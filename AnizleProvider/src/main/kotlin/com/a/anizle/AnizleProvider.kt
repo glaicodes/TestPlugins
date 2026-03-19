@@ -136,7 +136,7 @@ class AnizleProvider : MainAPI() {
             .firstOrNull()?.attr("abs:src")
 
         val plotEl = doc.selectFirst(".anime-description, .description, .summary") ?: run {
-            doc.select("div").firstOrNull { it.text().length > 100 && !it.select("a").isEmpty }
+            doc.select("div").firstOrNull { it.text().length > 100 && it.select("a").isNotEmpty() }
         }
         val plot = plotEl?.also { it.select("h1,h2,h3,h4,a").remove() }?.text()?.trim()?.ifBlank { null }
 
