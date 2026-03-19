@@ -1,4 +1,4 @@
-package com.yourname.anizle
+package com.a.anizle
 
 import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
