@@ -1,23 +1,19 @@
-// ============================================================
-// Anizle CloudStream 3 Extension - Plugin build.gradle.kts
-// ============================================================
-
+// use an integer for version numbers
 version = 1
 
 cloudstream {
-    // Displayed in the CloudStream extensions list
     language    = "tr"
     description = "Anizle / Anizm — Türkçe altyazılı anime akışı"
     authors     = listOf("yourname")
 
     /**
-     * Status codes:
-     *  0 = Down / not working
-     *  1 = Needs a VPN
-     *  2 = Slow (rate-limited)
-     *  3 = Operational / all good
+     * Status:
+     *  0 = Down
+     *  1 = Needs VPN
+     *  2 = Slow
+     *  3 = Working
      */
-    status  = 1 // Site may be behind Cloudflare / require VPN
+    status  = 1
     tvTypes = listOf("Anime", "AnimeMovie", "OVA")
 
     iconUrl = "https://anizm.pro/favicon.ico"
