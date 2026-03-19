@@ -392,13 +392,12 @@ class AnizleProvider : MainAPI() {
                 if (streamJson.optBoolean("hls", false) && securedLink.isNotBlank()) {
                     callback(
                         newExtractorLink(
-                            source  = this.name,
-                            name    = label,
-                            url     = securedLink,
-                            referer = playerBase,
+                            source = this.name,
+                            name   = label,
+                            url    = securedLink,
+                            type   = ExtractorLinkType.M3U8,
                         ) {
                             this.quality = Qualities.Unknown.value
-                            this.isM3u8  = true
                         }
                     )
                     found = true
@@ -410,13 +409,12 @@ class AnizleProvider : MainAPI() {
                 if (videoSource.isNotBlank()) {
                     callback(
                         newExtractorLink(
-                            source  = this.name,
-                            name    = label,
-                            url     = videoSource,
-                            referer = playerBase,
+                            source = this.name,
+                            name   = label,
+                            url    = videoSource,
+                            type   = ExtractorLinkType.VIDEO,
                         ) {
                             this.quality = Qualities.Unknown.value
-                            this.isM3u8  = false
                         }
                     )
                     found = true
