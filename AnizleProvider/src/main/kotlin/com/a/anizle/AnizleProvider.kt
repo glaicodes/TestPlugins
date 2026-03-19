@@ -22,9 +22,8 @@ class AnizleProvider : MainAPI() {
     // ------------------------------------------------------------------ meta
     override var mainUrl    = "https://anizm.pro"
     override var name       = "Anizle"
-    override val lang       = "tr"
+    override var lang       = "tr"
     override val hasMainPage = true
-    override val hasSearch   = true
     override val supportedTypes = setOf(
         TvType.Anime,
         TvType.AnimeMovie,
@@ -392,14 +391,15 @@ class AnizleProvider : MainAPI() {
                 val securedLink = streamJson.optString("securedLink", "")
                 if (streamJson.optBoolean("hls", false) && securedLink.isNotBlank()) {
                     callback(
-                        ExtractorLink(
-                            source   = this.name,
-                            name     = label,
-                            url      = securedLink,
-                            referer  = playerBase,
-                            quality  = Qualities.Unknown.value,
-                            isM3u8   = true,
-                        )
+                        newExtractorLink(
+                            source  = this.name,
+                            name    = label,
+                            url     = securedLink,
+                            referer = playerBase,
+                        ) {
+                            this.quality = Qualities.Unknown.value
+                            this.isM3u8  = true
+                        }
                     )
                     found = true
                     continue
@@ -409,14 +409,15 @@ class AnizleProvider : MainAPI() {
                 val videoSource = streamJson.optString("videoSource", "")
                 if (videoSource.isNotBlank()) {
                     callback(
-                        ExtractorLink(
+                        newExtractorLink(
                             source  = this.name,
                             name    = label,
                             url     = videoSource,
                             referer = playerBase,
-                            quality = Qualities.Unknown.value,
-                            isM3u8  = false,
-                        )
+                        ) {
+                            this.quality = Qualities.Unknown.value
+                            this.isM3u8  = false
+                        }
                     )
                     found = true
                 }
