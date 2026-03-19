@@ -1,4 +1,4 @@
-package com.yourname.anizle
+package com.a.anizle
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
