@@ -1,0 +1,8 @@
+{
+  "name": "glai",
+  "description": "test",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/glaicodes/TestPlugins/refs/heads/builds/plugins.json"
+  ]
+}
