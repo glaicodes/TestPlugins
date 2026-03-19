@@ -23,6 +23,7 @@ class AnizleProvider : MainAPI() {
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
+        "Origin"          to "https://anizle.org",
         "Referer"         to "https://anizle.org/",
     )
     private val xhrHeaders = baseHeaders + mapOf(
@@ -30,58 +31,43 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
+    // ── Anime list cache (fetched once, reused for all searches) ─────────────
+    // Same approach as the Aniyomi extension: fetch the full list once and
+    // filter locally. Origin + Referer headers are required to get a response.
+    private val animeList: List<Triple<String, String, String>> by lazy {
+        try {
+            val arr = org.json.JSONArray(
+                app.get("$mainUrl/getAnimeListForSearch", headers = baseHeaders).text
+            )
+            (0 until arr.length()).mapNotNull { i ->
+                val obj   = arr.optJSONObject(i) ?: return@mapNotNull null
+                val slug  = obj.optString("info_slug",  "").ifBlank { return@mapNotNull null }
+                val title = obj.optString("info_title", "").ifBlank { return@mapNotNull null }
+                val thumb = obj.optString("info_poster", "")
+                Triple(slug, title, thumb)
+            }
+        } catch (e: Exception) { emptyList() }
+    }
+
     // ── Search ────────────────────────────────────────────────────────────────
-    // Scrapes /harf?harf={firstLetter} pages — pure HTML, always works.
-    // For multi-word queries we use only the first non-article word.
+    // Filters the cached list locally — instant after first load.
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim().lowercase()
         if (q.isBlank()) return emptyList()
 
-        // Use first letter of query to hit the alphabetical browse page
-        val letter = q.first().let {
-            when {
-                it in 'a'..'z' -> it.toString()
-                it == 'ı' || it == 'i' -> "i"
-                it == 'ö' -> "o"
-                it == 'ü' -> "u"
-                it == 'ş' -> "s"
-                it == 'ç' -> "c"
-                it == 'ğ' -> "g"
-                else -> it.toString()
+        return animeList
+            .filter { (_, title, _) -> title.lowercase().contains(q) }
+            .take(20)
+            .map { (slug, title, thumb) ->
+                val poster = when {
+                    thumb.isBlank()          -> null
+                    thumb.startsWith("http") -> thumb
+                    else                     -> "$mainUrl/storage/pcovers/$thumb"
+                }
+                newAnimeSearchResponse(title, "$mainUrl/$slug", TvType.Anime) {
+                    posterUrl = poster
+                }
             }
-        }
-
-        val results = mutableListOf<SearchResponse>()
-
-        // Paginate all pages for that letter until no next page
-        var page = 1
-        while (true) {
-            val doc = try {
-                app.get("$mainUrl/harf?harf=$letter&sayfa=$page", headers = baseHeaders).document
-            } catch (e: Exception) { break }
-
-            val cards = doc.select("a[href*=-izle]").filter {
-                it.selectFirst("img[src*=pcovers]") != null
-            }
-            if (cards.isEmpty()) break
-
-            for (card in cards) {
-                val href   = card.attr("abs:href").ifBlank { continue }
-                val url    = href.removeSuffix("-izle")
-                val img    = card.selectFirst("img") ?: continue
-                val poster = img.attr("abs:src").ifBlank { null }
-                val title  = card.text().trim().ifBlank { img.attr("alt").trim() }
-                if (title.isBlank()) continue
-                if (!title.lowercase().contains(q)) continue
-                results += newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
-            }
-
-            val hasNext = doc.select("a[href*=sayfa=${page + 1}]").isNotEmpty()
-            if (!hasNext) break
-            page++
-        }
-
-        return results.take(20)
     }
 
     // ── Home page ─────────────────────────────────────────────────────────────
