@@ -32,10 +32,13 @@ class AnizleProvider : MainAPI() {
     )
 
     // ── Anime list cache (fetched once, reused for all searches) ─────────────
-    // Same approach as the Aniyomi extension: fetch the full list once and
-    // filter locally. Origin + Referer headers are required to get a response.
-    private val animeList: List<Triple<String, String, String>> by lazy {
-        try {
+    // Nullable var — populated on first search() call (which is a suspend fun),
+    // then reused for all subsequent searches without hitting the network again.
+    private var animeListCache: List<Triple<String, String, String>>? = null
+
+    private suspend fun getAnimeList(): List<Triple<String, String, String>> {
+        animeListCache?.let { return it }
+        return try {
             val arr = org.json.JSONArray(
                 app.get("$mainUrl/getAnimeListForSearch", headers = baseHeaders).text
             )
@@ -45,7 +48,7 @@ class AnizleProvider : MainAPI() {
                 val title = obj.optString("info_title", "").ifBlank { return@mapNotNull null }
                 val thumb = obj.optString("info_poster", "")
                 Triple(slug, title, thumb)
-            }
+            }.also { animeListCache = it }
         } catch (e: Exception) { emptyList() }
     }
 
@@ -55,7 +58,7 @@ class AnizleProvider : MainAPI() {
         val q = query.trim().lowercase()
         if (q.isBlank()) return emptyList()
 
-        return animeList
+        return getAnimeList()
             .filter { (_, title, _) -> title.lowercase().contains(q) }
             .take(20)
             .map { (slug, title, thumb) ->
