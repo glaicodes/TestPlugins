@@ -31,46 +31,89 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
-    // ── Anime list cache (fetched once, reused for all searches) ─────────────
-    // Nullable var — populated on first search() call (which is a suspend fun),
-    // then reused for all subsequent searches without hitting the network again.
+    // ── Search ────────────────────────────────────────────────────────────────
+    // Strategy:
+    //  1. Try /getAnimeListForSearch JSON (fast, cached after first call).
+    //  2. If JSON returns empty (blocked), fall back to scraping /harf pages
+    //     but stop as soon as we have 10+ results to avoid timeouts.
     private var animeListCache: List<Triple<String, String, String>>? = null
 
-    private suspend fun getAnimeList(): List<Triple<String, String, String>> {
+    private suspend fun fetchAnimeListJson(): List<Triple<String, String, String>> {
         animeListCache?.let { return it }
         return try {
-            val arr = org.json.JSONArray(
-                app.get("$mainUrl/getAnimeListForSearch", headers = baseHeaders).text
-            )
-            (0 until arr.length()).mapNotNull { i ->
+            val resp = app.get("$mainUrl/getAnimeListForSearch", headers = baseHeaders)
+            val text = resp.text
+            if (!text.trimStart().startsWith("[")) return emptyList()
+            val arr = org.json.JSONArray(text)
+            val list = (0 until arr.length()).mapNotNull { i ->
                 val obj   = arr.optJSONObject(i) ?: return@mapNotNull null
                 val slug  = obj.optString("info_slug",  "").ifBlank { return@mapNotNull null }
                 val title = obj.optString("info_title", "").ifBlank { return@mapNotNull null }
                 val thumb = obj.optString("info_poster", "")
                 Triple(slug, title, thumb)
-            }.also { animeListCache = it }
+            }
+            if (list.isNotEmpty()) animeListCache = list
+            list
         } catch (e: Exception) { emptyList() }
     }
 
-    // ── Search ────────────────────────────────────────────────────────────────
-    // Filters the cached list locally — instant after first load.
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim().lowercase()
         if (q.isBlank()) return emptyList()
 
-        return getAnimeList()
-            .filter { (_, title, _) -> title.lowercase().contains(q) }
-            .take(20)
-            .map { (slug, title, thumb) ->
-                val poster = when {
-                    thumb.isBlank()          -> null
-                    thumb.startsWith("http") -> thumb
-                    else                     -> "$mainUrl/storage/pcovers/$thumb"
+        // ── Attempt 1: JSON endpoint ──────────────────────────────────────────
+        val jsonList = fetchAnimeListJson()
+        if (jsonList.isNotEmpty()) {
+            return jsonList
+                .filter { (_, title, _) -> title.lowercase().contains(q) }
+                .take(20)
+                .map { (slug, title, thumb) ->
+                    val poster = when {
+                        thumb.isBlank()          -> null
+                        thumb.startsWith("http") -> thumb
+                        else -> "$mainUrl/storage/pcovers/$thumb"
+                    }
+                    newAnimeSearchResponse(title, "$mainUrl/$slug", TvType.Anime) {
+                        posterUrl = poster
+                    }
                 }
-                newAnimeSearchResponse(title, "$mainUrl/$slug", TvType.Anime) {
-                    posterUrl = poster
-                }
+        }
+
+        // ── Attempt 2: /harf page scraping fallback ───────────────────────────
+        // Only scrape until we have enough results to avoid timeouts.
+        val letter = when (val c = q.first()) {
+            'ı' -> "i";  'ö' -> "o";  'ü' -> "u"
+            'ş' -> "s";  'ç' -> "c";  'ğ' -> "g"
+            else -> c.toString()
+        }
+        val results = mutableListOf<SearchResponse>()
+        var page = 1
+        while (results.size < 10) {
+            val doc = try {
+                app.get("$mainUrl/harf?harf=$letter&sayfa=$page", headers = baseHeaders).document
+            } catch (e: Exception) { break }
+
+            val cards = doc.select("a[href*=-izle]")
+                .filter { it.selectFirst("img[src*=pcovers]") != null }
+            if (cards.isEmpty()) break
+
+            for (card in cards) {
+                val href  = card.attr("abs:href").ifBlank { continue }
+                val url   = href.removeSuffix("-izle")
+                val img   = card.selectFirst("img") ?: continue
+                // Use attr("src") and fixUrl() so relative URLs work too
+                val poster = fixUrl(img.attr("src")).ifBlank { null }
+                val title = card.text().trim().ifBlank { img.attr("alt").trim() }
+                if (title.isBlank()) continue
+                if (!title.lowercase().contains(q)) continue
+                results += newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
             }
+
+            val hasNext = doc.select("a[href*=sayfa=${page + 1}]").isNotEmpty()
+            if (!hasNext) break
+            page++
+        }
+        return results.take(20)
     }
 
     // ── Home page ─────────────────────────────────────────────────────────────
