@@ -1,7 +1,6 @@
 package com.a.anizle
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,16 +27,15 @@ class AnizleProvider : MainAPI() {
 
     private val playerBase = "https://anizmplayer.com"
 
-    // CloudflareKiller is passed as an interceptor — it auto-handles the CF challenge
-    // on the first request and stores the cookie for all subsequent requests.
-    private val cfKiller = CloudflareKiller()
-
+    // Session warmup — uses NiceHttp's shared cookie jar which already has
+    // valid CF cookies if the Anizm extension ran recently on this device.
+    private var sessionReady = false
     private suspend fun getSession() {
+        if (sessionReady) return
         android.util.Log.d("Anizle", "getSession başlatıldı")
         try {
-            // Hit the main page through cfKiller so it can solve the CF challenge
-            // and cache the cf_clearance cookie before we make API calls.
-            app.get(mainUrl, interceptor = cfKiller, headers = baseHeaders)
+            app.get(mainUrl, headers = baseHeaders)
+            sessionReady = true
             android.util.Log.d("Anizle", "getSession tamamlandı")
         } catch (e: Exception) {
             android.util.Log.e("Anizle", "getSession hatasi: ${e.message}")
@@ -72,7 +70,6 @@ class AnizleProvider : MainAPI() {
         val responseText = try {
             val resp = app.get(
                 "$mainUrl/searchAnime",
-                interceptor = cfKiller,
                 headers = baseHeaders,
                 params  = mapOf(
                     "query"          to q,
@@ -127,7 +124,7 @@ class AnizleProvider : MainAPI() {
         else
             "$mainUrl?sayfa=$page"
 
-        val doc = app.get(url, interceptor = cfKiller, headers = baseHeaders).document
+        val doc = app.get(url, headers = baseHeaders).document
 
         val items = doc.select("div#episodesMiddle div.posterBlock > a, a.imgWrapperLink, a[href*=-bolum]")
             .ifEmpty { doc.select("a[href*=-izle]").filter { it.selectFirst("img") != null } }
@@ -155,7 +152,7 @@ class AnizleProvider : MainAPI() {
 
     // ── Load (anime detail page) ───────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, interceptor = cfKiller, headers = baseHeaders).document
+        val doc = app.get(url, headers = baseHeaders).document
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
             ?: url.substringAfterLast("/").replace("-", " ").trim()
@@ -211,7 +208,7 @@ class AnizleProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val doc = try {
-            app.get(data, interceptor = cfKiller, headers = baseHeaders).document
+            app.get(data, headers = baseHeaders).document
         } catch (_: Exception) { return false }
 
         // Step 1: fansub buttons
