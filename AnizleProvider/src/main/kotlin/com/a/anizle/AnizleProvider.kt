@@ -162,26 +162,71 @@ class AnizleProvider : MainAPI() {
 
         val doc = app.get(url, headers = baseHeaders).document
 
-        val items = doc.select("div#episodesMiddle div.posterBlock > a, a.imgWrapperLink, a[href*=-bolum]")
-            .ifEmpty { doc.select("a[href*=-izle]").filter { it.selectFirst("img") != null } }
-            .distinctBy { it.attr("href") }
-            .mapNotNull { el ->
-                val href   = el.attr("abs:href").ifBlank { return@mapNotNull null }
-                val img    = el.selectFirst("img") ?: return@mapNotNull null
-                val poster = img.attr("abs:src").ifBlank { img.attr("data-src") }.ifBlank { img.attr("abs:data-src") }.ifBlank { null }
-                val title  = el.selectFirst("div.title, .truncateText, strong, b, h6")
-                    ?.text()?.trim()
-                    ?: img.attr("alt").trim()
-                if (title.isBlank()) return@mapNotNull null
+        val items: List<SearchResponse> = if (request.data == "anime-izle") {
+            // ── Episode listing (/anime-izle) ────────────────────────────────
+            // Each card has an episode image link AND a separate anime title/link.
+            // We must show the ANIME name, not "21. Bölüm".
+            doc.select("a[href*=-bolum]")
+                .distinctBy { it.attr("href") }
+                .mapNotNull { epLink ->
+                    val href = epLink.attr("abs:href").ifBlank { return@mapNotNull null }
+                    val img  = epLink.selectFirst("img") ?: return@mapNotNull null
+                    val poster = img.attr("abs:src")
+                        .ifBlank { img.attr("data-src") }
+                        .ifBlank { img.attr("abs:data-src") }
+                        .ifBlank { null }
 
-                // If this is an episode link, strip to anime URL
-                val animeUrl = if (href.contains("-bolum"))
-                    href.replace(Regex("""-\d+[-.]?bolum[^/]*$"""), "").trimEnd('-')
-                else
-                    href.removeSuffix("-izle")
+                    // Walk up to the card container (up to 4 levels) and look for
+                    // an explicit anime link or title element that is NOT the episode link.
+                    val card = epLink.parents().take(4).firstOrNull { parent ->
+                        parent.selectFirst("a:not([href*=-bolum])[href]") != null ||
+                        parent.selectFirst(".animeName, .anime-name, .animeNameBlock") != null
+                    }
+                    val animeLink = card?.selectFirst("a:not([href*=-bolum])[href]")
 
-                newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
-            }
+                    val title = animeLink?.text()?.trim()?.ifBlank { null }
+                        ?: card?.selectFirst(".animeName, .anime-name, h4, h5, h3")
+                            ?.text()?.trim()?.ifBlank { null }
+                        // Last resort: strip episode suffix from img alt ("Anime Name 21. Bölüm")
+                        ?: img.attr("alt").trim()
+                            .replace(Regex("""\s*\d+\.?\s*[Bb]ölüm.*$"""), "").trim()
+                            .ifBlank { null }
+                        ?: return@mapNotNull null
+
+                    // Derive anime URL: strip "-21-bolum" suffix from episode URL
+                    val animeUrl = animeLink?.attr("abs:href")?.ifBlank { null }
+                        ?: href.replace(Regex("""-\d+[-.]?bolum[^/?#]*"""), "").trimEnd('-', '/')
+
+                    newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
+                }
+        } else {
+            // ── Anime listing (/) ────────────────────────────────────────────
+            // The featured card at the top sometimes has tag spans nested inside
+            // the title element — clone and strip them before calling .text().
+            doc.select("a.imgWrapperLink, div.posterBlock > a")
+                .ifEmpty { doc.select("a[href*=$mainUrl]").filter { it.selectFirst("img") != null } }
+                .distinctBy { it.attr("href") }
+                .mapNotNull { el ->
+                    val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
+                    val img  = el.selectFirst("img") ?: return@mapNotNull null
+                    val poster = img.attr("abs:src")
+                        .ifBlank { img.attr("data-src") }
+                        .ifBlank { img.attr("abs:data-src") }
+                        .ifBlank { null }
+
+                    // Clone the title element and remove any nested tag/genre spans
+                    val titleEl = el.selectFirst("div.title, .truncateText, strong, b, h6, h5, h4")
+                        ?: el
+                    val titleClone = titleEl.clone().also {
+                        it.select("span.tag, span.label, .genres, .tags, a[href*=kategori]").remove()
+                    }
+                    val title = titleClone.text().trim()
+                        .ifBlank { img.attr("alt").trim() }
+                        .ifBlank { return@mapNotNull null }
+
+                    newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
+                }
+        }
 
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -364,7 +409,7 @@ class AnizleProvider : MainAPI() {
                 }
                 if (pageHtml.isBlank()) continue
 
-                val label = "$fansubName - $videoName"
+                val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
                 // ── GDrive path ──────────────────────────────────────────────
                 if (isGdrive) {
@@ -377,7 +422,11 @@ class AnizleProvider : MainAPI() {
                     if (fileId != null) {
                         val driveUrl = "https://drive.google.com/file/d/$fileId/view"
                         android.util.Log.d("Anizle", "GDrive fileId=$fileId")
-                        loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
+                        // Wrap callback so the link is labelled "FansubName - GDrive"
+                        // instead of the extractor's own generic source name.
+                        loadExtractor(driveUrl, "$mainUrl/", subtitleCallback) { link ->
+                            callback(link.copy(name = label))
+                        }
                         found = true
                     } else {
                         android.util.Log.w("Anizle", "GDrive: fileId not found in player page")
