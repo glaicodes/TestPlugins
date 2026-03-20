@@ -155,78 +155,69 @@ class AnizleProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data == "anime-izle")
-            "$mainUrl/anime-izle?sayfa=$page"
-        else
-            "$mainUrl?sayfa=$page"
-
+        val isEpisodePage = request.data == "anime-izle"
+        val url = if (isEpisodePage) "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
         val doc = app.get(url, headers = baseHeaders).document
 
-        val items: List<SearchResponse> = if (request.data == "anime-izle") {
-            // ── Episode listing (/anime-izle) ────────────────────────────────
-            // Each card has an episode image link AND a separate anime title/link.
-            // We must show the ANIME name, not "21. Bölüm".
-            doc.select("a[href*=-bolum]")
-                .distinctBy { it.attr("href") }
-                .mapNotNull { epLink ->
-                    val href = epLink.attr("abs:href").ifBlank { return@mapNotNull null }
-                    val img  = epLink.selectFirst("img") ?: return@mapNotNull null
-                    val poster = img.attr("abs:src")
-                        .ifBlank { img.attr("data-src") }
-                        .ifBlank { img.attr("abs:data-src") }
-                        .ifBlank { null }
-
-                    // Walk up to the card container (up to 4 levels) and look for
-                    // an explicit anime link or title element that is NOT the episode link.
-                    val card = epLink.parents().take(4).firstOrNull { parent ->
-                        parent.selectFirst("a:not([href*=-bolum])[href]") != null ||
-                        parent.selectFirst(".animeName, .anime-name, .animeNameBlock") != null
-                    }
-                    val animeLink = card?.selectFirst("a:not([href*=-bolum])[href]")
-
-                    val title = animeLink?.text()?.trim()?.ifBlank { null }
-                        ?: card?.selectFirst(".animeName, .anime-name, h4, h5, h3")
-                            ?.text()?.trim()?.ifBlank { null }
-                        // Last resort: strip episode suffix from img alt ("Anime Name 21. Bölüm")
-                        ?: img.attr("alt").trim()
-                            .replace(Regex("""\s*\d+\.?\s*[Bb]ölüm.*$"""), "").trim()
-                            .ifBlank { null }
-                        ?: return@mapNotNull null
-
-                    // Derive anime URL: strip "-21-bolum" suffix from episode URL
-                    val animeUrl = animeLink?.attr("abs:href")?.ifBlank { null }
-                        ?: href.replace(Regex("""-\d+[-.]?bolum[^/?#]*"""), "").trimEnd('-', '/')
-
-                    newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
-                }
-        } else {
-            // ── Anime listing (/) ────────────────────────────────────────────
-            // The featured card at the top sometimes has tag spans nested inside
-            // the title element — clone and strip them before calling .text().
-            doc.select("a.imgWrapperLink, div.posterBlock > a")
-                .ifEmpty { doc.select("a[href*=$mainUrl]").filter { it.selectFirst("img") != null } }
-                .distinctBy { it.attr("href") }
-                .mapNotNull { el ->
-                    val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
-                    val img  = el.selectFirst("img") ?: return@mapNotNull null
-                    val poster = img.attr("abs:src")
-                        .ifBlank { img.attr("data-src") }
-                        .ifBlank { img.attr("abs:data-src") }
-                        .ifBlank { null }
-
-                    // Clone the title element and remove any nested tag/genre spans
-                    val titleEl = el.selectFirst("div.title, .truncateText, strong, b, h6, h5, h4")
-                        ?: el
-                    val titleClone = titleEl.clone().also {
-                        it.select("span.tag, span.label, .genres, .tags, a[href*=kategori]").remove()
-                    }
-                    val title = titleClone.text().trim()
-                        .ifBlank { img.attr("alt").trim() }
-                        .ifBlank { return@mapNotNull null }
-
-                    newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
+        // Resolve the best available image URL, skipping placeholder/lazy-load stubs.
+        fun imgUrl(img: org.jsoup.nodes.Element): String? {
+            val src = img.attr("abs:src")
+            // Skip data URIs and common placeholder filenames
+            val realSrc = if (src.startsWith("data:") || src.contains("placeholder") ||
+                              src.contains("loading") || src.endsWith(".gif"))
+                null else src.ifBlank { null }
+            return realSrc
+                ?: img.attr("abs:data-src").ifBlank { null }
+                ?: img.attr("data-src").let { ds ->
+                    if (ds.isBlank()) null
+                    else if (ds.startsWith("http")) ds
+                    else "$mainUrl/$ds".replace("//", "/").replace("$mainUrl/http", "http")
                 }
         }
+
+        // Original combined selector — works for both pages.
+        val items = doc.select("a.imgWrapperLink, div.posterBlock > a, a[href*=-bolum]")
+            .ifEmpty { doc.select("a[href*=-izle]").filter { it.selectFirst("img") != null } }
+            .distinctBy { it.attr("href") }
+            .mapNotNull { el ->
+                val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
+                val img  = el.selectFirst("img") ?: return@mapNotNull null
+                val poster = imgUrl(img)
+
+                val isEpLink = href.contains("-bolum")
+
+                // ── Title extraction ─────────────────────────────────────────
+                val title: String? = if (isEpLink) {
+                    // For episode links the anime name lives OUTSIDE the <a> tag —
+                    // in a sibling element of the parent container.
+                    val container = el.parent()
+                    val siblingAnimeLink = container
+                        ?.select("a[href]:not([href*=-bolum])")
+                        ?.firstOrNull { it.attr("abs:href") != href }
+                    siblingAnimeLink?.text()?.trim()?.ifBlank { null }
+                        ?: container?.selectFirst(".animeName, .anime-name, h4, h5, h3, strong")
+                            ?.clone()?.also { it.select("span").remove() }?.text()?.trim()?.ifBlank { null }
+                        // Last resort: strip "21. Bölüm" suffix from the img alt attribute
+                        ?: img.attr("alt").trim()
+                            .replace(Regex("""\s*\d+\.?\s*[Bb][oöô]l[uüû]m.*$"""), "").trim()
+                            .ifBlank { null }
+                } else {
+                    // For anime cards: clone title element and strip nested tag spans
+                    val titleEl = el.selectFirst("div.title, .truncateText, h4, h5, h3, strong, b")
+                    val clone = (titleEl ?: el).clone()
+                    clone.select("span.tag, span.label, .tag, .genres, a[href*=kategori], a[href*=kategori]").remove()
+                    clone.text().trim().ifBlank { img.attr("alt").trim() }.ifBlank { null }
+                }
+                if (title.isNullOrBlank()) return@mapNotNull null
+
+                // Derive the anime page URL (strip episode suffix if needed)
+                val animeUrl = if (isEpLink)
+                    href.replace(Regex("""-\d+[-.]?bolum[^/?#]*"""), "").trimEnd('-', '/')
+                else
+                    href
+
+                newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
+            }
 
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
