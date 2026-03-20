@@ -292,50 +292,14 @@ class AnizleProvider : MainAPI() {
             for ((videoUrl, videoName) in videos) {
                 android.util.Log.d("Anizle", "Step3: $videoName -> $videoUrl")
 
-                // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
-                // Try plain first — the shared NiceHttp cookie jar may already have CF clearance
-                // from the Anizm extension running on this device. Only use cfKiller as fallback.
-                var vText = try {
-                    app.get(videoUrl,
-                        headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
-                } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Video fetch error (plain): ${e.message}"); continue
-                }
-                android.util.Log.d("Anizle", "Step3 raw[300]: ${vText.take(300)}")
+                // Step 3 is skipped: /video/{id} is CF-Turnstile-protected and times out.
+                // The endpoint only returns {"player":"<a href='/player/ID'>..."} anyway —
+                // the numeric ID is already embedded in the video URL itself.
+                val playerId = Regex("""[/=](\d+)$""").find(videoUrl)?.groupValues?.get(1)
+                android.util.Log.d("Anizle", "Step4: videoUrl=$videoUrl playerId=$playerId")
 
-                // If CF challenge came back, retry once with cfKiller
-                if (vText.contains("Just a moment", ignoreCase = true) ||
-                    vText.trimStart().startsWith("<!DOCTYPE")) {
-                    android.util.Log.w("Anizle", "Step3: CF on plain req, retrying with cfKiller")
-                    vText = try {
-                        app.get(videoUrl,
-                            headers = xhrHeaders + mapOf("Referer" to mainUrl),
-                            interceptor = cfKiller).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "Video fetch error (cfKiller): ${e.message}"); continue
-                    }
-                    android.util.Log.d("Anizle", "Step3 cfKiller raw[300]: ${vText.take(300)}")
-                    if (vText.contains("Just a moment", ignoreCase = true) ||
-                        vText.trimStart().startsWith("<!DOCTYPE")) {
-                        android.util.Log.e("Anizle", "Step3: CF not bypassed for $videoUrl — skipping")
-                        continue
-                    }
-                }
-                val playerHtml = try {
-                    val j = JSONObject(vText)
-                    // v44 Anizm uses field "data"; older Python used "player"
-                    val p = j.optString("player", "").ifBlank { j.optString("data", "") }
-                    p.ifBlank { vText }
-                } catch (_: Exception) { vText }
-                android.util.Log.d("Anizle", "Step3 playerHtml[200]: ${playerHtml.take(200)}")
-
-                // Check for direct FirePlayer hash embedded in player html (skip step 4)
-                val directFireId = extractFireplayerId(playerHtml)
-                val playerId = Regex("""/player/(\d+)""").find(playerHtml)?.groupValues?.get(1)
-                android.util.Log.d("Anizle", "Step3: playerId=$playerId directFireId=$directFireId")
-
-                // Step 4: FirePlayer hash — try player page on both domains
-                val fireId: String? = directFireId ?: run {
+                // Step 4: GET /player/{id} → packed JS → FirePlayer hash (32 hex chars)
+                val fireId: String? = run {
                     playerId ?: return@run null
                     for (base4 in listOf(mainUrl, videoBase)) {
                         val pageHtml = try {
@@ -345,6 +309,9 @@ class AnizleProvider : MainAPI() {
                             android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
                         }
                         android.util.Log.d("Anizle", "Step4 ($base4): len=${pageHtml.length}")
+                        if (pageHtml.contains("Just a moment", ignoreCase = true)) {
+                            android.util.Log.w("Anizle", "Step4: CF on $base4/player/$playerId"); continue
+                        }
                         val fid = extractFireplayerId(pageHtml)
                         android.util.Log.d("Anizle", "Step4: fireId=$fid")
                         if (fid != null) return@run fid
