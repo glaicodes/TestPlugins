@@ -152,7 +152,7 @@ class AnizleProvider : MainAPI() {
             .mapNotNull { el ->
                 val href   = el.attr("abs:href").ifBlank { return@mapNotNull null }
                 val img    = el.selectFirst("img") ?: return@mapNotNull null
-                val poster = img.attr("abs:src").ifBlank { null }
+                val poster = img.attr("abs:src").ifBlank { img.attr("data-src") }.ifBlank { img.attr("abs:data-src") }.ifBlank { null }
                 val title  = el.selectFirst("div.title, .truncateText, strong, b, h6")
                     ?.text()?.trim()
                     ?: img.attr("alt").trim()
@@ -192,18 +192,35 @@ class AnizleProvider : MainAPI() {
             .map { it.text().trim() }.filter { it.isNotBlank() }.ifEmpty { null }
 
         // Episodes are inside div#episodesMiddle
-        val episodes = doc.select("div#episodesMiddle a[href]")
-            .ifEmpty { doc.select("div.episodeListTabContent a[href], a[href*=-bolum]") }
-            .mapNotNull { el ->
-                val href  = el.attr("abs:href").ifBlank { return@mapNotNull null }
-                val label = el.text().trim().ifBlank { "Bölüm" }
-                val epNum = Regex("""(\d+)[.\s]*[Bb]ölüm""").find(label)
-                    ?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("""-(\d+)[-.]?bolum""").find(href)
-                        ?.groupValues?.get(1)?.toIntOrNull()
-                newEpisode(href) { name = label; episode = epNum }
+        // Exclude trailers (fragman) and PVs; separate OVAs to the end
+        val allLinks = doc.select("div#episodesMiddle a[href]")
+            .ifEmpty { doc.select("div.episodeListTabContent a[href]") }
+            .distinctBy { it.attr("abs:href") }
+        val episodes = run {
+            val regular = mutableListOf<Episode>()
+            val ovas     = mutableListOf<Episode>()
+            for (el in allLinks) {
+                val href  = el.attr("abs:href").ifBlank { continue }
+                val label = el.text().trim().ifBlank { continue }
+                val hrefL = href.lowercase()
+                val labelL = label.lowercase()
+                // Skip trailers and PVs
+                if (hrefL.contains("fragman") || labelL.contains("fragman")) continue
+                if (hrefL.contains("-pv") || labelL.contains(" pv") || labelL == "pv") continue
+                val isOva = hrefL.contains("ova") || labelL.contains("ova")
+                val ep = newEpisode(href) { name = label }
+                if (isOva) ovas.add(ep) else regular.add(ep)
             }
-            .distinctBy { it.data }
+            // Number regular episodes in order, then append OVAs unnumbered
+            regular.mapIndexed { i, ep ->
+                val num = Regex("""(\d+)[.\s]*[Bb]ölüm""").find(ep.name ?: "")
+                    ?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""-(\d+)[-.]?bolum""").find(ep.data)
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                    ?: (i + 1)
+                ep.apply { episode = num }
+            } + ovas
+        }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
@@ -290,34 +307,67 @@ class AnizleProvider : MainAPI() {
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
 
             for ((videoUrl, videoName) in videos) {
-                android.util.Log.d("Anizle", "Step3: $videoName -> $videoUrl")
+                val videoNameL = videoName.lowercase()
 
-                // Step 3 is skipped: /video/{id} is CF-Turnstile-protected and times out.
-                // The endpoint only returns {"player":"<a href='/player/ID'>..."} anyway —
-                // the numeric ID is already embedded in the video URL itself.
-                val playerId = Regex("""[/=](\d+)$""").find(videoUrl)?.groupValues?.get(1)
-                android.util.Log.d("Anizle", "Step4: videoUrl=$videoUrl playerId=$playerId")
-
-                // Step 4: GET /player/{id} → packed JS → FirePlayer hash (32 hex chars)
-                val fireId: String? = run {
-                    playerId ?: return@run null
-                    for (base4 in listOf(mainUrl, videoBase)) {
-                        val pageHtml = try {
-                            app.get("$base4/player/$playerId",
-                                headers = baseHeaders + mapOf("Referer" to "$base4/")).text
-                        } catch (e: Exception) {
-                            android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
-                        }
-                        android.util.Log.d("Anizle", "Step4 ($base4): len=${pageHtml.length}")
-                        if (pageHtml.contains("Just a moment", ignoreCase = true)) {
-                            android.util.Log.w("Anizle", "Step4: CF on $base4/player/$playerId"); continue
-                        }
-                        val fid = extractFireplayerId(pageHtml)
-                        android.util.Log.d("Anizle", "Step4: fireId=$fid")
-                        if (fid != null) return@run fid
-                    }
-                    null
+                // Only handle hosts we can extract:
+                //   Aincrad → FirePlayer (anizmplayer.com)
+                //   GDrive  → Google Drive direct link
+                // Skipping everything else avoids N×M /player/ requests that block later fansubs.
+                val isAincrad = videoNameL.contains("aincrad")
+                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
+                if (!isAincrad && !isGdrive) {
+                    android.util.Log.d("Anizle", "Step4: skipping unsupported host $videoName")
+                    continue
                 }
+
+                android.util.Log.d("Anizle", "Step4: processing $videoName -> $videoUrl")
+
+                // /video/{id} is CF-Turnstile-blocked — extract numeric ID from URL directly.
+                val playerId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1)
+                if (playerId == null) {
+                    android.util.Log.w("Anizle", "Step4: no playerId in $videoUrl"); continue
+                }
+
+                // Step 4: GET /player/{id} page (try mainUrl then videoBase)
+                var pageHtml = ""
+                for (base4 in listOf(mainUrl, videoBase)) {
+                    val html = try {
+                        app.get("$base4/player/$playerId",
+                            headers = baseHeaders + mapOf("Referer" to "$base4/")).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
+                    }
+                    android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length}")
+                    if (html.contains("Just a moment", ignoreCase = true)) {
+                        android.util.Log.w("Anizle", "Step4: CF on $base4/player/$playerId"); continue
+                    }
+                    pageHtml = html; break
+                }
+                if (pageHtml.isBlank()) continue
+
+                val label = "$fansubName - $videoName"
+
+                // ── GDrive path ──────────────────────────────────────────────
+                if (isGdrive) {
+                    // Player page embeds a drive.google.com/file/d/{fileId} link
+                    val fileId = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]+)""")
+                        .find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""[?&]id=([A-Za-z0-9_-]+)""").find(pageHtml)?.groupValues?.get(1)
+                    if (fileId != null) {
+                        val driveUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+                        android.util.Log.d("Anizle", "GDrive fileId=$fileId")
+                        callback(newExtractorLink(source = name, name = label, url = driveUrl,
+                            type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
+                        found = true
+                    } else {
+                        android.util.Log.w("Anizle", "GDrive: fileId not found in player page")
+                    }
+                    continue
+                }
+
+                // ── Aincrad / FirePlayer path ────────────────────────────────
+                val fireId = extractFireplayerId(pageHtml)
+                android.util.Log.d("Anizle", "Step4: fireId=$fireId")
                 fireId ?: continue
 
                 // Step 5: POST to anizmplayer.com → JSON {hls,securedLink} or {videoSource}
@@ -337,8 +387,7 @@ class AnizleProvider : MainAPI() {
                 }
                 android.util.Log.d("Anizle", "Step5: ${streamText.take(120)}")
 
-                val json  = try { JSONObject(streamText) } catch (_: Exception) { continue }
-                val label = "$fansubName - $videoName"
+                val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
 
                 val securedLink = json.optString("securedLink", "")
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
