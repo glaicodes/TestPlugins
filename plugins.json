@@ -1,0 +1,43 @@
+[
+    {
+        "iconUrl": "https://anizm.pro/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "fileSize": 36997,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            " "
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "OVA"
+        ],
+        "version": 26,
+        "internalName": "AnizleProvider",
+        "description": "Anizle / Anizm",
+        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/AnizleProvider.cs3",
+        "name": "AnizleProvider"
+    },
+    {
+        "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Korduene_Logo.png",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "fileSize": 7296,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "Cloudburst",
+            "Luna712"
+        ],
+        "tvTypes": [
+            "Movie"
+        ],
+        "version": 1,
+        "internalName": "ExampleProvider",
+        "description": "Lorem ipsum",
+        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/ExampleProvider.cs3",
+        "name": "ExampleProvider"
+    }
+]
