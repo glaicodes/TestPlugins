@@ -78,7 +78,7 @@ class AnizleProvider : MainAPI() {
         getSession()
 
         val responseText = try {
-            val postData = mutableMapOf(
+            val params = mutableMapOf(
                 "query"          to q,
                 "type"           to "detailed",
                 "limit"          to "20",
@@ -86,12 +86,12 @@ class AnizleProvider : MainAPI() {
                 "orderBy"        to "info_year",
                 "orderDirection" to "ASC",
             )
-            csrfToken?.let { postData["_token"] = it }
-            android.util.Log.d("Anizle", "POST /searchAnime _token=${csrfToken?.take(10)}")
-            val resp = app.post(
+            csrfToken?.let { params["_token"] = it }
+            android.util.Log.d("Anizle", "GET /searchAnime _token=${csrfToken?.take(10)}")
+            val resp = app.get(
                 "$mainUrl/searchAnime",
                 headers = xhrHeaders,
-                data    = postData,
+                params  = params,
             )
             android.util.Log.d("Anizle", "HTTP ${resp.code} len=${resp.text.length}")
             resp.text
