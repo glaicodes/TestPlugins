@@ -30,25 +30,42 @@ class AnizleProvider : MainAPI() {
     // Python source uses anizle.org specifically for player page requests (step 4)
     private val videoBase  = "https://anizle.org"
 
-    // CloudflareKiller solves the JS challenge on /video/* endpoints
-    // (those return "Just a moment..." without it)
+    // CloudflareKiller — used as fallback in getSession() when CF challenges the homepage.
     private val cfKiller = CloudflareKiller()
 
-    // Session warmup — uses NiceHttp's shared cookie jar which already has
-    // valid CF cookies if the Anizm extension ran recently on this device.
+    // Session cache — reused across search/load/loadLinks calls within the same session.
     private var csrfToken: String? = null
+    private var sessionFetchedAt: Long = 0L
+    private val sessionTtlMs = 5 * 60 * 1000L // 5 minutes
 
     private suspend fun getSession() {
-        android.util.Log.d("Anizle", "getSession başlatıldı")
+        val now = System.currentTimeMillis()
+        if (csrfToken != null && (now - sessionFetchedAt) < sessionTtlMs) {
+            android.util.Log.d("Anizle", "getSession: using cached token (age ${(now - sessionFetchedAt) / 1000}s)")
+            return
+        }
+        android.util.Log.d("Anizle", "getSession: refreshing")
         try {
-            val resp = app.get(mainUrl, headers = baseHeaders)
-            val html = resp.text
+            // Fast path: plain request reuses CF cookies pre-warmed by the Anizm extension.
+            var resp = app.get(mainUrl, headers = baseHeaders)
+            var html = resp.text
             android.util.Log.d("Anizle", "getSession HTTP ${resp.code} len=${html.length}")
+
+            // Fallback: if CF challenged us, solve it once with cfKiller (~3-5s, first time only).
+            if (html.contains("Just a moment", ignoreCase = true) ||
+                html.contains("cf-browser-verification", ignoreCase = true)) {
+                android.util.Log.w("Anizle", "getSession: CF challenge, retrying with cfKiller")
+                resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller)
+                html = resp.text
+                android.util.Log.d("Anizle", "getSession cfKiller HTTP ${resp.code} len=${html.length}")
+            }
+
             // Extract CSRF token from meta tag: <meta name="csrf-token" content="...">
             csrfToken = Regex("""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']""")
                 .find(html)?.groupValues?.get(1)
                 ?: Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""")
                 .find(html)?.groupValues?.get(1)
+            sessionFetchedAt = System.currentTimeMillis()
             android.util.Log.d("Anizle", "CSRF token: $csrfToken")
         } catch (e: Exception) {
             android.util.Log.e("Anizle", "getSession hatasi: ${e.message}")
@@ -70,7 +87,6 @@ class AnizleProvider : MainAPI() {
         "X-Requested-With" to "XMLHttpRequest",
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
-
 
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -108,8 +124,8 @@ class AnizleProvider : MainAPI() {
         }
 
         return try {
-            val root = org.json.JSONObject(responseText)
-            val arr  = root.optJSONArray("data") ?: org.json.JSONArray(responseText)
+            val root = JSONObject(responseText)
+            val arr  = root.optJSONArray("data") ?: JSONArray(responseText)
             android.util.Log.d("Anizle", "JSON parse OK, ${arr.length()} sonuc")
 
             (0 until arr.length()).mapNotNull { i ->
