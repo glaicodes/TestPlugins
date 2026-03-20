@@ -1,7 +1,6 @@
 package com.a.anizle
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -27,16 +26,6 @@ class AnizleProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private val playerBase = "https://anizmplayer.com"
-    private val cfKiller   = CloudflareKiller()
-
-    // Use a client with CloudflareKiller so JS challenges on /video/* are auto-solved
-    override val client = app.baseClient.newBuilder()
-        .addInterceptor(cfKiller)
-        .build()
-
-    // CloudflareKiller: solves JS challenges that a plain HTTP client can't handle.
-    // anizm.net/video/* endpoints require this — normal session cookies aren't enough.
-    private val cfKiller by lazy { CloudflareKiller() }
     // Python source uses anizle.org specifically for player page requests (step 4)
     private val videoBase  = "https://anizle.org"
 
@@ -272,8 +261,7 @@ class AnizleProvider : MainAPI() {
             // Step 2: GET translator URL → JSON {data: html} → video buttons
             val trText = try {
                 app.get(trUrl,
-                    headers = xhrHeaders + mapOf("Referer" to mainUrl),
-                    interceptor = cfKiller).text
+                    headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
             } catch (e: Exception) {
                 android.util.Log.e("Anizle", "Translator fetch error: ${e.message}"); continue
             }
@@ -301,16 +289,18 @@ class AnizleProvider : MainAPI() {
 
                 // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
                 val vText = try {
-                    // Use CloudflareKiller: /video/* endpoints trigger JS challenge
                     app.get(videoUrl,
-                        headers = xhrHeaders + mapOf("Referer" to mainUrl),
-                        interceptor = cfKiller).text
+                        headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
                 } catch (e: Exception) {
                     android.util.Log.e("Anizle", "Video fetch error: ${e.message}"); continue
                 }
                 android.util.Log.d("Anizle", "Step3 raw[300]: ${vText.take(300)}")
-                val playerHtml = try { JSONObject(vText).optString("player", vText) }
-                                 catch (_: Exception) { vText }
+                val playerHtml = try {
+                    val j = JSONObject(vText)
+                    // v44 Anizm uses field "data"; older Python used "player"
+                    val p = j.optString("player", "").ifBlank { j.optString("data", "") }
+                    p.ifBlank { vText }
+                } catch (_: Exception) { vText }
                 android.util.Log.d("Anizle", "Step3 playerHtml[200]: ${playerHtml.take(200)}")
 
                 // Check for direct FirePlayer hash embedded in player html (skip step 4)
