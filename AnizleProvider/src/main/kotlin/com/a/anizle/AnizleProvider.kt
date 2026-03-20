@@ -40,26 +40,20 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
-    // Warm up a session against the main page so Cloudflare cookies are set
-    // before we make API calls. Mirrors what the kraptor extension does with getSession.
-    private var sessionReady = false
-    private suspend fun ensureSession() {
-        if (sessionReady) return
-        sessionReady = true
-        try { app.get(mainUrl, headers = baseHeaders) } catch (_: Exception) {}
-    }
+
 
     // ── Search ────────────────────────────────────────────────────────────────
     // GET /searchAnime?query=TERM&type=detailed&limit=10&...
     // Returns JSON: {"data": [{"info_title":"..","info_slug":"..","info_poster":"..","info_year":2020}]}
     // Confirmed by reverse-engineering: search uses Jackson readValue, NOT HTML parsing.
     override suspend fun search(query: String): List<SearchResponse> {
-        ensureSession()
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
+        android.util.Log.d("Anizle", "Arama: $q")
+
         val responseText = try {
-            app.get(
+            val resp = app.get(
                 "$mainUrl/searchAnime",
                 headers = baseHeaders,
                 params  = mapOf(
@@ -70,13 +64,18 @@ class AnizleProvider : MainAPI() {
                     "orderBy"        to "info_year",
                     "orderDirection" to "ASC",
                 )
-            ).text
-        } catch (_: Exception) { return emptyList() }
+            )
+            android.util.Log.d("Anizle", "HTTP ${resp.code} len=${resp.text.length}")
+            resp.text
+        } catch (e: Exception) {
+            android.util.Log.e("Anizle", "Arama hatasi: ${e.message}")
+            return emptyList()
+        }
 
         return try {
-            // Response is {"data": [...]} wrapping the result list
             val root = org.json.JSONObject(responseText)
             val arr  = root.optJSONArray("data") ?: org.json.JSONArray(responseText)
+            android.util.Log.d("Anizle", "JSON parse OK, ${arr.length()} sonuc")
 
             (0 until arr.length()).mapNotNull { i ->
                 val obj   = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -92,7 +91,10 @@ class AnizleProvider : MainAPI() {
                     posterUrl = poster
                 }
             }
-        } catch (_: Exception) { emptyList() }
+        } catch (e: Exception) {
+            android.util.Log.e("Anizle", "JSON hatasi: ${e.message}, ilk 200: ${responseText.take(200)}")
+            emptyList()
+        }
     }
 
     // ── Home page ─────────────────────────────────────────────────────────────
@@ -102,7 +104,6 @@ class AnizleProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        ensureSession()
         val url = if (request.data == "anime-izle")
             "$mainUrl/anime-izle?sayfa=$page"
         else
@@ -136,7 +137,6 @@ class AnizleProvider : MainAPI() {
 
     // ── Load (anime detail page) ───────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        ensureSession()
         val doc = app.get(url, headers = baseHeaders).document
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
@@ -192,7 +192,6 @@ class AnizleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        ensureSession()
         val doc = try {
             app.get(data, headers = baseHeaders).document
         } catch (_: Exception) { return false }
