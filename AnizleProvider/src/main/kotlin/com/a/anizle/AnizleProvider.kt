@@ -159,63 +159,68 @@ class AnizleProvider : MainAPI() {
         val url = if (isEpisodePage) "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
         val doc = app.get(url, headers = baseHeaders).document
 
-        // ── DEBUG: log HTML snippet and element counts so we can see the real structure ──
-        android.util.Log.d("AnizleHP", "=== getMainPage url=$url ===")
-        android.util.Log.d("AnizleHP", "HTML[0:500]: ${doc.html().take(500)}")
-        val dbgImgWrapper = doc.select("a.imgWrapperLink")
-        val dbgPosterBlock = doc.select("div.posterBlock > a")
-        val dbgBolum      = doc.select("a[href*=-bolum]")
-        android.util.Log.d("AnizleHP", "a.imgWrapperLink count=${dbgImgWrapper.size}")
-        android.util.Log.d("AnizleHP", "div.posterBlock>a count=${dbgPosterBlock.size}")
-        android.util.Log.d("AnizleHP", "a[href*=-bolum] count=${dbgBolum.size}")
-        // Log the first matching element's outerHTML for each selector
-        dbgImgWrapper.firstOrNull()?.let { android.util.Log.d("AnizleHP", "imgWrapperLink[0]: ${it.outerHtml().take(400)}") }
-        dbgPosterBlock.firstOrNull()?.let { android.util.Log.d("AnizleHP", "posterBlock[0]: ${it.outerHtml().take(400)}") }
-        dbgBolum.firstOrNull()?.let { android.util.Log.d("AnizleHP", "bolum[0]: ${it.outerHtml().take(400)}") }
-        // Log first img element on the page and all its attributes
-        doc.selectFirst("img")?.let { img ->
-            android.util.Log.d("AnizleHP", "firstImg attrs: ${img.attributes()}")
+        // Helper: make a src attribute value absolute
+        fun toAbsUrl(src: String): String? {
+            if (src.isBlank()) return null
+            return when {
+                src.startsWith("http") -> src
+                src.startsWith("/")    -> "$mainUrl$src"
+                else                   -> null
+            }
         }
 
-        // Original combined selector — works for both pages.
+        // Helper: strip site suffix from alt-derived titles ("Name - Anizm.TV" → "Name")
+        fun cleanTitle(raw: String): String =
+            raw.replace(Regex("""\s*-\s*Anizm[.\w]*$""", RegexOption.IGNORE_CASE), "").trim()
+
         val items = doc.select("a.imgWrapperLink, div.posterBlock > a, a[href*=-bolum]")
             .ifEmpty { doc.select("a[href*=-izle]").filter { it.selectFirst("img") != null } }
             .distinctBy { it.attr("href") }
             .mapNotNull { el ->
                 val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
-                val img  = el.selectFirst("img") ?: return@mapNotNull null
-
-                // Try every known lazy-load attribute pattern
-                val poster = img.attr("abs:src").ifBlank { null }
-                    ?.takeIf { !it.startsWith("data:") && !it.endsWith(".gif") }
-                    ?: img.attr("data-src").ifBlank { null }
-                        ?.let { if (it.startsWith("http")) it else "$mainUrl/$it" }
-                    ?: img.attr("data-original").ifBlank { null }
-                        ?.let { if (it.startsWith("http")) it else "$mainUrl/$it" }
-                    ?: img.attr("data-lazy-src").ifBlank { null }
-                        ?.let { if (it.startsWith("http")) it else "$mainUrl/$it" }
-
-                android.util.Log.d("AnizleHP", "el href=$href img.src=${img.attr("src").take(60)} img.data-src=${img.attr("data-src").take(60)} poster=$poster")
-
                 val isEpLink = href.contains("-bolum")
+
+                // ── Poster extraction ────────────────────────────────────────
+                // img.attr("src") returns the raw relative path; abs:src is empty because
+                // Jsoup has no base URI. Manually resolve relative paths.
+                val img = el.selectFirst("img")
+                val poster: String? = img?.let {
+                    toAbsUrl(it.attr("src"))
+                        ?: toAbsUrl(it.attr("data-src"))
+                        ?: toAbsUrl(it.attr("data-original"))
+                } ?: run {
+                    // posterBlock images are JS-loaded and commented out as <!--src="URL"-->
+                    // Extract from the HTML comment inside div.poster
+                    val posterDiv = el.selectFirst("div.poster")
+                    if (posterDiv != null) {
+                        val html = posterDiv.html()
+                        Regex("""<!--src="([^"]+)"""").find(html)?.groupValues?.get(1)
+                            ?.let { toAbsUrl(it) }
+                    } else null
+                }
 
                 // ── Title extraction ─────────────────────────────────────────
                 val title: String? = if (isEpLink) {
+                    // Anime name is in a sibling element outside the episode <a>
                     val container = el.parent()
                     val siblingAnimeLink = container
                         ?.select("a[href]:not([href*=-bolum])")
                         ?.firstOrNull { it.attr("abs:href") != href }
-                    siblingAnimeLink?.text()?.trim()?.ifBlank { null }
+                    siblingAnimeLink?.text()?.trim()?.let { cleanTitle(it) }?.ifBlank { null }
                         ?: container?.selectFirst(".animeName, .anime-name, h4, h5, h3, strong")
-                            ?.clone()?.also { it.select("span").remove() }?.text()?.trim()?.ifBlank { null }
-                        ?: img.attr("alt").trim()
-                            .replace(Regex("""\s*\d+\.?\s*[Bb][oöô]l[uüû]m.*$"""), "").trim()
-                            .ifBlank { null }
+                            ?.clone()?.also { it.select("span").remove() }
+                            ?.text()?.trim()?.let { cleanTitle(it) }?.ifBlank { null }
+                        // Last resort: strip episode number and site name from img alt
+                        ?: img?.attr("alt")?.trim()
+                            ?.replace(Regex("""\s*\d+\.?\s*[Bb][oöô]l[uüû]m.*$"""), "")
+                            ?.let { cleanTitle(it) }?.ifBlank { null }
                 } else {
                     val titleEl = el.selectFirst("div.title, .truncateText, h4, h5, h3, strong, b")
                     val clone = (titleEl ?: el).clone()
                     clone.select("span.tag, span.label, .tag, .genres, a[href*=kategori]").remove()
-                    clone.text().trim().ifBlank { img.attr("alt").trim() }.ifBlank { null }
+                    cleanTitle(clone.text().trim())
+                        .ifBlank { img?.attr("alt")?.let { cleanTitle(it) } ?: "" }
+                        .ifBlank { null }
                 }
                 if (title.isNullOrBlank()) return@mapNotNull null
 
