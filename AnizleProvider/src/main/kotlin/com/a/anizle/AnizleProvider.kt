@@ -425,15 +425,14 @@ class AnizleProvider : MainAPI() {
                         // Wrap callback so the link is labelled "FansubName - GDrive"
                         // instead of the extractor's own generic source name.
                         loadExtractor(driveUrl, "$mainUrl/", subtitleCallback) { link ->
-                            callback(newExtractorLink(
-                                source = link.source,
-                                name   = label,
-                                url    = link.url,
-                                type   = link.type,
-                            ) {
-                                quality = link.quality
-                                referer = link.referer
-                            })
+                            callback(ExtractorLink(
+                                source  = link.source,
+                                name    = label,
+                                url     = link.url,
+                                referer = link.referer,
+                                quality = link.quality,
+                                type    = link.type,
+                            ))
                         }
                         found = true
                     } else {
