@@ -26,6 +26,8 @@ class AnizleProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private val playerBase = "https://anizmplayer.com"
+    // Python source uses anizle.org specifically for player page requests (step 4)
+    private val videoBase  = "https://anizle.org"
 
     // Session warmup — uses NiceHttp's shared cookie jar which already has
     // valid CF cookies if the Anizm extension ran recently on this device.
@@ -165,6 +167,7 @@ class AnizleProvider : MainAPI() {
 
     // ── Load (anime detail page) ───────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
+        getSession()
         val doc = app.get(url, headers = baseHeaders).document
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
@@ -220,61 +223,97 @@ class AnizleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val doc = try {
-            app.get(data, headers = baseHeaders).document
-        } catch (_: Exception) { return false }
+        getSession() // ensure cookies active for all requests below
+        android.util.Log.d("Anizle", "loadLinks: $data")
 
-        // Step 1: fansub buttons
-        val fansubEls = doc.select("div.fansubSecimKutucugu a[translator]")
-            .ifEmpty { doc.select("div#fansec > a[translator], a[translator]") }
+        val epHtml = try {
+            app.get(data, headers = baseHeaders).text
+        } catch (e: Exception) {
+            android.util.Log.e("Anizle", "Episode page error: ${e.message}")
+            return false
+        }
+        android.util.Log.d("Anizle", "Episode page len=${epHtml.length}")
 
-        if (fansubEls.isEmpty()) return false
+        // Step 1: translator buttons — regex like Python
+        val translators = mutableListOf<Pair<String, String>>()
+        Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
+            .findAll(epHtml).forEach { m ->
+                val url = m.groupValues[1]; if (url.isBlank()) return@forEach
+                if (translators.none { it.first == url })
+                    translators += url to m.groupValues[2].ifBlank { "Fansub" }
+            }
+        if (translators.isEmpty()) {
+            Regex("""data-fansub-name="([^"]*)"[^>]*translator="([^"]+)"""")
+                .findAll(epHtml).forEach { m ->
+                    val url = m.groupValues[2]; if (url.isBlank()) return@forEach
+                    if (translators.none { it.first == url })
+                        translators += url to m.groupValues[1].ifBlank { "Fansub" }
+                }
+        }
+        android.util.Log.d("Anizle", "Step1: ${translators.size} translators")
+        if (translators.isEmpty()) return false
 
         var found = false
 
-        for (fansubEl in fansubEls) {
-            val trUrl     = fansubEl.attr("abs:translator").ifBlank {
-                fansubEl.attr("translator").let { if (it.startsWith("http")) it else "$mainUrl/$it" }
-            }.ifBlank { continue }
-            val fansubName = fansubEl.text().trim().ifBlank { "Fansub" }
+        for ((trUrl, fansubName) in translators) {
+            android.util.Log.d("Anizle", "Step2: $fansubName -> $trUrl")
 
-            // Step 2: video button list
+            // Step 2: GET translator URL → JSON {data: html} → video buttons
             val trText = try {
-                app.get(trUrl, headers = xhrHeaders).text
-            } catch (_: Exception) { continue }
+                app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
+            } catch (e: Exception) {
+                android.util.Log.e("Anizle", "Translator fetch error: ${e.message}"); continue
+            }
+            android.util.Log.d("Anizle", "Step2 resp len=${trText.length}")
 
-            val trHtml = try { JSONObject(trText).optString("data", trText) }
-            catch (_: Exception) { trText }
+            val trHtml = try { JSONObject(trText).optString("data", "") }
+                         catch (_: Exception) { "" }
+            if (trHtml.isBlank()) {
+                android.util.Log.w("Anizle", "Step2: no data field, raw=${trText.take(80)}")
+                continue
+            }
 
-            // Parse video buttons: <a class="videoPlayerButtons" video="URL">Name</a>
-            val trDoc  = org.jsoup.Jsoup.parse(trHtml)
-            val videoEls = trDoc.select("a.videoPlayerButtons[video]")
-                .ifEmpty { trDoc.select("a[video]") }
+            // video="URL" data-video-name="Name" — exact Python pattern
+            val videos = mutableListOf<Pair<String, String>>()
+            Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
+                .findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
+            if (videos.isEmpty()) {
+                Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
+                    .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
+            }
+            android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
 
-            for (videoEl in videoEls) {
-                val videoUrl  = videoEl.attr("video").let {
-                    if (it.startsWith("http")) it else "$mainUrl/$it"
-                }.ifBlank { continue }
-                val videoName = videoEl.text().trim().ifBlank { "Player" }
+            for ((videoUrl, videoName) in videos) {
+                android.util.Log.d("Anizle", "Step3: $videoName -> $videoUrl")
 
-                // Step 3: player numeric ID
+                // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
                 val vText = try {
-                    app.get(videoUrl, headers = xhrHeaders).text
-                } catch (_: Exception) { continue }
-                val playerHtml = try { JSONObject(vText).optString("player", vText) }
-                catch (_: Exception) { vText }
+                    app.get(videoUrl, headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
+                } catch (e: Exception) {
+                    android.util.Log.e("Anizle", "Video fetch error: ${e.message}"); continue
+                }
+                val playerHtml = try { JSONObject(vText).optString("player", "") }
+                                 catch (_: Exception) { "" }
+                val playerId = Regex("""/player/(\d+)""").find(playerHtml)?.groupValues?.get(1)
+                android.util.Log.d("Anizle", "Step3: playerId=$playerId")
+                playerId ?: continue
 
-                val playerId = Regex("""/player/(\d+)""")
-                    .find(playerHtml)?.groupValues?.get(1) ?: continue
-
-                // Step 4: FirePlayer hash
+                // Step 4: GET player page → packed JS → FirePlayer hash
                 val pageHtml = try {
-                    app.get("$mainUrl/player/$playerId", headers = baseHeaders).text
-                } catch (_: Exception) { continue }
+                    app.get(
+                        "$videoBase/player/$playerId",
+                        headers = baseHeaders + mapOf("Referer" to "$videoBase/")
+                    ).text
+                } catch (e: Exception) {
+                    android.util.Log.e("Anizle", "Player page error: ${e.message}"); continue
+                }
+                android.util.Log.d("Anizle", "Step4: page len=${pageHtml.length}")
 
-                val fireId = extractFireplayerId(pageHtml) ?: continue
+                val fireId = extractFireplayerId(pageHtml)
+                android.util.Log.d("Anizle", "Step4: fireId=$fireId")
+                fireId ?: continue
 
-                // Step 5: real stream
+                // Step 5: POST to anizmplayer.com → JSON {hls,securedLink} or {videoSource}
                 val streamText = try {
                     app.post(
                         "$playerBase/player/index.php?data=$fireId&do=getVideo",
@@ -286,10 +325,13 @@ class AnizleProvider : MainAPI() {
                             "Origin"           to playerBase,
                         )
                     ).text
-                } catch (_: Exception) { continue }
+                } catch (e: Exception) {
+                    android.util.Log.e("Anizle", "getVideo error: ${e.message}"); continue
+                }
+                android.util.Log.d("Anizle", "Step5: ${streamText.take(120)}")
 
                 val json  = try { JSONObject(streamText) } catch (_: Exception) { continue }
-                val label = "$fansubName – $videoName"
+                val label = "$fansubName - $videoName"
 
                 val securedLink = json.optString("securedLink", "")
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
@@ -308,6 +350,7 @@ class AnizleProvider : MainAPI() {
         return found
     }
 
+    
     // ── JS helpers ────────────────────────────────────────────────────────────
 
     private fun extractFireplayerId(html: String): String? {
