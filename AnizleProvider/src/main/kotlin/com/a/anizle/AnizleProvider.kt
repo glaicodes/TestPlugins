@@ -431,7 +431,7 @@ class AnizleProvider : MainAPI() {
                                 url     = link.url,
                                 referer = link.referer,
                                 quality = link.quality,
-                                type    = link.type,
+                                isM3u8  = false,
                             ))
                         }
                         found = true
