@@ -28,12 +28,18 @@ class AnizleProvider : MainAPI() {
 
     private val playerBase = "https://anizmplayer.com"
 
-    // CloudflareKiller bypasses the JS challenge — same as kraptor's getSession
+    // CloudflareKiller is passed as an interceptor — it auto-handles the CF challenge
+    // on the first request and stores the cookie for all subsequent requests.
     private val cfKiller = CloudflareKiller()
 
     private suspend fun getSession() {
         android.util.Log.d("Anizle", "getSession başlatıldı")
-        try { cfKiller.bypass(mainUrl) } catch (e: Exception) {
+        try {
+            // Hit the main page through cfKiller so it can solve the CF challenge
+            // and cache the cf_clearance cookie before we make API calls.
+            app.get(mainUrl, interceptor = cfKiller, headers = baseHeaders)
+            android.util.Log.d("Anizle", "getSession tamamlandı")
+        } catch (e: Exception) {
             android.util.Log.e("Anizle", "getSession hatasi: ${e.message}")
         }
     }
