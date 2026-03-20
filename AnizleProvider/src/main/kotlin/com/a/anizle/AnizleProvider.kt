@@ -65,17 +65,18 @@ class AnizleProvider : MainAPI() {
 
     // ── Search ────────────────────────────────────────────────────────────────
     // GET /searchAnime?query=TERM&type=detailed&limit=10&...
-    // Results: div.aramaSonucItem  →  a.titleLink (url+title)  +  img (poster)
+    // Returns JSON: {"data": [{"info_title":"..","info_slug":"..","info_poster":"..","info_year":2020}]}
+    // Confirmed by reverse-engineering: search uses Jackson readValue, NOT HTML parsing.
     override suspend fun search(query: String): List<SearchResponse> {
         ensureDomain()
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
-        val doc = try {
+        val responseText = try {
             app.get(
                 "$mainUrl/searchAnime",
-                headers  = baseHeaders,
-                params   = mapOf(
+                headers = baseHeaders,
+                params  = mapOf(
                     "query"          to q,
                     "type"           to "detailed",
                     "limit"          to "20",
@@ -83,20 +84,29 @@ class AnizleProvider : MainAPI() {
                     "orderBy"        to "info_year",
                     "orderDirection" to "ASC",
                 )
-            ).document
+            ).text
         } catch (_: Exception) { return emptyList() }
 
-        return doc.select("div.aramaSonucItem").mapNotNull { el ->
-            val link   = el.selectFirst("a.titleLink") ?: el.selectFirst("a[href]") ?: return@mapNotNull null
-            val url    = link.attr("abs:href").ifBlank { return@mapNotNull null }
-            val title  = el.selectFirst("div.title, div.posterAlt.truncateText")
-                ?.text()?.trim()
-                ?: link.text().trim()
-            if (title.isBlank()) return@mapNotNull null
-            val poster = el.selectFirst("img[src*=pcovers], img")?.attr("abs:src")?.ifBlank { null }
+        return try {
+            // Response is {"data": [...]} wrapping the result list
+            val root = org.json.JSONObject(responseText)
+            val arr  = root.optJSONArray("data") ?: org.json.JSONArray(responseText)
 
-            newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
-        }
+            (0 until arr.length()).mapNotNull { i ->
+                val obj   = arr.optJSONObject(i) ?: return@mapNotNull null
+                val slug  = obj.optString("info_slug",  "").ifBlank { return@mapNotNull null }
+                val title = obj.optString("info_title", "").ifBlank { return@mapNotNull null }
+                val thumb = obj.optString("info_poster", "")
+                val poster = when {
+                    thumb.isBlank()           -> null
+                    thumb.startsWith("http")  -> thumb
+                    else -> "$mainUrl/storage/pcovers/$thumb"
+                }
+                newAnimeSearchResponse(title, "$mainUrl/$slug", TvType.Anime) {
+                    posterUrl = poster
+                }
+            }
+        } catch (_: Exception) { emptyList() }
     }
 
     // ── Home page ─────────────────────────────────────────────────────────────
