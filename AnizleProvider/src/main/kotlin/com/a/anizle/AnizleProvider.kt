@@ -1,6 +1,7 @@
 package com.a.anizle
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,6 +29,10 @@ class AnizleProvider : MainAPI() {
     private val playerBase = "https://anizmplayer.com"
     // Python source uses anizle.org specifically for player page requests (step 4)
     private val videoBase  = "https://anizle.org"
+
+    // CloudflareKiller solves the JS challenge on /video/* endpoints
+    // (those return "Just a moment..." without it)
+    private val cfKiller = CloudflareKiller()
 
     // Session warmup — uses NiceHttp's shared cookie jar which already has
     // valid CF cookies if the Anizm extension ran recently on this device.
@@ -289,8 +294,10 @@ class AnizleProvider : MainAPI() {
 
                 // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
                 val vText = try {
+                    // /video/* endpoints are behind a separate CF JS challenge — need cfKiller
                     app.get(videoUrl,
-                        headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
+                        headers = xhrHeaders + mapOf("Referer" to mainUrl),
+                        interceptor = cfKiller).text
                 } catch (e: Exception) {
                     android.util.Log.e("Anizle", "Video fetch error: ${e.message}"); continue
                 }
