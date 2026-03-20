@@ -178,8 +178,11 @@ class AnizleProvider : MainAPI() {
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
             ?: url.substringAfterLast("/").replace("-", " ").trim()
 
-        val poster = doc.selectFirst("div.infoPosterImg > img, img[src*=pcovers]")
-            ?.attr("abs:src")
+        val posterEl = doc.selectFirst("div.infoPosterImg > img, img[src*=pcovers]")
+        val poster = posterEl?.attr("abs:src")
+            ?.ifBlank { posterEl.attr("data-src") }
+            ?.ifBlank { posterEl.attr("abs:data-src") }
+            ?.ifBlank { null }
 
         val plot = doc.selectFirst("div.infoDesc, .anime-description, .description")
             ?.also { it.select("h1,h2,h3,h4,a").remove() }
