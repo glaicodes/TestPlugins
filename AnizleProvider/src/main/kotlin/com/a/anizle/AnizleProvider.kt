@@ -29,11 +29,20 @@ class AnizleProvider : MainAPI() {
 
     // Session warmup — uses NiceHttp's shared cookie jar which already has
     // valid CF cookies if the Anizm extension ran recently on this device.
+    private var csrfToken: String? = null
+
     private suspend fun getSession() {
         android.util.Log.d("Anizle", "getSession başlatıldı")
         try {
             val resp = app.get(mainUrl, headers = baseHeaders)
-            android.util.Log.d("Anizle", "getSession HTTP ${resp.code} len=${resp.text.length}")
+            val html = resp.text
+            android.util.Log.d("Anizle", "getSession HTTP ${resp.code} len=${html.length}")
+            // Extract CSRF token from meta tag: <meta name="csrf-token" content="...">
+            csrfToken = Regex("""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']""")
+                .find(html)?.groupValues?.get(1)
+                ?: Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""")
+                .find(html)?.groupValues?.get(1)
+            android.util.Log.d("Anizle", "CSRF token: $csrfToken")
         } catch (e: Exception) {
             android.util.Log.e("Anizle", "getSession hatasi: ${e.message}")
         }
@@ -69,17 +78,20 @@ class AnizleProvider : MainAPI() {
         getSession()
 
         val responseText = try {
-            val resp = app.get(
+            val postData = mutableMapOf(
+                "query"          to q,
+                "type"           to "detailed",
+                "limit"          to "20",
+                "priorityField"  to "info_title",
+                "orderBy"        to "info_year",
+                "orderDirection" to "ASC",
+            )
+            csrfToken?.let { postData["_token"] = it }
+            android.util.Log.d("Anizle", "POST /searchAnime _token=${csrfToken?.take(10)}")
+            val resp = app.post(
                 "$mainUrl/searchAnime",
-                headers = baseHeaders,
-                params  = mapOf(
-                    "query"          to q,
-                    "type"           to "detailed",
-                    "limit"          to "20",
-                    "priorityField"  to "info_title",
-                    "orderBy"        to "info_year",
-                    "orderDirection" to "ASC",
-                )
+                headers = xhrHeaders,
+                data    = postData,
             )
             android.util.Log.d("Anizle", "HTTP ${resp.code} len=${resp.text.length}")
             resp.text
