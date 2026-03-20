@@ -292,25 +292,33 @@ class AnizleProvider : MainAPI() {
                 } catch (e: Exception) {
                     android.util.Log.e("Anizle", "Video fetch error: ${e.message}"); continue
                 }
-                val playerHtml = try { JSONObject(vText).optString("player", "") }
-                                 catch (_: Exception) { "" }
+                android.util.Log.d("Anizle", "Step3 raw[300]: ${vText.take(300)}")
+                val playerHtml = try { JSONObject(vText).optString("player", vText) }
+                                 catch (_: Exception) { vText }
+                android.util.Log.d("Anizle", "Step3 playerHtml[200]: ${playerHtml.take(200)}")
+
+                // Check for direct FirePlayer hash embedded in player html (skip step 4)
+                val directFireId = extractFireplayerId(playerHtml)
                 val playerId = Regex("""/player/(\d+)""").find(playerHtml)?.groupValues?.get(1)
-                android.util.Log.d("Anizle", "Step3: playerId=$playerId")
-                playerId ?: continue
+                android.util.Log.d("Anizle", "Step3: playerId=$playerId directFireId=$directFireId")
 
-                // Step 4: GET player page → packed JS → FirePlayer hash
-                val pageHtml = try {
-                    app.get(
-                        "$videoBase/player/$playerId",
-                        headers = baseHeaders + mapOf("Referer" to "$videoBase/")
-                    ).text
-                } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Player page error: ${e.message}"); continue
+                // Step 4: FirePlayer hash — try player page on both domains
+                val fireId: String? = directFireId ?: run {
+                    playerId ?: return@run null
+                    for (base4 in listOf(mainUrl, videoBase)) {
+                        val pageHtml = try {
+                            app.get("$base4/player/$playerId",
+                                headers = baseHeaders + mapOf("Referer" to "$base4/")).text
+                        } catch (e: Exception) {
+                            android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
+                        }
+                        android.util.Log.d("Anizle", "Step4 ($base4): len=${pageHtml.length}")
+                        val fid = extractFireplayerId(pageHtml)
+                        android.util.Log.d("Anizle", "Step4: fireId=$fid")
+                        if (fid != null) return@run fid
+                    }
+                    null
                 }
-                android.util.Log.d("Anizle", "Step4: page len=${pageHtml.length}")
-
-                val fireId = extractFireplayerId(pageHtml)
-                android.util.Log.d("Anizle", "Step4: fireId=$fireId")
                 fireId ?: continue
 
                 // Step 5: POST to anizmplayer.com → JSON {hls,securedLink} or {videoSource}
