@@ -368,15 +368,16 @@ class AnizleProvider : MainAPI() {
 
                 // ── GDrive path ──────────────────────────────────────────────
                 if (isGdrive) {
-                    // Player page embeds a drive.google.com/file/d/{fileId} link
+                    // Player page embeds a drive.google.com/file/d/{fileId} link.
+                    // Pass it to CloudStream's built-in GoogleDrive extractor which
+                    // resolves the actual stream URL correctly.
                     val fileId = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]+)""")
                         .find(pageHtml)?.groupValues?.get(1)
                         ?: Regex("""[?&]id=([A-Za-z0-9_-]+)""").find(pageHtml)?.groupValues?.get(1)
                     if (fileId != null) {
-                        val driveUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+                        val driveUrl = "https://drive.google.com/file/d/$fileId/view"
                         android.util.Log.d("Anizle", "GDrive fileId=$fileId")
-                        callback(newExtractorLink(source = name, name = label, url = driveUrl,
-                            type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
+                        loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
                         found = true
                     } else {
                         android.util.Log.w("Anizle", "GDrive: fileId not found in player page")
