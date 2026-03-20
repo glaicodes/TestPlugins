@@ -159,29 +159,15 @@ class AnizleProvider : MainAPI() {
         val url = if (isEpisodePage) "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
         val doc = app.get(url, headers = baseHeaders).document
 
-        // ── DEBUG: identify the big banner element ──
-        android.util.Log.d("AnizleHP", "=== PAGE $url ===")
-        // Look for any large image-bearing container near the top
-        listOf("div.sliderBlock", "div.featured", "div.bigBanner", "div.heroSection",
-               "div.mainSlider", "div.slideShowBlock", "section.slider", ".homeBanner",
-               "div[class*=slide]", "div[class*=banner]", "div[class*=hero]", "div[class*=feature]"
-        ).forEach { sel ->
-            val els = doc.select(sel)
-            if (els.isNotEmpty())
-                android.util.Log.d("AnizleHP", "BANNER sel='$sel' count=${els.size} html=${els.first()?.outerHtml()?.take(300)}")
-        }
-        // Also log any element with a background-image style
-        doc.select("[style*=background]").take(3).forEachIndexed { i, el ->
-            android.util.Log.d("AnizleHP", "BG[$i] tag=${el.tagName()} class=${el.className()} style=${el.attr("style").take(100)}")
-        }
 
         // Helper: make a src attribute value absolute
         fun toAbsUrl(src: String): String? {
-            if (src.isBlank()) return null
+            if (src.isBlank() || src.startsWith("data:")) return null
             return when {
                 src.startsWith("http") -> src
+                src.startsWith("//")   -> "https:$src"
                 src.startsWith("/")    -> "$mainUrl$src"
-                else                   -> null
+                else                   -> "$mainUrl/$src"  // bare relative path
             }
         }
 
