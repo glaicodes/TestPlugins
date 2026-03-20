@@ -19,15 +19,14 @@ import org.json.JSONObject
  */
 class AnizleProvider : MainAPI() {
 
-    override var mainUrl    = "https://anizle.org"
+    override var mainUrl    = "https://anizm.net"
     override var name       = "Anizle"
     override var lang       = "tr"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val playerBase  = "https://anizmplayer.com"
-    private val domainListUrl =
-        "https://raw.githubusercontent.com/Kraptor123/domainListesi/refs/heads/main/eklenti_domainleri.txt"
+    private val playerBase = "https://anizmplayer.com"
+
 
     private val baseHeaders get() = mapOf(
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
@@ -41,26 +40,13 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
-    // ── Dynamic domain ────────────────────────────────────────────────────────
-    // The site keeps switching domains. Fetch the current one at startup,
-    // fall back to anizle.org if the list can't be reached.
-    private var domainInitialised = false
-
-    private suspend fun ensureDomain() {
-        if (domainInitialised) return
-        domainInitialised = true
-        try {
-            val text = app.get(domainListUrl).text.trim()
-            // File contains lines like "anizle_url=https://anizle.org"
-            // or just a plain URL per line — handle both
-            val url = text.lines()
-                .map { it.trim() }
-                .firstOrNull { it.startsWith("http") && it.contains("aniz") }
-                ?: text.lines().firstOrNull { it.startsWith("http") }
-            if (!url.isNullOrBlank()) {
-                mainUrl = url.trimEnd('/')
-            }
-        } catch (_: Exception) { /* keep default */ }
+    // Warm up a session against the main page so Cloudflare cookies are set
+    // before we make API calls. Mirrors what the kraptor extension does with getSession.
+    private var sessionReady = false
+    private suspend fun ensureSession() {
+        if (sessionReady) return
+        sessionReady = true
+        try { app.get(mainUrl, headers = baseHeaders) } catch (_: Exception) {}
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -68,7 +54,7 @@ class AnizleProvider : MainAPI() {
     // Returns JSON: {"data": [{"info_title":"..","info_slug":"..","info_poster":"..","info_year":2020}]}
     // Confirmed by reverse-engineering: search uses Jackson readValue, NOT HTML parsing.
     override suspend fun search(query: String): List<SearchResponse> {
-        ensureDomain()
+        ensureSession()
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
@@ -116,7 +102,7 @@ class AnizleProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        ensureDomain()
+        ensureSession()
         val url = if (request.data == "anime-izle")
             "$mainUrl/anime-izle?sayfa=$page"
         else
@@ -150,7 +136,7 @@ class AnizleProvider : MainAPI() {
 
     // ── Load (anime detail page) ───────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        ensureDomain()
+        ensureSession()
         val doc = app.get(url, headers = baseHeaders).document
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
@@ -206,7 +192,7 @@ class AnizleProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        ensureDomain()
+        ensureSession()
         val doc = try {
             app.get(data, headers = baseHeaders).document
         } catch (_: Exception) { return false }
