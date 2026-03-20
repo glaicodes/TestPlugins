@@ -41,11 +41,7 @@ class AnizleProvider : MainAPI() {
     private suspend fun getSession() {
         android.util.Log.d("Anizle", "getSession başlatıldı")
         try {
-            // Use cfKiller here so it builds up a CF clearance cookie for anizm.net.
-            // Even if the homepage doesn't present a challenge, cfKiller will cache the
-            // result and reuse those cookies for /video/* requests — skipping the WebView
-            // on each video and avoiding the 60s timeout.
-            val resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller)
+            val resp = app.get(mainUrl, headers = baseHeaders)
             val html = resp.text
             android.util.Log.d("Anizle", "getSession HTTP ${resp.code} len=${html.length}")
             // Extract CSRF token from meta tag: <meta name="csrf-token" content="...">
@@ -297,24 +293,33 @@ class AnizleProvider : MainAPI() {
                 android.util.Log.d("Anizle", "Step3: $videoName -> $videoUrl")
 
                 // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
-                // /video/* is behind a CF challenge. We use cfKiller; because getSession()
-                // already called cfKiller on mainUrl, cfKiller should reuse the cached
-                // clearance cookie rather than launching a new WebView for each video.
-                val vText = try {
+                // Try plain first — the shared NiceHttp cookie jar may already have CF clearance
+                // from the Anizm extension running on this device. Only use cfKiller as fallback.
+                var vText = try {
                     app.get(videoUrl,
-                        headers = xhrHeaders + mapOf("Referer" to mainUrl),
-                        interceptor = cfKiller).text
+                        headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
                 } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Video fetch error: ${e.message}"); continue
+                    android.util.Log.e("Anizle", "Video fetch error (plain): ${e.message}"); continue
                 }
                 android.util.Log.d("Anizle", "Step3 raw[300]: ${vText.take(300)}")
 
-                // Guard: if CF still blocked us, skip rather than parse garbage HTML
+                // If CF challenge came back, retry once with cfKiller
                 if (vText.contains("Just a moment", ignoreCase = true) ||
-                    vText.contains("cf-browser-verification", ignoreCase = true) ||
                     vText.trimStart().startsWith("<!DOCTYPE")) {
-                    android.util.Log.e("Anizle", "Step3: CF challenge not bypassed for $videoUrl — skipping")
-                    continue
+                    android.util.Log.w("Anizle", "Step3: CF on plain req, retrying with cfKiller")
+                    vText = try {
+                        app.get(videoUrl,
+                            headers = xhrHeaders + mapOf("Referer" to mainUrl),
+                            interceptor = cfKiller).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "Video fetch error (cfKiller): ${e.message}"); continue
+                    }
+                    android.util.Log.d("Anizle", "Step3 cfKiller raw[300]: ${vText.take(300)}")
+                    if (vText.contains("Just a moment", ignoreCase = true) ||
+                        vText.trimStart().startsWith("<!DOCTYPE")) {
+                        android.util.Log.e("Anizle", "Step3: CF not bypassed for $videoUrl — skipping")
+                        continue
+                    }
                 }
                 val playerHtml = try {
                     val j = JSONObject(vText)
