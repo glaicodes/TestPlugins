@@ -1,0 +1,45 @@
+[
+    {
+        "iconUrl": "https://anizm.pro/favicon.ico",
+        "fileHash": "sha256-8216efbfea67c3a09c09ba0beeda7cdbb1306a603146ab3fb509605891f5e5e3",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "fileSize": 48195,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            " "
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "OVA"
+        ],
+        "version": 85,
+        "internalName": "AnizleProvider",
+        "description": "Anizle / Anizm",
+        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/AnizleProvider.cs3",
+        "name": "AnizleProvider"
+    },
+    {
+        "iconUrl": "https://rezeroizle.com/images/icon.png",
+        "fileHash": "sha256-3e68791f17bd7f01123524760658389f428c58552184bbf42051f8cf7bf9571a",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "fileSize": 21862,
+        "status": 1,
+        "language": "tr",
+        "authors": [
+            "a"
+        ],
+        "tvTypes": [
+            "Anime",
+            "OVA"
+        ],
+        "version": 16,
+        "internalName": "ReZeroIzleProvider",
+        "description": "Re:Zero kara Hajimeru Isekai Seikatsu \u2014 T\u00fcrk\u00e7e altyaz\u0131l\u0131, Google Drive \u00fczerinden.",
+        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/ReZeroIzleProvider.cs3",
+        "name": "ReZeroIzleProvider"
+    }
+]
