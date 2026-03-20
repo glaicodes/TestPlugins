@@ -2,12 +2,20 @@ package com.a.anizle
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Anizle CloudStream 3 Provider
- * Source: https://anizle.org
+ * Anizle / Anizm CloudStream 3 Provider
+ *
+ * Reverse-engineered from the kraptor Anizm cs3 extension (v44).
+ *
+ * Key findings:
+ *  - Domain changes frequently; fetched from a remote list at startup
+ *  - Search:   GET /searchAnime?query=...  → div.aramaSonucItem
+ *  - Episodes: div#episodesMiddle a[href]
+ *  - Fansubs:  div.fansubSecimKutucugu a[translator]
+ *  - Videos:   a.videoPlayerButtons[video]  (XHR JSON → player html → FirePlayer hash)
  */
 class AnizleProvider : MainAPI() {
 
@@ -17,134 +25,143 @@ class AnizleProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val playerBase = "https://anizmplayer.com"
+    private val playerBase  = "https://anizmplayer.com"
+    private val domainListUrl =
+        "https://raw.githubusercontent.com/Kraptor123/domainListesi/refs/heads/main/eklenti_domainleri.txt"
 
-    private val baseHeaders = mapOf(
+    private val baseHeaders get() = mapOf(
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
-        "Origin"          to "https://anizle.org",
-        "Referer"         to "https://anizle.org/",
+        "Origin"          to mainUrl,
+        "Referer"         to "$mainUrl/",
     )
-    private val xhrHeaders = baseHeaders + mapOf(
+    private val xhrHeaders get() = baseHeaders + mapOf(
         "X-Requested-With" to "XMLHttpRequest",
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
+    // ── Dynamic domain ────────────────────────────────────────────────────────
+    // The site keeps switching domains. Fetch the current one at startup,
+    // fall back to anizle.org if the list can't be reached.
+    private var domainInitialised = false
+
+    private suspend fun ensureDomain() {
+        if (domainInitialised) return
+        domainInitialised = true
+        try {
+            val text = app.get(domainListUrl).text.trim()
+            // File contains lines like "anizle_url=https://anizle.org"
+            // or just a plain URL per line — handle both
+            val url = text.lines()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("http") && it.contains("aniz") }
+                ?: text.lines().firstOrNull { it.startsWith("http") }
+            if (!url.isNullOrBlank()) {
+                mainUrl = url.trimEnd('/')
+            }
+        } catch (_: Exception) { /* keep default */ }
+    }
+
     // ── Search ────────────────────────────────────────────────────────────────
-    // Uses the real server-side search endpoint /searchAnime?query=
-    // discovered by reverse-engineering the kraptor Anizm cs3 extension.
-    // Results are in div.aramaSonucItem elements.
+    // GET /searchAnime?query=TERM&type=detailed&limit=10&...
+    // Results: div.aramaSonucItem  →  a.titleLink (url+title)  +  img (poster)
     override suspend fun search(query: String): List<SearchResponse> {
+        ensureDomain()
         val q = query.trim()
         if (q.isBlank()) return emptyList()
 
         val doc = try {
             app.get(
                 "$mainUrl/searchAnime",
-                headers = baseHeaders,
-                params = mapOf(
-                    "query"         to q,
-                    "type"          to "detailed",
-                    "limit"         to "20",
-                    "priorityField" to "info_title",
-                    "orderBy"       to "info_year",
+                headers  = baseHeaders,
+                params   = mapOf(
+                    "query"          to q,
+                    "type"           to "detailed",
+                    "limit"          to "20",
+                    "priorityField"  to "info_title",
+                    "orderBy"        to "info_year",
                     "orderDirection" to "ASC",
                 )
             ).document
-        } catch (e: Exception) { return emptyList() }
+        } catch (_: Exception) { return emptyList() }
 
         return doc.select("div.aramaSonucItem").mapNotNull { el ->
-            // Link — <a class="titleLink" href="/slug"> or <a class="animeDetayKutuLink">
-            val link = el.selectFirst("a.titleLink, a.animeDetayKutuLink, a[href]")
-                ?: return@mapNotNull null
-            val url   = link.attr("abs:href").ifBlank { return@mapNotNull null }
-            val title = el.selectFirst("div.title, div.posterAlt, .truncateText, a.titleLink")
+            val link   = el.selectFirst("a.titleLink") ?: el.selectFirst("a[href]") ?: return@mapNotNull null
+            val url    = link.attr("abs:href").ifBlank { return@mapNotNull null }
+            val title  = el.selectFirst("div.title, div.posterAlt.truncateText")
                 ?.text()?.trim()
                 ?: link.text().trim()
             if (title.isBlank()) return@mapNotNull null
-            val poster = el.selectFirst("img.infoPosterImgItem, img[src*=pcovers], img")
-                ?.attr("abs:src")?.ifBlank { null }
+            val poster = el.selectFirst("img[src*=pcovers], img")?.attr("abs:src")?.ifBlank { null }
 
-            newAnimeSearchResponse(title, url, TvType.Anime) {
-                posterUrl = poster
-            }
+            newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
         }
     }
 
     // ── Home page ─────────────────────────────────────────────────────────────
     override val mainPage = mainPageOf(
-        "1" to "Son Eklenen Bölümler",
-        "2" to "Son Eklenen Animeler",
+        "anime-izle" to "Son Eklenen Bölümler",
+        ""           to "Son Eklenen Animeler",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc = app.get("$mainUrl?sayfa=$page", headers = baseHeaders).document
+        ensureDomain()
+        val url = if (request.data == "anime-izle")
+            "$mainUrl/anime-izle?sayfa=$page"
+        else
+            "$mainUrl?sayfa=$page"
 
-        val items: List<SearchResponse> = when (request.data) {
-            "2" -> {
-                // "Son Eklenen Animeler" section at the bottom — cards ending in -izle
-                doc.select("a[href*=-izle]")
-                    .filter { el ->
-                        el.selectFirst("img[src*=pcovers]") != null &&
-                        !el.attr("href").contains("-bolum")
-                    }
-                    .distinctBy { it.attr("href") }
-                    .mapNotNull { el ->
-                        val href  = el.attr("abs:href").ifBlank { return@mapNotNull null }
-                        val url   = href.removeSuffix("-izle")
-                        val img   = el.selectFirst("img") ?: return@mapNotNull null
-                        val poster = img.attr("abs:src").ifBlank { null }
-                        val title = el.text().trim().ifBlank { img.attr("alt").trim() }
-                        if (title.isBlank()) return@mapNotNull null
-                        newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
-                    }
+        val doc = app.get(url, headers = baseHeaders).document
+
+        val items = doc.select("div#episodesMiddle div.posterBlock > a, a.imgWrapperLink, a[href*=-bolum]")
+            .ifEmpty { doc.select("a[href*=-izle]").filter { it.selectFirst("img") != null } }
+            .distinctBy { it.attr("href") }
+            .mapNotNull { el ->
+                val href   = el.attr("abs:href").ifBlank { return@mapNotNull null }
+                val img    = el.selectFirst("img") ?: return@mapNotNull null
+                val poster = img.attr("abs:src").ifBlank { null }
+                val title  = el.selectFirst("div.title, .truncateText, strong, b, h6")
+                    ?.text()?.trim()
+                    ?: img.attr("alt").trim()
+                if (title.isBlank()) return@mapNotNull null
+
+                // If this is an episode link, strip to anime URL
+                val animeUrl = if (href.contains("-bolum"))
+                    href.replace(Regex("""-\d+[-.]?bolum[^/]*$"""), "").trimEnd('-')
+                else
+                    href.removeSuffix("-izle")
+
+                newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
             }
-            else -> {
-                // "Son Eklenen Bölümler" — episode links containing -bolum
-                doc.select("a[href*=-bolum]")
-                    .filter { it.selectFirst("img") != null }
-                    .distinctBy { it.attr("href") }
-                    .mapNotNull { el ->
-                        val href   = el.attr("abs:href").ifBlank { return@mapNotNull null }
-                        val img    = el.selectFirst("img") ?: return@mapNotNull null
-                        val poster = img.attr("abs:src").ifBlank { null }
-                        val title  = el.select("h6, strong, b, p").firstOrNull()?.text()?.trim()
-                            ?: el.text().lines().lastOrNull { it.isNotBlank() }?.trim()
-                            ?: return@mapNotNull null
-                        // Convert episode URL to anime URL
-                        val animeUrl = href
-                            .replace(Regex("""-\d+[-.]?bolum[^/]*$"""), "")
-                            .trimEnd('-')
-                        newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
-                    }
-            }
-        }
 
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     // ── Load (anime detail page) ───────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
+        ensureDomain()
         val doc = app.get(url, headers = baseHeaders).document
 
-        val title = doc.selectFirst("h1")?.text()?.trim()
+        val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
             ?: url.substringAfterLast("/").replace("-", " ").trim()
 
-        val poster = doc.select("img[src*=pcovers], img[src*=storage]")
-            .firstOrNull()?.attr("abs:src")
+        val poster = doc.selectFirst("div.infoPosterImg > img, img[src*=pcovers]")
+            ?.attr("abs:src")
 
-        val plot = doc.selectFirst(".anime-description, .description, .summary")
+        val plot = doc.selectFirst("div.infoDesc, .anime-description, .description")
             ?.also { it.select("h1,h2,h3,h4,a").remove() }
             ?.text()?.trim()?.ifBlank { null }
 
-        val year = doc.select("li, td, span").map { it.text().trim() }
+        val year = doc.select("span.dataValue, li, td").map { it.text().trim() }
             .firstOrNull { it.matches(Regex("""\d{4}""")) }?.toIntOrNull()
 
-        val tags = doc.select("a[href*=/kategoriler/]")
+        val tags = doc.select("span.dataValue > span.tag > span.label, a[href*=/kategoriler/]")
             .map { it.text().trim() }.filter { it.isNotBlank() }.ifEmpty { null }
 
-        val episodes = doc.select("a[href*=-bolum]")
+        // Episodes are inside div#episodesMiddle
+        val episodes = doc.select("div#episodesMiddle a[href]")
+            .ifEmpty { doc.select("div.episodeListTabContent a[href], a[href*=-bolum]") }
             .mapNotNull { el ->
                 val href  = el.attr("abs:href").ifBlank { return@mapNotNull null }
                 val label = el.text().trim().ifBlank { "Bölüm" }
@@ -166,60 +183,63 @@ class AnizleProvider : MainAPI() {
     }
 
     // ── Load links ────────────────────────────────────────────────────────────
+    // Step 1: div.fansubSecimKutucugu a[translator]  → translator URLs
+    // Step 2: GET translator URL (XHR) → JSON {data: html}
+    //         html contains: a.videoPlayerButtons[video]
+    // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
+    // Step 4: GET /player/{id} → packed JS → FirePlayer hash (32 hex)
+    // Step 5: POST anizmplayer.com/player/index.php?data={hash}&do=getVideo
+    //         → JSON {hls, securedLink} or {videoSource}
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val html = try {
-            app.get(data, headers = baseHeaders).text
-        } catch (e: Exception) { return false }
+        ensureDomain()
+        val doc = try {
+            app.get(data, headers = baseHeaders).document
+        } catch (_: Exception) { return false }
 
-        // Step 1: translator buttons
-        val translators = mutableListOf<Pair<String, String>>()
-        Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""").findAll(html).forEach {
-            val trUrl = it.groupValues[1].ifBlank { return@forEach }
-            if (translators.none { t -> t.first == trUrl })
-                translators += trUrl to it.groupValues[2].ifBlank { "Fansub" }
-        }
-        if (translators.isEmpty()) {
-            Regex("""data-fansub-name="([^"]*)"[^>]*translator="([^"]+)"""").findAll(html).forEach {
-                val trUrl = it.groupValues[2].ifBlank { return@forEach }
-                if (translators.none { t -> t.first == trUrl })
-                    translators += trUrl to it.groupValues[1].ifBlank { "Fansub" }
-            }
-        }
-        if (translators.isEmpty()) return false
+        // Step 1: fansub buttons
+        val fansubEls = doc.select("div.fansubSecimKutucugu a[translator]")
+            .ifEmpty { doc.select("div#fansec > a[translator], a[translator]") }
+
+        if (fansubEls.isEmpty()) return false
 
         var found = false
 
-        for ((trUrl, fansubName) in translators) {
-            // Step 2: video list
+        for (fansubEl in fansubEls) {
+            val trUrl     = fansubEl.attr("abs:translator").ifBlank {
+                fansubEl.attr("translator").let { if (it.startsWith("http")) it else "$mainUrl/$it" }
+            }.ifBlank { continue }
+            val fansubName = fansubEl.text().trim().ifBlank { "Fansub" }
+
+            // Step 2: video button list
             val trText = try {
                 app.get(trUrl, headers = xhrHeaders).text
-            } catch (e: Exception) { continue }
+            } catch (_: Exception) { continue }
 
             val trHtml = try { JSONObject(trText).optString("data", trText) }
-            catch (e: Exception) { trText }
+            catch (_: Exception) { trText }
 
-            val videos = mutableListOf<Pair<String, String>>()
-            Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""").findAll(trHtml).forEach {
-                videos += it.groupValues[1] to it.groupValues[2].ifBlank { "Player" }
-            }
-            if (videos.isEmpty()) {
-                Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""").findAll(trHtml).forEach {
-                    videos += it.groupValues[2] to it.groupValues[1].ifBlank { "Player" }
-                }
-            }
+            // Parse video buttons: <a class="videoPlayerButtons" video="URL">Name</a>
+            val trDoc  = org.jsoup.Jsoup.parse(trHtml)
+            val videoEls = trDoc.select("a.videoPlayerButtons[video]")
+                .ifEmpty { trDoc.select("a[video]") }
 
-            for ((videoUrl, videoName) in videos) {
+            for (videoEl in videoEls) {
+                val videoUrl  = videoEl.attr("video").let {
+                    if (it.startsWith("http")) it else "$mainUrl/$it"
+                }.ifBlank { continue }
+                val videoName = videoEl.text().trim().ifBlank { "Player" }
+
                 // Step 3: player numeric ID
                 val vText = try {
                     app.get(videoUrl, headers = xhrHeaders).text
-                } catch (e: Exception) { continue }
+                } catch (_: Exception) { continue }
                 val playerHtml = try { JSONObject(vText).optString("player", vText) }
-                catch (e: Exception) { vText }
+                catch (_: Exception) { vText }
 
                 val playerId = Regex("""/player/(\d+)""")
                     .find(playerHtml)?.groupValues?.get(1) ?: continue
@@ -227,25 +247,25 @@ class AnizleProvider : MainAPI() {
                 // Step 4: FirePlayer hash
                 val pageHtml = try {
                     app.get("$mainUrl/player/$playerId", headers = baseHeaders).text
-                } catch (e: Exception) { continue }
+                } catch (_: Exception) { continue }
 
                 val fireId = extractFireplayerId(pageHtml) ?: continue
 
-                // Step 5: real stream URL
+                // Step 5: real stream
                 val streamText = try {
                     app.post(
                         "$playerBase/player/index.php?data=$fireId&do=getVideo",
                         headers = mapOf(
-                            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
                             "X-Requested-With" to "XMLHttpRequest",
                             "Accept"           to "application/json, */*; q=0.01",
                             "Referer"          to "$playerBase/player/$fireId",
                             "Origin"           to playerBase,
                         )
                     ).text
-                } catch (e: Exception) { continue }
+                } catch (_: Exception) { continue }
 
-                val json = try { JSONObject(streamText) } catch (e: Exception) { continue }
+                val json  = try { JSONObject(streamText) } catch (_: Exception) { continue }
                 val label = "$fansubName – $videoName"
 
                 val securedLink = json.optString("securedLink", "")
