@@ -29,14 +29,11 @@ class AnizleProvider : MainAPI() {
 
     // Session warmup — uses NiceHttp's shared cookie jar which already has
     // valid CF cookies if the Anizm extension ran recently on this device.
-    private var sessionReady = false
     private suspend fun getSession() {
-        if (sessionReady) return
         android.util.Log.d("Anizle", "getSession başlatıldı")
         try {
-            app.get(mainUrl, headers = baseHeaders)
-            sessionReady = true
-            android.util.Log.d("Anizle", "getSession tamamlandı")
+            val resp = app.get(mainUrl, headers = baseHeaders)
+            android.util.Log.d("Anizle", "getSession HTTP ${resp.code} len=${resp.text.length}")
         } catch (e: Exception) {
             android.util.Log.e("Anizle", "getSession hatasi: ${e.message}")
         }
@@ -46,10 +43,14 @@ class AnizleProvider : MainAPI() {
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
-        "Origin"          to mainUrl,
         "Referer"         to "$mainUrl/",
     )
-    private val xhrHeaders get() = baseHeaders + mapOf(
+    private val xhrHeaders get() = mapOf(
+        "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept-Language"  to "tr-TR,tr;q=0.9,en;q=0.7",
+        "Origin"           to mainUrl,
+        "Referer"          to "$mainUrl/",
         "X-Requested-With" to "XMLHttpRequest",
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
