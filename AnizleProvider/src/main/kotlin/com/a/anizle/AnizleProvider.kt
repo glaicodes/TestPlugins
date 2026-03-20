@@ -422,18 +422,7 @@ class AnizleProvider : MainAPI() {
                     if (fileId != null) {
                         val driveUrl = "https://drive.google.com/file/d/$fileId/view"
                         android.util.Log.d("Anizle", "GDrive fileId=$fileId")
-                        // Wrap callback so the link is labelled "FansubName - GDrive"
-                        // instead of the extractor's own generic source name.
-                        loadExtractor(driveUrl, "$mainUrl/", subtitleCallback) { link ->
-                            callback(ExtractorLink(
-                                source  = link.source,
-                                name    = label,
-                                url     = link.url,
-                                referer = link.referer,
-                                quality = link.quality,
-                                isM3u8  = false,
-                            ))
-                        }
+                        loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
                         found = true
                     } else {
                         android.util.Log.w("Anizle", "GDrive: fileId not found in player page")
