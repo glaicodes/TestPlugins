@@ -506,8 +506,10 @@ class AnizleProvider : MainAPI() {
                     val urlWithQuality = securedLink + sep + "quality=1080"
                     android.util.Log.d("Anizle", "Aincrad urlWithQuality=$urlWithQuality")
                     callback(newExtractorLink(source = name, name = label, url = urlWithQuality,
-                        referer = "$playerBase/",
-                        type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value })
+                        type = ExtractorLinkType.M3U8) {
+                        quality = Qualities.P1080.value
+                        referer = "$playerBase/"
+                    })
                     found = true; continue
                 }
                 val videoSource = json.optString("videoSource", "")
