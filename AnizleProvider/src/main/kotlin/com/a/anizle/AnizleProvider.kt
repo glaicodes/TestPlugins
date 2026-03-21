@@ -375,6 +375,15 @@ class AnizleProvider : MainAPI() {
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
             }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
+            // Debug: log full raw HTML of any GDrive-named button to see all attributes
+            videos.forEach { (vUrl, vName) ->
+                if (vName.lowercase().let { it.contains("gdrive") || it.contains("google") }) {
+                    val idx = trHtml.indexOf(vUrl.replace("&", "&amp;").ifEmpty { vUrl })
+                    val idx2 = trHtml.indexOf(vUrl)
+                    val start = (minOf(idx, idx2).takeIf { it >= 0 } ?: 0).let { (it - 50).coerceAtLeast(0) }
+                    android.util.Log.d("Anizle", "Step2 GDrive raw name=$vName url=$vUrl ctx=${trHtml.substring(start, (start+500).coerceAtMost(trHtml.length))}")
+                }
+            }
 
             for ((videoUrl, videoName) in videos) {
                 val videoNameL = videoName.lowercase()
@@ -491,21 +500,20 @@ class AnizleProvider : MainAPI() {
                 } catch (e: Exception) {
                     android.util.Log.e("Anizle", "getVideo error: ${e.message}"); continue
                 }
-                android.util.Log.d("Anizle", "Step5: ${streamText.take(120)}")
+                android.util.Log.d("Anizle", "Step5 full=${streamText.take(300)}")
 
                 val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
 
                 val securedLink = json.optString("securedLink", "")
+                val hlsUrl = json.optString("hlsUrl", "")
+                android.util.Log.d("Anizle", "Step5 securedLink=$securedLink hlsUrl=$hlsUrl")
+
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    // The Aincrad CDN supports a &quality= parameter directly on the URL.
-                    // Appending it returns a quality-specific muxed playlist (video+audio),
-                    // which CS3's downloader can handle. Using the master URL directly causes
-                    // "M3u8 must contains TS files" on download, and resolving to a video-only
-                    // sub-playlist loses audio entirely.
-                    val sep = if (securedLink.contains("?")) "&" else "?"
-                    val urlWithQuality = securedLink + sep + "quality=1080"
-                    android.util.Log.d("Anizle", "Aincrad urlWithQuality=$urlWithQuality")
-                    callback(newExtractorLink(source = name, name = label, url = urlWithQuality,
+                    // Pass the master m3u8 with referer. ExoPlayer handles adaptive HLS (incl.
+                    // separate audio tracks) correctly for both playback and download.
+                    // &quality= param returns a video-only sub-playlist → "no video with audio".
+                    android.util.Log.d("Anizle", "Aincrad masterUrl=$securedLink")
+                    callback(newExtractorLink(source = name, name = label, url = securedLink,
                         type = ExtractorLinkType.M3U8) {
                         quality = Qualities.P1080.value
                         referer = "$playerBase/"
