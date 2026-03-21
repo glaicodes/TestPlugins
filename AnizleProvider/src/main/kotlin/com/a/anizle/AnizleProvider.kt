@@ -424,10 +424,17 @@ class AnizleProvider : MainAPI() {
                     //   init('VIDEO_ID', 'BASE_URL', 'ENCODED_KEY', '')
                     // Then construct: BASE_URL/?video_id=ENCODED_KEY&quality=1080&action=p
                     // &action=p = "direct play" — returns the actual stream, not a redirect proxy.
-                    android.util.Log.d("Anizle", "GDrive playerHtml snippet=${pageHtml.take(600)}")
-                    val embedUrl = Regex("""embed_url\s*[=:]\s*['"]?(https://gdplayer\.vip/[^'"&\s]+)""")
+                    // Search the full HTML for gdplayer.vip — the URL may be deep in JS
+                    val gdplayerIdx = pageHtml.indexOf("gdplayer.vip")
+                    android.util.Log.d("Anizle", "GDrive gdplayer idx=$gdplayerIdx in len=${pageHtml.length}")
+                    if (gdplayerIdx >= 0) {
+                        android.util.Log.d("Anizle", "GDrive context=${pageHtml.substring((gdplayerIdx-30).coerceAtLeast(0), (gdplayerIdx+80).coerceAtMost(pageHtml.length))}")
+                    }
+                    val embedUrl = Regex("""embed_url\s*[=:]\s*['"]?(https://gdplayer\.vip/[^'"&\s<]+)""")
                         .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""src=['"](https://gdplayer\.vip/[^'"]+)['"]""")
+                        ?: Regex("""src=['"]([^'"]*gdplayer\.vip/[^'"]+)['"]""")
+                            .find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""['"](https://gdplayer\.vip/[A-Za-z0-9]+)['"]""")
                             .find(pageHtml)?.groupValues?.get(1)
                         ?: Regex("""(https://gdplayer\.vip/[A-Za-z0-9]+)""")
                             .find(pageHtml)?.groupValues?.get(1)
@@ -499,6 +506,7 @@ class AnizleProvider : MainAPI() {
                     val urlWithQuality = securedLink + sep + "quality=1080"
                     android.util.Log.d("Anizle", "Aincrad urlWithQuality=$urlWithQuality")
                     callback(newExtractorLink(source = name, name = label, url = urlWithQuality,
+                        referer = "$playerBase/",
                         type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value })
                     found = true; continue
                 }
