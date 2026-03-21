@@ -1,17 +1,17 @@
 // use an integer for version numbers
-version = 22
+version = 23
 
 cloudstream {
     language    = "tr"
-    description = "Anizle / Anizm — Türkçe altyazılı anime akışı"
-    authors     = listOf("yourname")
+    description = "Anizle / Anizm"
+    authors     = listOf(" ")
 
     /**
      * Status:
      *  0 = Down
-     *  1 = Needs VPN
+     *  1 = Working
      *  2 = Slow
-     *  3 = Working
+     *  3 = Beta only
      */
     status  = 1
     tvTypes = listOf("Anime", "AnimeMovie", "OVA")
