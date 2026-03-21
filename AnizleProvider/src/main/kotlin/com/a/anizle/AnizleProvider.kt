@@ -419,20 +419,44 @@ class AnizleProvider : MainAPI() {
 
                 // ── GDrive path ──────────────────────────────────────────────
                 if (isGdrive) {
-                    // Player page embeds a drive.google.com/file/d/{fileId} link.
-                    // Pass it to CloudStream's built-in GoogleDrive extractor which
-                    // resolves the actual stream URL correctly.
-                    val fileId = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]+)""")
+                    // The player page contains a gdplayer.vip embed.
+                    // We fetch that embed page, extract the ng-init attribute which has:
+                    //   init('VIDEO_ID', 'BASE_URL', 'ENCODED_KEY', '')
+                    // Then construct: BASE_URL/?video_id=ENCODED_KEY&quality=1080&action=p
+                    // &action=p = "direct play" — returns the actual stream, not a redirect proxy.
+                    val embedUrl = Regex("""embed_url\s*=\s*['"](https://gdplayer\.vip/[^'"]+)['"]""")
                         .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""[?&]id=([A-Za-z0-9_-]+)""").find(pageHtml)?.groupValues?.get(1)
-                    if (fileId != null) {
-                        val driveUrl = "https://drive.google.com/file/d/$fileId/view"
-                        android.util.Log.d("Anizle", "GDrive fileId=$fileId")
-                        loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
-                        found = true
-                    } else {
-                        android.util.Log.w("Anizle", "GDrive: fileId not found in player page")
+                        ?: Regex("""https://gdplayer\.vip/[A-Za-z0-9]+""").find(pageHtml)?.value
+                    if (embedUrl == null) {
+                        android.util.Log.w("Anizle", "GDrive: no gdplayer embed URL found"); continue
                     }
+                    android.util.Log.d("Anizle", "GDrive embedUrl=$embedUrl")
+
+                    val embedHtml = try {
+                        app.get(embedUrl, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "GDrive embed fetch error: ${e.message}"); continue
+                    }
+
+                    // ng-init="init('VIDEO_ID', 'BASE_URL', 'ENCODED_KEY', '')"
+                    val ngInit = Regex("""ng-init=["']init\s*\(\s*'([^']*)',\s*'([^']*)',\s*'([^']*)'""")
+                        .find(embedHtml)
+                    if (ngInit == null) {
+                        android.util.Log.w("Anizle", "GDrive: ng-init not found in embed page"); continue
+                    }
+                    val basePlayUrl = ngInit.groupValues[2]
+                    val encodedKey  = ngInit.groupValues[3]
+                    android.util.Log.d("Anizle", "GDrive basePlayUrl=$basePlayUrl encodedKey=${encodedKey.take(20)}")
+
+                    for (q in listOf("1080", "720", "480", "360")) {
+                        val directUrl = "$basePlayUrl/?video_id=$encodedKey&quality=$q&action=p"
+                        android.util.Log.d("Anizle", "GDrive trying quality=$q url=${directUrl.take(80)}")
+                        val qLabel = "$label (${q}p)"
+                        val qInt = q.toIntOrNull() ?: Qualities.Unknown.value
+                        callback(newExtractorLink(source = name, name = qLabel, url = directUrl,
+                            type = ExtractorLinkType.VIDEO) { quality = qInt })
+                    }
+                    found = true
                     continue
                 }
 
@@ -462,8 +486,12 @@ class AnizleProvider : MainAPI() {
 
                 val securedLink = json.optString("securedLink", "")
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    callback(newExtractorLink(source = name, name = label, url = securedLink,
-                        type = ExtractorLinkType.M3U8) { quality = Qualities.Unknown.value })
+                    // Fetch the master.m3u8 and resolve to a specific quality sub-playlist
+                    // so CS3's downloader gets a flat TS playlist instead of an adaptive master.
+                    val resolvedUrl = resolveM3u8Quality(securedLink) ?: securedLink
+                    android.util.Log.d("Anizle", "Aincrad resolvedUrl=$resolvedUrl")
+                    callback(newExtractorLink(source = name, name = label, url = resolvedUrl,
+                        type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value })
                     found = true; continue
                 }
                 val videoSource = json.optString("videoSource", "")
@@ -478,6 +506,36 @@ class AnizleProvider : MainAPI() {
     }
 
     
+    // ── Stream helpers ───────────────────────────────────────────────────────
+
+    // Fetches a master.m3u8, picks the highest-quality sub-playlist, and returns
+    // its absolute URL. Returns null if the manifest can't be fetched or parsed.
+    private suspend fun resolveM3u8Quality(masterUrl: String): String? {
+        val master = try { app.get(masterUrl).text } catch (_: Exception) { return null }
+        // Lines starting with "#EXT-X-STREAM-INF" are followed by a playlist URL.
+        // Pick the one with the highest BANDWIDTH or RESOLUTION value.
+        data class Entry(val bandwidth: Int, val url: String)
+        val entries = mutableListOf<Entry>()
+        val lines = master.lines()
+        for (i in lines.indices) {
+            val line = lines[i]
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                val bw = Regex("""BANDWIDTH=(\d+)""").find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val next = lines.getOrNull(i + 1)?.trim() ?: continue
+                if (next.isBlank() || next.startsWith("#")) continue
+                val absUrl = when {
+                    next.startsWith("http") -> next
+                    next.startsWith("/")    -> masterUrl.substringBefore("//").plus("//")
+                        .plus(masterUrl.removePrefix("https://").removePrefix("http://").substringBefore("/"))
+                        .plus(next)
+                    else -> masterUrl.substringBeforeLast("/") + "/" + next
+                }
+                entries.add(Entry(bw, absUrl))
+            }
+        }
+        return entries.maxByOrNull { it.bandwidth }?.url
+    }
+
     // ── JS helpers ────────────────────────────────────────────────────────────
 
     private fun extractFireplayerId(html: String): String? {
