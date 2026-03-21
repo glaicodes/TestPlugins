@@ -424,11 +424,15 @@ class AnizleProvider : MainAPI() {
                     //   init('VIDEO_ID', 'BASE_URL', 'ENCODED_KEY', '')
                     // Then construct: BASE_URL/?video_id=ENCODED_KEY&quality=1080&action=p
                     // &action=p = "direct play" — returns the actual stream, not a redirect proxy.
-                    val embedUrl = Regex("""embed_url\s*=\s*['"](https://gdplayer\.vip/[^'"]+)['"]""")
+                    android.util.Log.d("Anizle", "GDrive playerHtml snippet=${pageHtml.take(600)}")
+                    val embedUrl = Regex("""embed_url\s*[=:]\s*['"]?(https://gdplayer\.vip/[^'"&\s]+)""")
                         .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""https://gdplayer\.vip/[A-Za-z0-9]+""").find(pageHtml)?.value
+                        ?: Regex("""src=['"](https://gdplayer\.vip/[^'"]+)['"]""")
+                            .find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""(https://gdplayer\.vip/[A-Za-z0-9]+)""")
+                            .find(pageHtml)?.groupValues?.get(1)
                     if (embedUrl == null) {
-                        android.util.Log.w("Anizle", "GDrive: no gdplayer embed URL found"); continue
+                        android.util.Log.w("Anizle", "GDrive: no gdplayer embed URL found in len=${pageHtml.length}"); continue
                     }
                     android.util.Log.d("Anizle", "GDrive embedUrl=$embedUrl")
 
@@ -486,11 +490,15 @@ class AnizleProvider : MainAPI() {
 
                 val securedLink = json.optString("securedLink", "")
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    // Fetch the master.m3u8 and resolve to a specific quality sub-playlist
-                    // so CS3's downloader gets a flat TS playlist instead of an adaptive master.
-                    val resolvedUrl = resolveM3u8Quality(securedLink) ?: securedLink
-                    android.util.Log.d("Anizle", "Aincrad resolvedUrl=$resolvedUrl")
-                    callback(newExtractorLink(source = name, name = label, url = resolvedUrl,
+                    // The Aincrad CDN supports a &quality= parameter directly on the URL.
+                    // Appending it returns a quality-specific muxed playlist (video+audio),
+                    // which CS3's downloader can handle. Using the master URL directly causes
+                    // "M3u8 must contains TS files" on download, and resolving to a video-only
+                    // sub-playlist loses audio entirely.
+                    val sep = if (securedLink.contains("?")) "&" else "?"
+                    val urlWithQuality = securedLink + sep + "quality=1080"
+                    android.util.Log.d("Anizle", "Aincrad urlWithQuality=$urlWithQuality")
+                    callback(newExtractorLink(source = name, name = label, url = urlWithQuality,
                         type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value })
                     found = true; continue
                 }
