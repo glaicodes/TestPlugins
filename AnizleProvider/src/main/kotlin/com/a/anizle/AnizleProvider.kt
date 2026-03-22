@@ -375,16 +375,6 @@ class AnizleProvider : MainAPI() {
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
             }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
-            // Debug: log full raw HTML of any GDrive-named button to see all attributes
-            videos.forEach { (vUrl, vName) ->
-                if (vName.lowercase().let { it.contains("gdrive") || it.contains("google") }) {
-                    val idx = trHtml.indexOf(vUrl.replace("&", "&amp;").ifEmpty { vUrl })
-                    val idx2 = trHtml.indexOf(vUrl)
-                    val start = (minOf(idx, idx2).takeIf { it >= 0 } ?: 0).let { (it - 50).coerceAtLeast(0) }
-                    android.util.Log.d("Anizle", "Step2 GDrive raw name=$vName url=$vUrl ctx=${trHtml.substring(start, (start+500).coerceAtMost(trHtml.length))}")
-                }
-            }
-
             for ((videoUrl, videoName) in videos) {
                 val videoNameL = videoName.lowercase()
 
@@ -393,7 +383,9 @@ class AnizleProvider : MainAPI() {
                 //   GDrive  → Google Drive direct link
                 // Skipping everything else avoids N×M /player/ requests that block later fansubs.
                 val isAincrad = videoNameL.contains("aincrad")
-                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
+                // GDrive disabled: /player/{id} on anizle.org serves the Drive viewer directly,
+                // not a gdplayer.vip embed. Cannot extract stream URL without the CF-blocked /video/{id}.
+                val isGdrive  = false // videoNameL.contains("gdrive") || videoNameL.contains("google")
                 if (!isAincrad && !isGdrive) {
                     android.util.Log.d("Anizle", "Step4: skipping unsupported host $videoName")
                     continue
@@ -509,14 +501,13 @@ class AnizleProvider : MainAPI() {
                 android.util.Log.d("Anizle", "Step5 securedLink=$securedLink hlsUrl=$hlsUrl")
 
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    // Pass the master m3u8 with referer. ExoPlayer handles adaptive HLS (incl.
-                    // separate audio tracks) correctly for both playback and download.
-                    // &quality= param returns a video-only sub-playlist → "no video with audio".
-                    android.util.Log.d("Anizle", "Aincrad masterUrl=$securedLink")
+                    // The CDN gates audio by Referer — must be the specific player page, not root.
+                    val playerReferer = "$playerBase/player/$fireId"
+                    android.util.Log.d("Anizle", "Aincrad url=$securedLink referer=$playerReferer")
                     callback(newExtractorLink(source = name, name = label, url = securedLink,
                         type = ExtractorLinkType.M3U8) {
                         quality = Qualities.P1080.value
-                        referer = "$playerBase/"
+                        referer = playerReferer
                     })
                     found = true; continue
                 }
