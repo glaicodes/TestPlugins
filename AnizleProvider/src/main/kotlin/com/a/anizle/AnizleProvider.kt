@@ -420,80 +420,36 @@ class AnizleProvider : MainAPI() {
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
                 // ── GDrive path ──────────────────────────────────────────────
+                // pageHtml is already the Google Drive viewer page (fetched from anizle.org/player/{id}).
+                // cfKiller on /video/{id} always times out (CF-Turnstile). Don't use it.
+                // Extract the Drive file ID directly from pageHtml and use CS3's built-in extractor.
                 if (isGdrive) {
-                    // /player/{id} serves the Google Drive viewer directly — no gdplayer embed.
-                    // The gdplayer.vip URL is only in the JSON response from /video/{id} (Step 3).
-                    // That endpoint is CF-Turnstile protected, so we use cfKiller here.
-                    android.util.Log.d("Anizle", "GDrive: Step3 via cfKiller -> $videoUrl")
-                    val vText = try {
-                        app.get(
-                            videoUrl,
-                            headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
-                            interceptor = cfKiller,
-                        ).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "GDrive Step3 error: ${e.message}"); continue
-                    }
-                    android.util.Log.d("Anizle", "GDrive Step3 len=${vText.length} raw=${vText.take(300)}")
-                    if (vText.contains("Just a moment", ignoreCase = true) ||
-                        vText.contains("cf-browser-verification", ignoreCase = true)) {
-                        android.util.Log.w("Anizle", "GDrive: CF not bypassed on /video/$playerId"); continue
-                    }
-                    val vJson = try { JSONObject(vText) } catch (_: Exception) {
-                        android.util.Log.w("Anizle", "GDrive: not JSON raw=${vText.take(80)}"); continue
-                    }
-                    // Step 3 returns {player: "<html>..."} or {data: "<html>..."}
-                    val playerHtml = vJson.optString("player", "").ifBlank { vJson.optString("data", "") }
-                    if (playerHtml.isBlank()) {
-                        android.util.Log.w("Anizle", "GDrive: empty player html keys=${vJson.keys().asSequence().toList()}"); continue
-                    }
-                    android.util.Log.d("Anizle", "GDrive: playerHtml len=${playerHtml.length}")
+                    android.util.Log.d("Anizle", "GDrive: scanning pageHtml len=${pageHtml.length} for Drive ID")
 
-                    val gdplayerIdx = playerHtml.indexOf("gdplayer.vip")
-                    android.util.Log.d("Anizle", "GDrive gdplayer idx=$gdplayerIdx in len=${playerHtml.length}")
-                    if (gdplayerIdx >= 0) {
-                        android.util.Log.d("Anizle", "GDrive context=${playerHtml.substring((gdplayerIdx-30).coerceAtLeast(0), (gdplayerIdx+80).coerceAtMost(playerHtml.length))}")
-                    }
-                    val embedUrl = Regex("""embed_url\s*[=:]\s*['"]?(https://gdplayer\.vip/[^'"&\s<]+)""")
-                        .find(playerHtml)?.groupValues?.get(1)
-                        ?: Regex("""src=['"]([^'"]*gdplayer\.vip/[^'"]+)['"]""")
-                            .find(playerHtml)?.groupValues?.get(1)
-                        ?: Regex("""['"](https://gdplayer\.vip/[A-Za-z0-9]+)['"]""")
-                            .find(playerHtml)?.groupValues?.get(1)
-                        ?: Regex("""(https://gdplayer\.vip/[A-Za-z0-9]+)""")
-                            .find(playerHtml)?.groupValues?.get(1)
-                    if (embedUrl == null) {
-                        android.util.Log.w("Anizle", "GDrive: no gdplayer embed URL found in playerHtml len=${playerHtml.length}"); continue
-                    }
-                    android.util.Log.d("Anizle", "GDrive embedUrl=$embedUrl")
+                    val fileId =
+                        Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex(""""([A-Za-z0-9_-]{33,})"(?=[^"]*\.mp4|[^"]*\.m3u8|[^"]*google)""").find(pageHtml)?.groupValues?.get(1)
 
-                    val embedHtml = try {
-                        app.get(embedUrl, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "GDrive embed fetch error: ${e.message}"); continue
+                    if (fileId != null) {
+                        android.util.Log.d("Anizle", "GDrive: found fileId=$fileId")
+                        val driveUrl = "https://drive.google.com/file/d/$fileId/view"
+                        try {
+                            loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
+                            found = true
+                        } catch (e: Exception) {
+                            android.util.Log.e("Anizle", "GDrive loadExtractor error: ${e.message}")
+                        }
+                    } else {
+                        // Log context around any google reference to help add patterns later
+                        android.util.Log.w("Anizle", "GDrive: no file ID found in pageHtml len=${pageHtml.length}")
+                        val gIdx = pageHtml.indexOf("google")
+                        if (gIdx >= 0) android.util.Log.d("Anizle", "GDrive ctx=${pageHtml.substring(gIdx.coerceAtLeast(0), (gIdx + 200).coerceAtMost(pageHtml.length))}")
                     }
-
-                    // ng-init="init('VIDEO_ID', 'BASE_URL', 'ENCODED_KEY', '')"
-                    val ngInit = Regex("""ng-init=["']init\s*\(\s*'([^']*)',\s*'([^']*)',\s*'([^']*)'""")
-                        .find(embedHtml)
-                    if (ngInit == null) {
-                        android.util.Log.w("Anizle", "GDrive: ng-init not found in embed page"); continue
-                    }
-                    val basePlayUrl = ngInit.groupValues[2]
-                    val encodedKey  = ngInit.groupValues[3]
-                    android.util.Log.d("Anizle", "GDrive basePlayUrl=$basePlayUrl encodedKey=${encodedKey.take(20)}")
-
-                    for (q in listOf("1080", "720", "480", "360")) {
-                        val directUrl = "$basePlayUrl/?video_id=$encodedKey&quality=$q&action=p"
-                        android.util.Log.d("Anizle", "GDrive trying quality=$q url=${directUrl.take(80)}")
-                        val qLabel = "$label (${q}p)"
-                        val qInt = q.toIntOrNull() ?: Qualities.Unknown.value
-                        callback(newExtractorLink(source = name, name = qLabel, url = directUrl,
-                            type = ExtractorLinkType.VIDEO) { quality = qInt })
-                    }
-                    found = true
                     continue
                 }
+
 
                 // ── Aincrad / FirePlayer path ────────────────────────────────
                 val fireId = extractFireplayerId(pageHtml)
