@@ -383,9 +383,7 @@ class AnizleProvider : MainAPI() {
                 //   GDrive  → Google Drive direct link
                 // Skipping everything else avoids N×M /player/ requests that block later fansubs.
                 val isAincrad = videoNameL.contains("aincrad")
-                // GDrive disabled: /player/{id} on anizle.org serves the Drive viewer directly,
-                // not a gdplayer.vip embed. Cannot extract stream URL without the CF-blocked /video/{id}.
-                val isGdrive  = false // videoNameL.contains("gdrive") || videoNameL.contains("google")
+                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
                 if (!isAincrad && !isGdrive) {
                     android.util.Log.d("Anizle", "Step4: skipping unsupported host $videoName")
                     continue
@@ -399,48 +397,73 @@ class AnizleProvider : MainAPI() {
                     android.util.Log.w("Anizle", "Step4: no playerId in $videoUrl"); continue
                 }
 
-                // Step 4: GET /player/{id} page (try mainUrl then videoBase)
+                // Step 4: GET /player/{id} page — only needed for Aincrad/FirePlayer path.
+                // GDrive gets its player HTML from /video/{id} (Step 3) via cfKiller instead.
                 var pageHtml = ""
-                for (base4 in listOf(mainUrl, videoBase)) {
-                    val html = try {
-                        app.get("$base4/player/$playerId",
-                            headers = baseHeaders + mapOf("Referer" to "$base4/")).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
+                if (isAincrad) {
+                    for (base4 in listOf(mainUrl, videoBase)) {
+                        val html = try {
+                            app.get("$base4/player/$playerId",
+                                headers = baseHeaders + mapOf("Referer" to "$base4/")).text
+                        } catch (e: Exception) {
+                            android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
+                        }
+                        android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length}")
+                        if (html.contains("Just a moment", ignoreCase = true)) {
+                            android.util.Log.w("Anizle", "Step4: CF on $base4/player/$playerId"); continue
+                        }
+                        pageHtml = html; break
                     }
-                    android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length}")
-                    if (html.contains("Just a moment", ignoreCase = true)) {
-                        android.util.Log.w("Anizle", "Step4: CF on $base4/player/$playerId"); continue
-                    }
-                    pageHtml = html; break
+                    if (pageHtml.isBlank()) continue
                 }
-                if (pageHtml.isBlank()) continue
 
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
                 // ── GDrive path ──────────────────────────────────────────────
                 if (isGdrive) {
-                    // The player page contains a gdplayer.vip embed.
-                    // We fetch that embed page, extract the ng-init attribute which has:
-                    //   init('VIDEO_ID', 'BASE_URL', 'ENCODED_KEY', '')
-                    // Then construct: BASE_URL/?video_id=ENCODED_KEY&quality=1080&action=p
-                    // &action=p = "direct play" — returns the actual stream, not a redirect proxy.
-                    // Search the full HTML for gdplayer.vip — the URL may be deep in JS
-                    val gdplayerIdx = pageHtml.indexOf("gdplayer.vip")
-                    android.util.Log.d("Anizle", "GDrive gdplayer idx=$gdplayerIdx in len=${pageHtml.length}")
+                    // /player/{id} serves the Google Drive viewer directly — no gdplayer embed.
+                    // The gdplayer.vip URL is only in the JSON response from /video/{id} (Step 3).
+                    // That endpoint is CF-Turnstile protected, so we use cfKiller here.
+                    android.util.Log.d("Anizle", "GDrive: Step3 via cfKiller -> $videoUrl")
+                    val vText = try {
+                        app.get(
+                            videoUrl,
+                            headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
+                            interceptor = cfKiller,
+                        ).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "GDrive Step3 error: ${e.message}"); continue
+                    }
+                    android.util.Log.d("Anizle", "GDrive Step3 len=${vText.length} raw=${vText.take(300)}")
+                    if (vText.contains("Just a moment", ignoreCase = true) ||
+                        vText.contains("cf-browser-verification", ignoreCase = true)) {
+                        android.util.Log.w("Anizle", "GDrive: CF not bypassed on /video/$playerId"); continue
+                    }
+                    val vJson = try { JSONObject(vText) } catch (_: Exception) {
+                        android.util.Log.w("Anizle", "GDrive: not JSON raw=${vText.take(80)}"); continue
+                    }
+                    // Step 3 returns {player: "<html>..."} or {data: "<html>..."}
+                    val playerHtml = vJson.optString("player", "").ifBlank { vJson.optString("data", "") }
+                    if (playerHtml.isBlank()) {
+                        android.util.Log.w("Anizle", "GDrive: empty player html keys=${vJson.keys().asSequence().toList()}"); continue
+                    }
+                    android.util.Log.d("Anizle", "GDrive: playerHtml len=${playerHtml.length}")
+
+                    val gdplayerIdx = playerHtml.indexOf("gdplayer.vip")
+                    android.util.Log.d("Anizle", "GDrive gdplayer idx=$gdplayerIdx in len=${playerHtml.length}")
                     if (gdplayerIdx >= 0) {
-                        android.util.Log.d("Anizle", "GDrive context=${pageHtml.substring((gdplayerIdx-30).coerceAtLeast(0), (gdplayerIdx+80).coerceAtMost(pageHtml.length))}")
+                        android.util.Log.d("Anizle", "GDrive context=${playerHtml.substring((gdplayerIdx-30).coerceAtLeast(0), (gdplayerIdx+80).coerceAtMost(playerHtml.length))}")
                     }
                     val embedUrl = Regex("""embed_url\s*[=:]\s*['"]?(https://gdplayer\.vip/[^'"&\s<]+)""")
-                        .find(pageHtml)?.groupValues?.get(1)
+                        .find(playerHtml)?.groupValues?.get(1)
                         ?: Regex("""src=['"]([^'"]*gdplayer\.vip/[^'"]+)['"]""")
-                            .find(pageHtml)?.groupValues?.get(1)
+                            .find(playerHtml)?.groupValues?.get(1)
                         ?: Regex("""['"](https://gdplayer\.vip/[A-Za-z0-9]+)['"]""")
-                            .find(pageHtml)?.groupValues?.get(1)
+                            .find(playerHtml)?.groupValues?.get(1)
                         ?: Regex("""(https://gdplayer\.vip/[A-Za-z0-9]+)""")
-                            .find(pageHtml)?.groupValues?.get(1)
+                            .find(playerHtml)?.groupValues?.get(1)
                     if (embedUrl == null) {
-                        android.util.Log.w("Anizle", "GDrive: no gdplayer embed URL found in len=${pageHtml.length}"); continue
+                        android.util.Log.w("Anizle", "GDrive: no gdplayer embed URL found in playerHtml len=${playerHtml.length}"); continue
                     }
                     android.util.Log.d("Anizle", "GDrive embedUrl=$embedUrl")
 
