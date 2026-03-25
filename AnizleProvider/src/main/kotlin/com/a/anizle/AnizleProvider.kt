@@ -420,20 +420,32 @@ class AnizleProvider : MainAPI() {
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
                 // ── GDrive path ──────────────────────────────────────────────
-                // pageHtml is already the Google Drive viewer page (fetched from anizle.org/player/{id}).
-                // cfKiller on /video/{id} always times out (CF-Turnstile). Don't use it.
-                // Extract the Drive file ID directly from pageHtml and use CS3's built-in extractor.
+                // pageHtml is NOT fetched above for GDrive (only fetched for Aincrad).
+                // Fetch anizle.org/player/{id} here — for GDrive IDs it serves the
+                // Google Drive viewer page directly (the file ID is embedded in the HTML).
                 if (isGdrive) {
-                    android.util.Log.d("Anizle", "GDrive: scanning pageHtml len=${pageHtml.length} for Drive ID")
+                    val gHtml = try {
+                        // Try anizle.org first (no CF), then anizm.net as fallback
+                        var h = app.get("$videoBase/player/$playerId",
+                            headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
+                        if (h.isBlank() || h.contains("Just a moment", ignoreCase = true)) {
+                            h = app.get("$mainUrl/player/$playerId",
+                                headers = baseHeaders + mapOf("Referer" to "$mainUrl/"),
+                                interceptor = cfKiller).text
+                        }
+                        h
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "GDrive player fetch error: ${e.message}"); continue
+                    }
+                    android.util.Log.d("Anizle", "GDrive: player page len=${gHtml.length}")
 
                     val fileId =
-                        Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex(""""([A-Za-z0-9_-]{33,})"(?=[^"]*\.mp4|[^"]*\.m3u8|[^"]*google)""").find(pageHtml)?.groupValues?.get(1)
+                        Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
+                        ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
+                        ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
 
                     if (fileId != null) {
-                        android.util.Log.d("Anizle", "GDrive: found fileId=$fileId")
+                        android.util.Log.d("Anizle", "GDrive: fileId=$fileId")
                         val driveUrl = "https://drive.google.com/file/d/$fileId/view"
                         try {
                             loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
@@ -442,13 +454,13 @@ class AnizleProvider : MainAPI() {
                             android.util.Log.e("Anizle", "GDrive loadExtractor error: ${e.message}")
                         }
                     } else {
-                        // Log context around any google reference to help add patterns later
-                        android.util.Log.w("Anizle", "GDrive: no file ID found in pageHtml len=${pageHtml.length}")
-                        val gIdx = pageHtml.indexOf("google")
-                        if (gIdx >= 0) android.util.Log.d("Anizle", "GDrive ctx=${pageHtml.substring(gIdx.coerceAtLeast(0), (gIdx + 200).coerceAtMost(pageHtml.length))}")
+                        android.util.Log.w("Anizle", "GDrive: no file ID in len=${gHtml.length}")
+                        val gIdx = gHtml.indexOf("google")
+                        if (gIdx >= 0) android.util.Log.d("Anizle", "GDrive ctx=${gHtml.substring(gIdx.coerceAtLeast(0), (gIdx + 200).coerceAtMost(gHtml.length))}")
                     }
                     continue
                 }
+
 
 
                 // ── Aincrad / FirePlayer path ────────────────────────────────
