@@ -420,12 +420,11 @@ class AnizleProvider : MainAPI() {
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
                 // ── GDrive path ──────────────────────────────────────────────
-                // pageHtml is NOT fetched above for GDrive (only fetched for Aincrad).
-                // Fetch anizle.org/player/{id} here — for GDrive IDs it serves the
-                // Google Drive viewer page directly (the file ID is embedded in the HTML).
+                // We do our own extraction chain instead of loadExtractor so we can
+                // set Referer=https://gdplayer.vip/ on the final video links.
+                // Without this referer the CDN (vycdn.sbs/vtcdn.sbs) returns 403 on downloads.
                 if (isGdrive) {
                     val gHtml = try {
-                        // Try anizle.org first (no CF), then anizm.net as fallback
                         var h = app.get("$videoBase/player/$playerId",
                             headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
                         if (h.isBlank() || h.contains("Just a moment", ignoreCase = true)) {
@@ -444,31 +443,73 @@ class AnizleProvider : MainAPI() {
                         ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
                         ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
 
-                    if (fileId != null) {
-                        android.util.Log.d("Anizle", "GDrive: fileId=$fileId")
-                        val driveUrl = "https://drive.google.com/file/d/$fileId/view"
-                        try {
-                            loadExtractor(driveUrl, "$mainUrl/", subtitleCallback, callback)
-                            found = true
-                        } catch (e: Exception) {
-                            android.util.Log.e("Anizle", "GDrive loadExtractor error: ${e.message}")
-                        }
-                    } else {
+                    if (fileId == null) {
                         android.util.Log.w("Anizle", "GDrive: no file ID in len=${gHtml.length}")
                         val gIdx = gHtml.indexOf("google")
                         if (gIdx >= 0) android.util.Log.d("Anizle", "GDrive ctx=${gHtml.substring(gIdx.coerceAtLeast(0), (gIdx + 200).coerceAtMost(gHtml.length))}")
+                        continue
                     }
+                    android.util.Log.d("Anizle", "GDrive: fileId=$fileId")
+
+                    // Step A: fetch drive.google.com viewer → find gdplayer.vip embed URL
+                    val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
+                    val driveHtml = try {
+                        app.get(driveViewUrl, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "GDrive drive fetch error: ${e.message}"); continue
+                    }
+
+                    val gdplayerUrl =
+                        Regex("""(https://gdplayer\.vip/[A-Za-z0-9]+)""").find(driveHtml)?.groupValues?.get(1)
+                        ?: Regex("""src=['"](https://gdplayer\.vip/[^'"]+)['"]""").find(driveHtml)?.groupValues?.get(1)
+                    if (gdplayerUrl == null) {
+                        android.util.Log.w("Anizle", "GDrive: no gdplayer URL in driveHtml len=${driveHtml.length}"); continue
+                    }
+                    android.util.Log.d("Anizle", "GDrive: gdplayerUrl=$gdplayerUrl")
+
+                    // Step B: fetch gdplayer.vip embed → extract ng-init params
+                    val gdHtml = try {
+                        app.get(gdplayerUrl, headers = baseHeaders + mapOf("Referer" to driveViewUrl)).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "GDrive gdplayer fetch error: ${e.message}"); continue
+                    }
+
+                    val ngInit = Regex("""ng-init=["']init\s*\(\s*'([^']*)',\s*'([^']*)',\s*'([^']*)'""")
+                        .find(gdHtml)
+                    if (ngInit == null) {
+                        android.util.Log.w("Anizle", "GDrive: ng-init not found in gdplayer page"); continue
+                    }
+                    val basePlayUrl = ngInit.groupValues[2]
+                    val encodedKey  = ngInit.groupValues[3]
+                    android.util.Log.d("Anizle", "GDrive: basePlayUrl=$basePlayUrl encodedKey=${encodedKey.take(20)}")
+
+                    // Step C: register quality links — referer=gdplayer.vip is required by the CDN
+                    val gdReferer = "https://gdplayer.vip/"
+                    for (q in listOf("1080" to Qualities.P1080.value,
+                                     "720"  to Qualities.P720.value,
+                                     "360"  to Qualities.P360.value)) {
+                        val url = "$basePlayUrl/?video_id=$encodedKey&quality=${q.first}&action=p"
+                        android.util.Log.d("Anizle", "GDrive: registering ${q.first}p url=${url.take(80)}")
+                        callback(newExtractorLink(
+                            source = name,
+                            name   = "$label (${q.first}p)",
+                            url    = url,
+                            type   = ExtractorLinkType.VIDEO
+                        ) {
+                            quality = q.second
+                            referer = gdReferer
+                        })
+                    }
+                    found = true
                     continue
                 }
-
-
 
                 // ── Aincrad / FirePlayer path ────────────────────────────────
                 val fireId = extractFireplayerId(pageHtml)
                 android.util.Log.d("Anizle", "Step4: fireId=$fireId")
                 fireId ?: continue
 
-                // Step 5: POST to anizmplayer.com → JSON {hls,securedLink} or {videoSource}
+                // Step 5: POST to anizmplayer.com → JSON {hls,securedLink,videoSource}
                 val streamText = try {
                     app.post(
                         "$playerBase/player/index.php?data=$fireId&do=getVideo",
@@ -488,27 +529,41 @@ class AnizleProvider : MainAPI() {
                 val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
 
                 val securedLink = json.optString("securedLink", "")
-                val hlsUrl = json.optString("hlsUrl", "")
-                android.util.Log.d("Anizle", "Step5 securedLink=$securedLink hlsUrl=$hlsUrl")
+                val videoSource = json.optString("videoSource", "")
+                android.util.Log.d("Anizle", "Step5 securedLink=$securedLink videoSource=${videoSource.take(80)}")
 
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    // The CDN gates audio by Referer — must be the specific player page, not root.
                     val playerReferer = "$playerBase/player/$fireId"
                     android.util.Log.d("Anizle", "Aincrad url=$securedLink referer=$playerReferer")
+
+                    // Primary link: master.m3u8 — ExoPlayer handles separate HLS audio tracks
+                    // natively in the player (selectable via track menu). Downloads will fail
+                    // on this link since CS3's downloader can't mux separate audio.
                     callback(newExtractorLink(source = name, name = label, url = securedLink,
                         type = ExtractorLinkType.M3U8) {
                         quality = Qualities.P1080.value
                         referer = playerReferer
                     })
+
+                    // Secondary link: videoSource (master.txt) — may be a flat media playlist
+                    // that CS3's downloader can handle (TS segments, no separate audio mux needed).
+                    // Labelled "(DL)" so users know it's the download-friendly variant.
+                    if (videoSource.isNotBlank() && videoSource != securedLink) {
+                        android.util.Log.d("Anizle", "Aincrad DL url=${videoSource.take(80)}")
+                        callback(newExtractorLink(source = name, name = "$label (DL)", url = videoSource,
+                            type = ExtractorLinkType.M3U8) {
+                            quality = Qualities.P1080.value
+                            referer = playerReferer
+                        })
+                    }
+
                     found = true; continue
                 }
-                val videoSource = json.optString("videoSource", "")
                 if (videoSource.isNotBlank()) {
                     callback(newExtractorLink(source = name, name = label, url = videoSource,
                         type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
                     found = true
                 }
-            }
         }
         return found
     }
