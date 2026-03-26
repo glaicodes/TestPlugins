@@ -528,7 +528,8 @@ class AnizleProvider : MainAPI() {
                         type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
                     found = true
                 }
-        }
+            } // end for (videoUrl, videoName)
+        } // end for (trUrl, fansubName)
         return found
     }
 
