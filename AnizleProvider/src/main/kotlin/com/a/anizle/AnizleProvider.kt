@@ -451,55 +451,19 @@ class AnizleProvider : MainAPI() {
                     }
                     android.util.Log.d("Anizle", "GDrive: fileId=$fileId")
 
-                    // Step A: fetch drive.google.com viewer → find gdplayer.vip embed URL
-                    val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
-                    val driveHtml = try {
-                        app.get(driveViewUrl, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "GDrive drive fetch error: ${e.message}"); continue
-                    }
-
-                    val gdplayerUrl =
-                        Regex("""(https://gdplayer\.vip/[A-Za-z0-9]+)""").find(driveHtml)?.groupValues?.get(1)
-                        ?: Regex("""src=['"](https://gdplayer\.vip/[^'"]+)['"]""").find(driveHtml)?.groupValues?.get(1)
-                    if (gdplayerUrl == null) {
-                        android.util.Log.w("Anizle", "GDrive: no gdplayer URL in driveHtml len=${driveHtml.length}"); continue
-                    }
-                    android.util.Log.d("Anizle", "GDrive: gdplayerUrl=$gdplayerUrl")
-
-                    // Step B: fetch gdplayer.vip embed → extract ng-init params
-                    val gdHtml = try {
-                        app.get(gdplayerUrl, headers = baseHeaders + mapOf("Referer" to driveViewUrl)).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "GDrive gdplayer fetch error: ${e.message}"); continue
-                    }
-
-                    val ngInit = Regex("""ng-init=["']init\s*\(\s*'([^']*)',\s*'([^']*)',\s*'([^']*)'""")
-                        .find(gdHtml)
-                    if (ngInit == null) {
-                        android.util.Log.w("Anizle", "GDrive: ng-init not found in gdplayer page"); continue
-                    }
-                    val basePlayUrl = ngInit.groupValues[2]
-                    val encodedKey  = ngInit.groupValues[3]
-                    android.util.Log.d("Anizle", "GDrive: basePlayUrl=$basePlayUrl encodedKey=${encodedKey.take(20)}")
-
-                    // Step C: register quality links — referer=gdplayer.vip is required by the CDN
-                    val gdReferer = "https://gdplayer.vip/"
-                    for (q in listOf("1080" to Qualities.P1080.value,
-                                     "720"  to Qualities.P720.value,
-                                     "360"  to Qualities.P360.value)) {
-                        val url = "$basePlayUrl/?video_id=$encodedKey&quality=${q.first}&action=p"
-                        android.util.Log.d("Anizle", "GDrive: registering ${q.first}p url=${url.take(80)}")
-                        callback(newExtractorLink(
-                            source = name,
-                            name   = "$label (${q.first}p)",
-                            url    = url,
-                            type   = ExtractorLinkType.VIDEO
-                        ) {
-                            quality = q.second
-                            referer = gdReferer
-                        })
-                    }
+                    // Direct Google Drive download URL — stable, no session expiry, no third-party CDN.
+                    // confirm=t bypasses the "large file" interstitial Google shows for big files.
+                    val directUrl = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t"
+                    android.util.Log.d("Anizle", "GDrive: directUrl=$directUrl")
+                    callback(newExtractorLink(
+                        source = name,
+                        name   = label,
+                        url    = directUrl,
+                        type   = ExtractorLinkType.VIDEO
+                    ) {
+                        quality = Qualities.Unknown.value
+                        referer = "https://drive.google.com/"
+                    })
                     found = true
                     continue
                 }
