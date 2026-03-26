@@ -482,69 +482,20 @@ class AnizleProvider : MainAPI() {
                     "Origin"           to playerBase,
                 )
 
-                // Step 5a: try action=get_video — returns a muxed direct URL (video+audio, downloadable).
-                // This is how the original kraptor Anizm extension handled downloads.
-                // Try each quality; use the first non-empty response.
-                var directFound = false
-                for (q in listOf("1080" to Qualities.P1080.value,
-                                  "720"  to Qualities.P720.value,
-                                  "480"  to Qualities.P480.value)) {
-                    val resp = try {
-                        app.post(
-                            "$playerBase/player/index.php?data=$fireId&quality=${q.first}&action=get_video",
-                            headers = aincradHeaders
-                        ).text.trim()
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "get_video ${q.first}p error: ${e.message}"); continue
-                    }
-                    android.util.Log.d("Anizle", "get_video ${q.first}p resp=${resp.take(120)}")
-
-                    // Response may be a plain URL or JSON {"url":"..."} or similar
-                    val directUrl = when {
-                        resp.startsWith("http") -> resp
-                        resp.startsWith("{")    -> try {
-                            JSONObject(resp).let {
-                                it.optString("url", "").ifBlank {
-                                it.optString("videoSource", "").ifBlank {
-                                it.optString("securedLink", "") } }
-                            }.ifBlank { null }
-                        } catch (_: Exception) { null }
-                        else -> null
-                    }
-
-                    if (directUrl.isNullOrBlank()) {
-                        android.util.Log.w("Anizle", "get_video ${q.first}p: no URL in response"); break
-                    }
-
-                    android.util.Log.d("Anizle", "Aincrad direct ${q.first}p url=${directUrl.take(80)}")
-                    callback(newExtractorLink(
-                        source = name,
-                        name   = "$label (${q.first}p)",
-                        url    = directUrl,
-                        type   = ExtractorLinkType.VIDEO
-                    ) {
-                        quality = q.second
-                        referer = playerReferer
-                    })
-                    directFound = true
-                }
-
-                // Step 5b: fallback to do=getVideo → HLS master.m3u8 for streaming.
+                // Step 5: POST do=getVideo → HLS master.m3u8 for streaming.
                 // ExoPlayer handles the separate audio track natively in the player.
+                // Downloads should use the GDrive link (registered earlier) which is a direct MP4.
                 val streamText = try {
                     app.post(
                         "$playerBase/player/index.php?data=$fireId&do=getVideo",
                         headers = aincradHeaders
                     ).text
                 } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "getVideo error: ${e.message}")
-                    if (directFound) { found = true }; continue
+                    android.util.Log.e("Anizle", "getVideo error: ${e.message}"); continue
                 }
                 android.util.Log.d("Anizle", "Step5 full=${streamText.take(300)}")
 
-                val json = try { JSONObject(streamText) } catch (_: Exception) {
-                    if (directFound) { found = true }; continue
-                }
+                val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
 
                 val securedLink = json.optString("securedLink", "")
                 val videoSource = json.optString("videoSource", "")
@@ -564,7 +515,6 @@ class AnizleProvider : MainAPI() {
                         type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
                     found = true
                 }
-                if (directFound) found = true
             } // end for (videoUrl, videoName)
         } // end for (trUrl, fansubName)
         return found
