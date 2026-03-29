@@ -456,7 +456,7 @@ class AnizleProvider : MainAPI() {
                     val directUrl = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t"
                     android.util.Log.d("Anizle", "GDrive: directUrl=$directUrl")
                     callback(newExtractorLink(
-                        source = name,
+                        source = label,
                         name   = label,
                         url    = directUrl,
                         type   = ExtractorLinkType.VIDEO
@@ -503,7 +503,7 @@ class AnizleProvider : MainAPI() {
 
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
                     android.util.Log.d("Anizle", "Aincrad HLS url=$securedLink")
-                    callback(newExtractorLink(source = name, name = label, url = securedLink,
+                    callback(newExtractorLink(source = label, name = label, url = securedLink,
                         type = ExtractorLinkType.M3U8) {
                         quality = Qualities.P1080.value
                         referer = playerReferer
@@ -511,7 +511,7 @@ class AnizleProvider : MainAPI() {
                     found = true; continue
                 }
                 if (videoSource.isNotBlank()) {
-                    callback(newExtractorLink(source = name, name = label, url = videoSource,
+                    callback(newExtractorLink(source = label, name = label, url = videoSource,
                         type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
                     found = true
                 }
