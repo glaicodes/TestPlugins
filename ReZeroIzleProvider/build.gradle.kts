@@ -1,5 +1,5 @@
 // use an integer for version numbers
-version = 1
+version = 2
 
 cloudstream {
     // All of the following are optional, remove any line you don't need
