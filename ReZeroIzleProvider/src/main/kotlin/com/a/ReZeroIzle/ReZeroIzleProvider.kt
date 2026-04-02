@@ -6,33 +6,30 @@ import com.lagradost.cloudstream3.utils.*
 /**
  * ReZero İzle CloudStream 3 Provider
  *
- * Single-anime site (Re:Zero) with Turkish subtitles, hosted on Google Drive.
+ * Single-anime Turkish-subtitle site. Each season is exposed as a separate
+ * searchable entry with its own poster so the user can jump straight to any season.
  *
- * Site structure:
- *   Home:          https://rezeroizle.com/index.html
- *   Season index:  https://rezeroizle.com/sezon/{n}/index.html
- *   Regular ep:    https://rezeroizle.com/sezon/{s}/bolum/{n}.html
- *   Interlude ep:  https://rezeroizle.com/sezon/{s}/arabolum/{n}.html
- *   Special / OVA: https://rezeroizle.com/sezon/{s}/ozel/{name}.html
+ * Season index HTML structure (confirmed from raw page source):
+ *   <div class="hub-card">
+ *     <ul>
+ *       <li><a href="https://rezeroizle.com/sezon/1/bolum/1.html">1. Bölüm …</a></li>
+ *       …
+ *     </ul>
+ *   </div>
+ *   (The "İzlemeye Başla" CTA sits in a sibling div.hub-cta, NOT inside the <ul>.)
  *
- * Video links:
- *   GDrive file ID is embedded in the episode page HTML (inline script or iframe).
- *   We extract the ID with regexes and build a direct download URL.
+ * Episode page GDrive link (confirmed from raw page source):
+ *   <a id="downloadBtn"
+ *      href="https://drive.google.com/uc?export=download&id=FILE_ID">⬇ İndir</a>
+ *   → [?&]id= regex catches FILE_ID reliably.
  */
 class ReZeroIzleProvider : MainAPI() {
 
-    override var mainUrl         = "https://rezeroizle.com"
-    override var name            = "ReZero İzle"
-    override var lang            = "tr"
-    override val hasMainPage      = true
-    override val supportedTypes   = setOf(TvType.Anime, TvType.OVA)
-
-    private val animeTitle = "Re:Zero kara Hajimeru Isekai Seikatsu"
-    private val animeDesc  =
-        "Lise öğrencisi Subaru Natsuki, aniden başka bir dünyaya ışınlanır. " +
-        "Karşılaştığı tehlikeleri 'Ölümden Dönüş' yeteneğiyle atlatmaya çalışır."
-    private val animePoster = "$mainUrl/images/icon.png"
-    private val animeUrl    = "$mainUrl/index.html"
+    override var mainUrl        = "https://rezeroizle.com"
+    override var name           = "ReZero İzle"
+    override var lang           = "tr"
+    override val hasMainPage    = false
+    override val supportedTypes = setOf(TvType.Anime, TvType.OVA)
 
     private val baseHeaders = mapOf(
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
@@ -41,110 +38,163 @@ class ReZeroIzleProvider : MainAPI() {
         "Referer"         to "$mainUrl/",
     )
 
-    // ── Home page ──────────────────────────────────────────────────────────────
-    // One category per available season + the OVAs, so the user lands on a
-    // useful episode list without having to enter load() first.
-    override val mainPage = mainPageOf(
-        "$mainUrl/sezon/1/index.html" to "1. Sezon",
-        "$mainUrl/sezon/2/index.html" to "2. Sezon",
-        "$mainUrl/sezon/3/index.html" to "3. Sezon",
-        "$mainUrl/sezon/4/index.html" to "4. Sezon",
+    // ── Catalogue ─────────────────────────────────────────────────────────────
+    private data class Catalogue(
+        val title: String,
+        val url: String,
+        val poster: String,
+        val plot: String,
+        val type: TvType,
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Home page shows the anime as a single card — no pagination needed.
-        if (page > 1) return newHomePageResponse(request.name, emptyList())
-        val result = newAnimeSearchResponse(animeTitle, animeUrl, TvType.Anime) {
-            posterUrl = animePoster
-        }
-        return newHomePageResponse(request.name, listOf(result))
-    }
+    private val catalogue = listOf(
+        Catalogue(
+            title  = "Re:Zero 1. Sezon",
+            url    = "$mainUrl/sezon/1/index.html",
+            poster = "$mainUrl/images/s1.jpg",
+            plot   = "Subaru Natsuki başka bir dünyaya ışınlanır ve 'Ölümden Dönüş' " +
+                     "yeteneğiyle hayatta kalmaya çalışır. (1. Sezon – 25 bölüm)",
+            type   = TvType.Anime,
+        ),
+        Catalogue(
+            title  = "Re:Zero 2. Sezon",
+            url    = "$mainUrl/sezon/2/index.html",
+            poster = "$mainUrl/images/s2.webp",
+            plot   = "Subaru yeni tehditlerle yüzleşirken Rem gizemli bir uykuya dalar. " +
+                     "(2. Sezon – 25 bölüm)",
+            type   = TvType.Anime,
+        ),
+        Catalogue(
+            title  = "Re:Zero 3. Sezon",
+            url    = "$mainUrl/sezon/3/index.html",
+            poster = "$mainUrl/images/s3.webp",
+            plot   = "Re:Zero 3. Sezon – Türkçe altyazılı.",
+            type   = TvType.Anime,
+        ),
+        Catalogue(
+            title  = "Re:Zero 4. Sezon",
+            url    = "$mainUrl/sezon/4/index.html",
+            poster = "$mainUrl/images/s4.webp",
+            plot   = "Re:Zero 4. Sezon – Türkçe altyazılı.",
+            type   = TvType.Anime,
+        ),
+        Catalogue(
+            title  = "Re:Zero – Memory Snow (OVA)",
+            url    = "$mainUrl/sezon/1/ozel/memory-snow.html",
+            poster = "$mainUrl/images/s1.jpg",
+            plot   = "Kış şenliği ve karlı bir gün. Subaru ile Emilia'nın tatlı kış macerası.",
+            type   = TvType.OVA,
+        ),
+        Catalogue(
+            title  = "Re:Zero – Frozen Bond (OVA)",
+            url    = "$mainUrl/sezon/2/ozel/frozen-bond.html",
+            poster = "$mainUrl/images/frozen-bond.webp",
+            plot   = "Emilia'nın geçmişi ve Frozen Bond – Türkçe altyazılı OVA.",
+            type   = TvType.OVA,
+        ),
+    )
 
     // ── Search ─────────────────────────────────────────────────────────────────
-    // This site carries only Re:Zero. We do a fuzzy match and always return it
-    // when the query is at all related; blank queries also return it.
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.lowercase().trim()
-        val keywords = listOf("re", "zero", "rezero", "sıfır", "subaru", "emilia", "rem", "ram")
-        val matches = q.isBlank() || keywords.any { q.contains(it) }
-        if (!matches) return emptyList()
-        return listOf(
-            newAnimeSearchResponse(animeTitle, animeUrl, TvType.Anime) {
-                posterUrl = animePoster
-            }
+        val keywords = listOf(
+            "re", "zero", "rezero", "subaru", "emilia", "rem", "ram",
+            "memory", "snow", "frozen", "bond", "sezon", "ova",
         )
+        val isMatch = q.isBlank() || keywords.any { q.contains(it) }
+        if (!isMatch) return emptyList()
+
+        return catalogue.map { entry ->
+            newAnimeSearchResponse(entry.title, entry.url, entry.type) {
+                posterUrl = entry.poster
+            }
+        }
     }
 
     // ── Load ──────────────────────────────────────────────────────────────────
-    // Parses all available seasons from their index pages and builds a flat
-    // episode list with correct season/episode numbering.
     override suspend fun load(url: String): LoadResponse {
-        val episodes = mutableListOf<Episode>()
+        val entry  = catalogue.find { it.url == url }
+        val title  = entry?.title  ?: "Re:Zero"
+        val poster = entry?.poster ?: "$mainUrl/images/s1.jpg"
+        val plot   = entry?.plot
+        val type   = entry?.type   ?: TvType.Anime
 
-        for (season in 1..4) {
-            val seasonUrl = "$mainUrl/sezon/$season/index.html"
-            try {
-                val doc = app.get(seasonUrl, headers = baseHeaders).document
-
-                // Select ALL links on the page and filter by URL pattern.
-                // This is resilient to any HTML structure (ul/ol/div/etc.) the site uses.
-                // Episode URLs always contain /sezon/{season}/(bolum|arabolum|ozel)/.
-                val episodePattern = Regex("""/sezon/$season/(bolum|arabolum|ozel)/""")
-
-                val seen = mutableSetOf<String>()
-                var epCounter = 0
-
-                doc.select("a[href]").forEach { el ->
-                    val rawHref = el.attr("abs:href").ifBlank { el.attr("href") }
-                    val href    = fixUrl(rawHref).ifBlank { return@forEach }
-                    val title   = el.text().trim().ifBlank { return@forEach }
-
-                    // Must match the episode URL pattern for this season
-                    if (!episodePattern.containsMatchIn(href)) return@forEach
-
-                    // Deduplicate (e.g. "İzlemeye Başla" repeats the first episode link)
-                    if (!seen.add(href)) return@forEach
-
-                    epCounter++
-
-                    // Derive display episode number from URL; fall back to sequential counter.
-                    val epNum: Int? = when {
-                        href.contains("/bolum/") ->
-                            Regex("""/bolum/(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
-                        href.contains("/arabolum/") ->
-                            Regex("""/arabolum/(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
-                        else -> epCounter  // /ozel/ pages have names, not numbers
-                    }
-
-                    episodes.add(
-                        newEpisode(href) {
-                            this.name    = title
-                            this.season  = season
-                            this.episode = epNum
-                        }
-                    )
-                    android.util.Log.d("ReZeroIzle", "S$season ep $epNum: $title -> $href")
+        // OVA pages are the episode themselves — wrap as single episode
+        if (url.contains("/ozel/")) {
+            val episodes = listOf(
+                newEpisode(url) {
+                    this.name    = title
+                    this.season  = 1
+                    this.episode = 1
                 }
-                android.util.Log.d("ReZeroIzle", "Season $season: $epCounter episodes parsed")
-            } catch (e: Exception) {
-                // Season 4 may not be live yet — silently skip missing/future seasons.
-                android.util.Log.w("ReZeroIzle", "Season $season skipped: ${e.message}")
+            )
+            return newAnimeLoadResponse(title, url, type) {
+                posterUrl  = poster
+                this.plot  = plot
+                this.tags  = listOf("OVA", "Türkçe Altyazı")
+                addEpisodes(DubStatus.Subbed, episodes)
             }
         }
 
-        return newAnimeLoadResponse(animeTitle, url, TvType.Anime) {
-            posterUrl  = animePoster
-            this.plot  = animeDesc
+        // Season index pages
+        // IMPORTANT: hrefs in the HTML are already absolute URLs.
+        // Use el.attr("href") directly — do NOT use abs:href or fixUrl()
+        // which can corrupt already-absolute URLs when no <base> tag is present.
+        val seasonNum = Regex("""/sezon/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+
+        val doc = try {
+            app.get(url, headers = baseHeaders).document
+        } catch (e: Exception) {
+            android.util.Log.e("ReZeroIzle", "Season $seasonNum index fetch failed: ${e.message}")
+            return newAnimeLoadResponse(title, url, type) {
+                posterUrl = poster
+                this.plot = plot
+                addEpisodes(DubStatus.Subbed, emptyList())
+            }
+        }
+
+        val episodes = mutableListOf<Episode>()
+        var counter  = 0
+
+        // Selector confirmed against raw HTML:
+        // div.hub-card > ul > li > a[href]
+        // This excludes the CTA link (in div.hub-cta) and the navbar logo link.
+        doc.select("div.hub-card ul li a[href]").forEach { el ->
+            val href   = el.attr("href").ifBlank { return@forEach }
+            val label  = el.text().trim().ifBlank { return@forEach }
+            counter++
+
+            val epNum: Int? = when {
+                href.contains("/bolum/")    ->
+                    Regex("""/bolum/(\d+)\.html""").find(href)?.groupValues?.get(1)?.toIntOrNull()
+                href.contains("/arabolum/") ->
+                    Regex("""/arabolum/(\d+)\.html""").find(href)?.groupValues?.get(1)?.toIntOrNull()
+                else -> counter
+            }
+
+            episodes.add(
+                newEpisode(href) {
+                    this.name    = label
+                    this.season  = 1
+                    this.episode = epNum
+                }
+            )
+            android.util.Log.d("ReZeroIzle", "S$seasonNum E$epNum: $label")
+        }
+
+        android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded")
+
+        return newAnimeLoadResponse(title, url, type) {
+            posterUrl  = poster
+            this.plot  = plot
             this.tags  = listOf("İsekai", "Fantazi", "Aksiyon", "Türkçe Altyazı")
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
     // ── Load links ────────────────────────────────────────────────────────────
-    // The episode page embeds a Google Drive file ID inside an inline <script>
-    // or an <iframe src="...drive.google.com..."> element.
-    // We try several regex patterns in order of specificity and build a direct
-    // download URL from whichever ID we find.
+    // GDrive ID confirmed in raw HTML inside the download button:
+    //   <a id="downloadBtn" href="https://drive.google.com/uc?export=download&id=FILE_ID">
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -161,43 +211,25 @@ class ReZeroIzleProvider : MainAPI() {
         }
         android.util.Log.d("ReZeroIzle", "Episode page len=${html.length}")
 
-        // ── GDrive file ID extraction ──────────────────────────────────────────
-        // Priority 1: explicit /file/d/{ID} path in any context (iframe, script, href)
         val fileId =
             Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""")
                 .find(html)?.groupValues?.get(1)
-
-            // Priority 2: ?id=... or &id=... query parameter (uc?export&id=..., usercontent, etc.)
             ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""")
                 .find(html)?.groupValues?.get(1)
-
-            // Priority 3: docs.google.com variant with /d/{ID}
             ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""")
                 .find(html)?.groupValues?.get(1)
 
-            // Priority 4: JS string literal that looks like a GDrive file ID.
-            //             GDrive file IDs start with "1" and are 28-33 chars of base64url.
-            //             This is a heuristic — only used as a last resort.
-            ?: Regex("""["'`](1[A-Za-z0-9_-]{27,32})["'`]""")
-                .find(html)?.groupValues?.get(1)
-
         if (fileId == null) {
-            android.util.Log.w(
-                "ReZeroIzle",
-                "No GDrive file ID found — episode may not be translated yet. " +
-                "HTML snippet: ${html.take(400)}"
-            )
+            android.util.Log.w("ReZeroIzle",
+                "No GDrive ID found — episode may not be translated yet. " +
+                "Snippet: ${html.take(300)}")
             return false
         }
         android.util.Log.d("ReZeroIzle", "GDrive fileId=$fileId")
 
-        // Direct download URL.
-        // - drive.usercontent.google.com is Google's canonical download endpoint.
-        // - confirm=t skips the "large file" interstitial for files > ~100 MB.
-        // - export=download forces a download response (Content-Disposition: attachment).
+        // confirm=t bypasses the large-file download interstitial
         val directUrl =
             "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t"
-
         callback(
             newExtractorLink(
                 source = name,
@@ -209,22 +241,6 @@ class ReZeroIzleProvider : MainAPI() {
                 referer = "https://drive.google.com/"
             }
         )
-
-        // Also offer a streaming-friendly preview URL as a second source.
-        // Some CloudStream players handle this better than the raw download endpoint.
-        val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-        callback(
-            newExtractorLink(
-                source = name,
-                name   = "Google Drive (Önizleme)",
-                url    = previewUrl,
-                type   = ExtractorLinkType.VIDEO,
-            ) {
-                quality = Qualities.Unknown.value
-                referer = "https://drive.google.com/"
-            }
-        )
-
         return true
     }
 }
