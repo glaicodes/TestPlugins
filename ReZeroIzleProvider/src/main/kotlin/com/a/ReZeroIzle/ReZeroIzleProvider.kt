@@ -85,30 +85,35 @@ class ReZeroIzleProvider : MainAPI() {
             val seasonUrl = "$mainUrl/sezon/$season/index.html"
             try {
                 val doc = app.get(seasonUrl, headers = baseHeaders).document
-                // All episode links live inside the <ul> list on the season index page.
-                // Each <li> has exactly one <a href="...">title</a>.
-                // The "İzlemeye Başla" call-to-action link at the bottom is outside the <ul>.
-                var epCounter = 0
-                doc.select("ul li a[href]").forEach { el ->
-                    val href  = fixUrl(el.attr("abs:href").ifBlank { el.attr("href") })
-                        .ifBlank { return@forEach }
-                    val title = el.text().trim().ifBlank { return@forEach }
 
-                    // Only include episode / interlude / special pages from this site
-                    if (!href.startsWith(mainUrl)) return@forEach
-                    if (!href.contains("/sezon/")) return@forEach
+                // Select ALL links on the page and filter by URL pattern.
+                // This is resilient to any HTML structure (ul/ol/div/etc.) the site uses.
+                // Episode URLs always contain /sezon/{season}/(bolum|arabolum|ozel)/.
+                val episodePattern = Regex("""/sezon/$season/(bolum|arabolum|ozel)/""")
+
+                val seen = mutableSetOf<String>()
+                var epCounter = 0
+
+                doc.select("a[href]").forEach { el ->
+                    val rawHref = el.attr("abs:href").ifBlank { el.attr("href") }
+                    val href    = fixUrl(rawHref).ifBlank { return@forEach }
+                    val title   = el.text().trim().ifBlank { return@forEach }
+
+                    // Must match the episode URL pattern for this season
+                    if (!episodePattern.containsMatchIn(href)) return@forEach
+
+                    // Deduplicate (e.g. "İzlemeye Başla" repeats the first episode link)
+                    if (!seen.add(href)) return@forEach
 
                     epCounter++
 
-                    // Derive a display episode number from the URL path when possible,
-                    // so regular episodes keep their "true" number (e.g. S1E12 = 12).
-                    // Interlude and OVA episodes get sequential numbers within their season.
+                    // Derive display episode number from URL; fall back to sequential counter.
                     val epNum: Int? = when {
                         href.contains("/bolum/") ->
                             Regex("""/bolum/(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
                         href.contains("/arabolum/") ->
                             Regex("""/arabolum/(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
-                        else -> epCounter   // OVA / named specials
+                        else -> epCounter  // /ozel/ pages have names, not numbers
                     }
 
                     episodes.add(
@@ -118,10 +123,11 @@ class ReZeroIzleProvider : MainAPI() {
                             this.episode = epNum
                         }
                     )
+                    android.util.Log.d("ReZeroIzle", "S$season ep $epNum: $title -> $href")
                 }
                 android.util.Log.d("ReZeroIzle", "Season $season: $epCounter episodes parsed")
             } catch (e: Exception) {
-                // Season 4 may not be live yet — silently skip missing seasons.
+                // Season 4 may not be live yet — silently skip missing/future seasons.
                 android.util.Log.w("ReZeroIzle", "Season $season skipped: ${e.message}")
             }
         }
