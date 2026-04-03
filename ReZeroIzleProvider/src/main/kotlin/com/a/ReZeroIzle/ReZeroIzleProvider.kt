@@ -227,10 +227,20 @@ class ReZeroIzleProvider : MainAPI() {
         }
         android.util.Log.d("ReZeroIzle", "Episode page len=${html.length}")
 
+        // Detect unreleased episodes: the site renders unreleasedOverlay with display:none
+        // for released episodes, and makes it visible (no display:none) for unreleased ones.
+        val isUnreleased = html.contains("unreleasedOverlay") &&
+            !Regex("""unreleasedOverlay[^>]*display\s*:\s*none""").containsMatchIn(html)
+        if (isUnreleased) {
+            android.util.Log.w("ReZeroIzle", "Episode not yet translated by site owner. url=$data")
+            return false
+        }
+
         val fileId =
             Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""")
                 .find(html)?.groupValues?.get(1)
-            ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""")
+            // &amp; is the HTML-encoded form of & inside href attributes
+            ?: Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,})""")
                 .find(html)?.groupValues?.get(1)
             ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""")
                 .find(html)?.groupValues?.get(1)
