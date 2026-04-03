@@ -429,16 +429,13 @@ class AnizleProvider : MainAPI() {
                 // Without this referer the CDN (vycdn.sbs/vtcdn.sbs) returns 403 on downloads.
                 if (isGdrive) {
                     val gHtml = try {
-                        var h = app.get("$videoBase/player/$playerId",
+                        val h = app.get("$videoBase/player/$playerId",
                             headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
-                        val isBad = { s: String -> s.isBlank() || s.length < 8000 ||
-                            s.contains("Just a moment", ignoreCase = true) ||
-                            s.contains("cf-browser-verification", ignoreCase = true) }
-                        if (isBad(h)) {
-                            android.util.Log.w("Anizle", "GDrive: anizle.org bad len=${h.length} snippet=${h.take(100)}")
-                            h = app.get("$mainUrl/player/$playerId",
-                                headers = baseHeaders + mapOf("Referer" to "$mainUrl/"),
-                                interceptor = cfKiller).text
+                        if (h.isBlank() || h.length < 8000 ||
+                            h.contains("Just a moment", ignoreCase = true) ||
+                            h.contains("cf-browser-verification", ignoreCase = true)) {
+                            android.util.Log.w("Anizle", "GDrive: player page unavailable len=${h.length} — skipping")
+                            continue
                         }
                         h
                     } catch (e: Exception) {
