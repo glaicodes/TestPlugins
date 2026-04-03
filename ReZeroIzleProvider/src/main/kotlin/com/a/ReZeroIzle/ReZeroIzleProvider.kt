@@ -137,9 +137,9 @@ class ReZeroIzleProvider : MainAPI() {
         }
 
         // Season index pages
-        // IMPORTANT: hrefs in the HTML are already absolute URLs.
-        // Use el.attr("href") directly — do NOT use abs:href or fixUrl()
-        // which can corrupt already-absolute URLs when no <base> tag is present.
+        // The live HTML uses relative hrefs (e.g. "bolum/5.html"), NOT absolute ones.
+        // Chrome rewrites them to absolute when saving as MHT, which caused confusion.
+        // We resolve them manually against the season index page URL.
         val seasonNum = Regex("""/sezon/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 
         val doc = try {
@@ -156,12 +156,28 @@ class ReZeroIzleProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         var counter  = 0
 
-        // Selector confirmed against raw HTML:
-        // div.hub-card > ul > li > a[href]
-        // This excludes the CTA link (in div.hub-cta) and the navbar logo link.
+        // Base for resolving relative hrefs.
+        // The season index is at /sezon/N/index.html, so the base dir is /sezon/N/
+        // e.g. a relative href "bolum/5.html" → https://rezeroizle.com/sezon/1/bolum/5.html
+        val pageBaseDir = url.substringBeforeLast("/") + "/"
+
+        // Selector confirmed against raw HTML: div.hub-card > ul > li > a[href]
+        // Excludes the CTA link (div.hub-cta) and the navbar logo link.
         doc.select("div.hub-card ul li a[href]").forEach { el ->
-            val href   = el.attr("href").ifBlank { return@forEach }
-            val label  = el.text().trim().ifBlank { return@forEach }
+            val rawHref = el.attr("href").ifBlank { return@forEach }
+            val label   = el.text().trim().ifBlank { return@forEach }
+
+            // Resolve the href to an absolute URL.
+            // Priority: abs:href (Jsoup resolves against its base URI) →
+            //           manual resolution against the season index page dir.
+            val href = el.attr("abs:href").ifBlank {
+                when {
+                    rawHref.startsWith("http") -> rawHref          // already absolute
+                    rawHref.startsWith("/")    -> "$mainUrl$rawHref" // root-relative
+                    else                       -> pageBaseDir + rawHref // relative to page
+                }
+            }.ifBlank { return@forEach }
+
             counter++
 
             val epNum: Int? = when {
@@ -179,7 +195,7 @@ class ReZeroIzleProvider : MainAPI() {
                     this.episode = epNum
                 }
             )
-            android.util.Log.d("ReZeroIzle", "S$seasonNum E$epNum: $label")
+            android.util.Log.d("ReZeroIzle", "S$seasonNum E$epNum [$href]: $label")
         }
 
         android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded")
