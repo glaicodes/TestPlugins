@@ -326,22 +326,55 @@ class AnizleProvider : MainAPI() {
         }
         android.util.Log.d("Anizle", "Episode page len=${epHtml.length}")
 
-        // Step 1: translator buttons — regex like Python
+        // Diagnostic: log a snippet around the fansub section to see what the page looks like.
+        val fansubIdx = epHtml.indexOf("fansub", ignoreCase = true)
+            .takeIf { it >= 0 } ?: epHtml.indexOf("translator", ignoreCase = true)
+        android.util.Log.d("Anizle", "Step1 diag: epHtml len=${epHtml.length}, fansubIdx=$fansubIdx snippet=${epHtml.substring(fansubIdx.coerceAtLeast(0), (fansubIdx + 400).coerceAtMost(epHtml.length))}")
+
+        // Step 1: translator buttons
+        // Supports both old attribute name  translator="URL"
+        // and newer  data-translator="URL"  that the site may have switched to.
         val translators = mutableListOf<Pair<String, String>>()
-        Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
-            .findAll(epHtml).forEach { m ->
-                val url = m.groupValues[1]; if (url.isBlank()) return@forEach
-                if (translators.none { it.first == url })
-                    translators += url to m.groupValues[2].ifBlank { "Fansub" }
-            }
-        if (translators.isEmpty()) {
-            Regex("""data-fansub-name="([^"]*)"[^>]*translator="([^"]+)"""")
-                .findAll(epHtml).forEach { m ->
-                    val url = m.groupValues[2]; if (url.isBlank()) return@forEach
-                    if (translators.none { it.first == url })
-                        translators += url to m.groupValues[1].ifBlank { "Fansub" }
-                }
+
+        fun addTranslator(url: String, name: String) {
+            if (url.isNotBlank() && translators.none { it.first == url })
+                translators += url to name.ifBlank { "Fansub" }
         }
+
+        // Pattern A: translator="URL" ... data-fansub-name="Name"  (original)
+        Regex("""(?:data-)?translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
+            .findAll(epHtml).forEach { m -> addTranslator(m.groupValues[1], m.groupValues[2]) }
+
+        // Pattern B: reversed attribute order
+        if (translators.isEmpty()) {
+            Regex("""data-fansub-name="([^"]*)"[^>]*(?:data-)?translator="([^"]+)"""")
+                .findAll(epHtml).forEach { m -> addTranslator(m.groupValues[2], m.groupValues[1]) }
+        }
+
+        // Pattern C: Jsoup selector fallback — catches any attribute name variant
+        if (translators.isEmpty()) {
+            val epDoc = org.jsoup.Jsoup.parse(epHtml)
+            for (el in epDoc.select("[translator],[data-translator],[data-url][data-fansub-name]")) {
+                val url  = el.attr("translator").ifBlank { el.attr("data-translator") }
+                              .ifBlank { el.attr("data-url") }
+                val name = el.attr("data-fansub-name").ifBlank { el.attr("data-name") }
+                              .ifBlank { el.text().trim() }
+                addTranslator(url, name)
+            }
+            android.util.Log.d("Anizle", "Step1 Jsoup fallback: ${translators.size} found")
+        }
+
+        // Pattern D: href-based links inside the fansub selection box
+        if (translators.isEmpty()) {
+            val epDoc = org.jsoup.Jsoup.parse(epHtml)
+            for (el in epDoc.select("div.fansubSecimKutucugu a[href], div[class*=fansub] a[href]")) {
+                val url  = el.attr("abs:href").ifBlank { el.attr("href") }
+                val name = el.attr("data-fansub-name").ifBlank { el.text().trim() }
+                addTranslator(url, name)
+            }
+            android.util.Log.d("Anizle", "Step1 href fallback: ${translators.size} found")
+        }
+
         android.util.Log.d("Anizle", "Step1: ${translators.size} translators")
         if (translators.isEmpty()) return false
 
@@ -359,20 +392,49 @@ class AnizleProvider : MainAPI() {
             }
             android.util.Log.d("Anizle", "Step2 resp len=${trText.length}")
 
-            val trHtml = try { JSONObject(trText).optString("data", "") }
-                         catch (_: Exception) { "" }
+            val trHtml = try {
+                val obj = JSONObject(trText)
+                // Site may use key "data", "html", "content", or "player"
+                obj.optString("data", "")
+                    .ifBlank { obj.optString("html", "") }
+                    .ifBlank { obj.optString("content", "") }
+                    .ifBlank { obj.optString("player", "") }
+            } catch (_: Exception) { "" }
             if (trHtml.isBlank()) {
-                android.util.Log.w("Anizle", "Step2: no data field, raw=${trText.take(80)}")
+                android.util.Log.w("Anizle", "Step2: no data field, raw=${trText.take(200)}")
                 continue
             }
+            android.util.Log.d("Anizle", "Step2: trHtml len=${trHtml.length} snippet=${trHtml.take(300)}")
 
-            // video="URL" data-video-name="Name" — exact Python pattern
+            // video="URL" data-video-name="Name" — original pattern + data-video variant
             val videos = mutableListOf<Pair<String, String>>()
-            Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
-                .findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
+
+            fun addVideo(url: String, name: String) {
+                if (url.isNotBlank()) videos += url to name.ifBlank { "Player" }
+            }
+
+            // Pattern A: video="URL" ... data-video-name="Name"
+            Regex("""(?:data-)?video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
+                .findAll(trHtml).forEach { m -> addVideo(m.groupValues[1], m.groupValues[2]) }
+
+            // Pattern B: reversed attribute order
             if (videos.isEmpty()) {
-                Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
-                    .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
+                Regex("""data-video-name="([^"]*)"[^>]*(?:data-)?video="([^"]+)"""")
+                    .findAll(trHtml).forEach { m -> addVideo(m.groupValues[2], m.groupValues[1]) }
+            }
+
+            // Pattern C: Jsoup selector fallback
+            if (videos.isEmpty()) {
+                val trDoc = org.jsoup.Jsoup.parse(trHtml)
+                for (el in trDoc.select("[video],[data-video],[data-src][data-video-name],a.videoPlayerButtons")) {
+                    val url  = el.attr("video").ifBlank { el.attr("data-video") }
+                                  .ifBlank { el.attr("data-src") }
+                                  .ifBlank { el.attr("href") }
+                    val name = el.attr("data-video-name").ifBlank { el.attr("data-name") }
+                                  .ifBlank { el.text().trim() }
+                    addVideo(url, name)
+                }
+                android.util.Log.d("Anizle", "Step2 Jsoup fallback: ${videos.size} found")
             }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
             for ((videoUrl, videoName) in videos) {
@@ -382,17 +444,19 @@ class AnizleProvider : MainAPI() {
                 //   Aincrad → FirePlayer (anizmplayer.com)
                 //   GDrive  → Google Drive direct link
                 // Skipping everything else avoids N×M /player/ requests that block later fansubs.
-                val isAincrad = videoNameL.contains("aincrad")
-                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
+                val isAincrad = videoNameL.contains("aincrad") || videoNameL.contains("fire")
+                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google") || videoNameL.contains("drive")
                 if (!isAincrad && !isGdrive) {
-                    android.util.Log.d("Anizle", "Step4: skipping unsupported host $videoName")
+                    android.util.Log.d("Anizle", "Step4: skipping unsupported host '$videoName' url=$videoUrl")
                     continue
                 }
 
                 android.util.Log.d("Anizle", "Step4: processing $videoName -> $videoUrl")
 
                 // /video/{id} is CF-Turnstile-blocked — extract numeric ID from URL directly.
-                val playerId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1)
+                // Also handle /player/{id} or ?id={id} if the URL format changed.
+                val playerId = Regex("""/(?:video|player)/(\d+)""").find(videoUrl)?.groupValues?.get(1)
+                    ?: Regex("""[?&]id=(\d+)""").find(videoUrl)?.groupValues?.get(1)
                 if (playerId == null) {
                     android.util.Log.w("Anizle", "Step4: no playerId in $videoUrl"); continue
                 }
