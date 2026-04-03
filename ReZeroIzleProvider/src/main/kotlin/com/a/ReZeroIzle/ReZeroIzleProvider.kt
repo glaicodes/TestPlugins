@@ -187,21 +187,28 @@ class ReZeroIzleProvider : MainAPI() {
         }
         android.util.Log.d("ReZeroIzle", "Episode html len=${html.length}")
 
-        // ── Targeted debug: log the download button href and any GDrive context ──
-        // This tells us exactly what the live HTML contains so we can fix the regex.
-        val downloadBtnHref = Regex("""id=["']downloadBtn["'][^>]*href=["']([^"']+)["']""")
-            .find(html)?.groupValues?.get(1)
-            ?: Regex("""href=["']([^"']+)["'][^>]*id=["']downloadBtn["']""")
-            .find(html)?.groupValues?.get(1)
-        android.util.Log.d("ReZeroIzle", "downloadBtn href raw: $downloadBtnHref")
+        // ── Deep debug: parse with Jsoup to inspect the real DOM ──
+        val doc2 = org.jsoup.Jsoup.parse(html)
 
-        // Log first occurrence of 'drive' in the HTML so we can see the context
-        val driveIdx = html.indexOf("drive", ignoreCase = true)
-        if (driveIdx >= 0) {
-            android.util.Log.d("ReZeroIzle",
-                "drive ctx: ${html.substring((driveIdx - 20).coerceAtLeast(0), (driveIdx + 120).coerceAtMost(html.length))}")
-        } else {
-            android.util.Log.w("ReZeroIzle", "No 'drive' string anywhere in HTML!")
+        // 1. Log the full downloadBtn element outerHTML
+        val btnEl = doc2.selectFirst("#downloadBtn")
+        android.util.Log.d("ReZeroIzle", "downloadBtn outerHTML: ${btnEl?.outerHtml() ?: "NOT FOUND"}")
+
+        // 2. Log ALL inline script content so we can see where the GDrive ID comes from
+        doc2.select("script:not([src])").forEachIndexed { i, el ->
+            val sc = el.html().trim()
+            if (sc.isNotBlank()) {
+                android.util.Log.d("ReZeroIzle", "script[$i] (${sc.length}): ${sc.take(400)}")
+            }
+        }
+
+        // 3. Log any element that has a data-* attribute containing a long base64url string
+        doc2.allElements.forEach { el ->
+            el.attributes().forEach { attr ->
+                if (attr.value.length > 20 && attr.value.matches(Regex("[A-Za-z0-9_/-]{25,}"))) {
+                    android.util.Log.d("ReZeroIzle", "data attr ${el.tagName()}[${attr.key}]=${attr.value}")
+                }
+            }
         }
 
         // ── GDrive file ID extraction ──────────────────────────────────────────
