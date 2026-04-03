@@ -38,9 +38,6 @@ class AnizleProvider : MainAPI() {
     private var sessionFetchedAt: Long = 0L
     private val sessionTtlMs = 5 * 60 * 1000L // 5 minutes
 
-    // CF clearance pre-warm state
-    @Volatile private var cfPrewarmed = false
-    private var cfPrewarmJob: kotlinx.coroutines.Job? = null
 
     private suspend fun getSession() {
         val now = System.currentTimeMillis()
@@ -245,29 +242,6 @@ class AnizleProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         getSession()
 
-        // Pre-warm CF clearance for /video/ endpoints while user browses episode list.
-        // /video/{id} now requires cf_clearance. We launch cfKiller in a background job
-        // (not tied to this coroutine) so it survives even if the user navigates quickly.
-        // By the time they click an episode (~5-30s later), cfKiller will have solved
-        // the Turnstile challenge and stored cf_clearance in the shared cookie jar.
-        if (!cfPrewarmed) {
-            cfPrewarmed = true
-            cfPrewarmJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                try {
-                    android.util.Log.d("Anizle", "CF pre-warm: starting cfKiller on /video/1")
-                    // We don't care about the response — we just need cfKiller to run
-                    // its WebView, solve the Turnstile, and deposit cf_clearance in the
-                    // OkHttp cookie jar. Video ID 1 is intentionally bogus; CF will still
-                    // challenge and solve regardless of whether the content exists.
-                    app.get("$mainUrl/video/1", headers = baseHeaders, interceptor = cfKiller)
-                    android.util.Log.d("Anizle", "CF pre-warm: done — cf_clearance deposited")
-                } catch (e: Exception) {
-                    android.util.Log.w("Anizle", "CF pre-warm: ${e.message}")
-                    cfPrewarmed = false // allow retry next load()
-                }
-            }
-        }
-
         val doc = app.get(url, headers = baseHeaders).document
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
@@ -345,15 +319,6 @@ class AnizleProvider : MainAPI() {
     ): Boolean {
         getSession() // ensure cookies active for all requests below
         android.util.Log.d("Anizle", "loadLinks: $data")
-
-        // If CF pre-warm is still running, give it up to 30s to finish.
-        // This covers the case where the user clicks an episode very quickly.
-        val job = cfPrewarmJob
-        if (job != null && job.isActive) {
-            android.util.Log.d("Anizle", "loadLinks: waiting up to 30s for CF pre-warm...")
-            kotlinx.coroutines.withTimeoutOrNull(30_000L) { job.join() }
-            android.util.Log.d("Anizle", "loadLinks: CF pre-warm wait done (active=${job.isActive})")
-        }
 
         val epHtml = try {
             app.get(data, headers = baseHeaders).text
