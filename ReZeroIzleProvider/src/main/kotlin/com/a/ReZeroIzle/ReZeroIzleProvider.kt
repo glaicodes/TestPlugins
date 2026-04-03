@@ -187,58 +187,75 @@ class ReZeroIzleProvider : MainAPI() {
         }
         android.util.Log.d("ReZeroIzle", "Episode html len=${html.length}")
 
-        // ── Deep debug: parse with Jsoup to inspect the real DOM ──
+        // ── Step 1: parse page, extract EPISODE_INDEX and external script URLs ──
         val doc2 = org.jsoup.Jsoup.parse(html)
 
-        // 1. Log the full downloadBtn element outerHTML
-        val btnEl = doc2.selectFirst("#downloadBtn")
-        android.util.Log.d("ReZeroIzle", "downloadBtn outerHTML: ${btnEl?.outerHtml() ?: "NOT FOUND"}")
-
-        // 2. Log ALL inline script content so we can see where the GDrive ID comes from
-        doc2.select("script:not([src])").forEachIndexed { i, el ->
-            val sc = el.html().trim()
-            if (sc.isNotBlank()) {
-                android.util.Log.d("ReZeroIzle", "script[$i] (${sc.length}): ${sc.take(400)}")
-            }
+        // Extract window.EPISODE_INDEX from inline scripts
+        var episodeIndex = -1
+        doc2.select("script:not([src])").forEach { el ->
+            val m = Regex("""window\.EPISODE_INDEX\s*=\s*(\d+)""").find(el.html())
+            if (m != null) episodeIndex = m.groupValues[1].toInt()
         }
+        android.util.Log.d("ReZeroIzle", "EPISODE_INDEX=$episodeIndex")
 
-        // 3. Log any element that has a data-* attribute containing a long base64url string
-        doc2.allElements.forEach { el ->
-            el.attributes().forEach { attr ->
-                if (attr.value.length > 20 && attr.value.matches(Regex("[A-Za-z0-9_/-]{25,}"))) {
-                    android.util.Log.d("ReZeroIzle", "data attr ${el.tagName()}[${attr.key}]=${attr.value}")
+        // Log and collect external script URLs from this domain
+        val extScripts = doc2.select("script[src]")
+            .map { it.attr("abs:src").ifBlank { it.attr("src") } }
+            .filter { it.isNotBlank() }
+        android.util.Log.d("ReZeroIzle", "External scripts: $extScripts")
+
+        // ── Step 2: fetch external scripts and search for GDrive IDs ──
+        var fileId: String? = null
+
+        for (scriptUrl in extScripts) {
+            val absUrl = when {
+                scriptUrl.startsWith("http") -> scriptUrl
+                scriptUrl.startsWith("/")    -> "$mainUrl$scriptUrl"
+                else                         -> "$mainUrl/$scriptUrl"
+            }
+            android.util.Log.d("ReZeroIzle", "Fetching script: $absUrl")
+            val jsText = try {
+                app.get(absUrl, headers = baseHeaders).text
+            } catch (e: Exception) {
+                android.util.Log.w("ReZeroIzle", "Script fetch failed: ${e.message}")
+                continue
+            }
+            android.util.Log.d("ReZeroIzle", "Script len=${jsText.length} preview=${jsText.take(200)}")
+
+            // Collect ALL GDrive file IDs from this script
+            val ids = Regex("""["'`]([A-Za-z0-9_-]{25,})["'`]""")
+                .findAll(jsText)
+                .map { it.groupValues[1] }
+                .filter { it.matches(Regex("[A-Za-z0-9_-]{25,}")) }
+                .toList()
+            android.util.Log.d("ReZeroIzle", "Found ${ids.size} candidate IDs in script")
+
+            if (ids.isNotEmpty()) {
+                // Use EPISODE_INDEX if valid, otherwise take first
+                fileId = if (episodeIndex >= 0 && episodeIndex < ids.size) {
+                    android.util.Log.d("ReZeroIzle", "Using index $episodeIndex: ${ids[episodeIndex]}")
+                    ids[episodeIndex]
+                } else {
+                    android.util.Log.d("ReZeroIzle", "Index out of range, using first: ${ids[0]}")
+                    ids[0]
                 }
+                break
             }
         }
 
-        // ── GDrive file ID extraction ──────────────────────────────────────────
-        // Try every plausible pattern. The &amp; version is what HTML attribute
-        // encoding produces; the plain & version appears in JS strings.
-        val fileId =
-            // Pattern 1: /file/d/{ID} path — in iframe src or script
-            Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""")
-                .find(html)?.groupValues?.get(1)
-
-            // Pattern 2: [?&]id= — covers both raw & and HTML-encoded &amp;
-            ?: Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,})""")
-                .find(html)?.groupValues?.get(1)
-
-            // Pattern 3: docs.google.com with /d/{ID}
-            ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""")
-                .find(html)?.groupValues?.get(1)
-
-            // Pattern 4: bare GDrive file ID in a JS string literal.
-            // GDrive IDs are 28-33 chars of base64url, typically starting with "1".
-            ?: Regex("""["'`](1[A-Za-z0-9_-]{27,32})["'`]""")
-                .find(html)?.groupValues?.get(1)
+        // ── Step 3: fallback — search inline HTML for any GDrive pattern ──
+        if (fileId == null) {
+            fileId =
+                Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
+                ?: Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
+        }
 
         if (fileId == null) {
-            android.util.Log.w("ReZeroIzle", "No GDrive ID found in ${html.length} chars")
+            android.util.Log.w("ReZeroIzle", "No GDrive ID found anywhere. episodeIndex=$episodeIndex extScripts=$extScripts")
             return false
         }
         android.util.Log.d("ReZeroIzle", "GDrive fileId=$fileId")
 
-        // Direct download — confirm=t bypasses the large-file interstitial
         callback(
             newExtractorLink(
                 source = name,
