@@ -38,6 +38,10 @@ class AnizleProvider : MainAPI() {
     private var sessionFetchedAt: Long = 0L
     private val sessionTtlMs = 5 * 60 * 1000L // 5 minutes
 
+    // CF clearance pre-warm state
+    @Volatile private var cfPrewarmed = false
+    private var cfPrewarmJob: kotlinx.coroutines.Job? = null
+
     private suspend fun getSession() {
         val now = System.currentTimeMillis()
         if (csrfToken != null && (now - sessionFetchedAt) < sessionTtlMs) {
@@ -240,6 +244,30 @@ class AnizleProvider : MainAPI() {
     // ── Load (anime detail page) ───────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         getSession()
+
+        // Pre-warm CF clearance for /video/ endpoints while user browses episode list.
+        // /video/{id} now requires cf_clearance. We launch cfKiller in a background job
+        // (not tied to this coroutine) so it survives even if the user navigates quickly.
+        // By the time they click an episode (~5-30s later), cfKiller will have solved
+        // the Turnstile challenge and stored cf_clearance in the shared cookie jar.
+        if (!cfPrewarmed) {
+            cfPrewarmed = true
+            cfPrewarmJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                try {
+                    android.util.Log.d("Anizle", "CF pre-warm: starting cfKiller on /video/1")
+                    // We don't care about the response — we just need cfKiller to run
+                    // its WebView, solve the Turnstile, and deposit cf_clearance in the
+                    // OkHttp cookie jar. Video ID 1 is intentionally bogus; CF will still
+                    // challenge and solve regardless of whether the content exists.
+                    app.get("$mainUrl/video/1", headers = baseHeaders, interceptor = cfKiller)
+                    android.util.Log.d("Anizle", "CF pre-warm: done — cf_clearance deposited")
+                } catch (e: Exception) {
+                    android.util.Log.w("Anizle", "CF pre-warm: ${e.message}")
+                    cfPrewarmed = false // allow retry next load()
+                }
+            }
+        }
+
         val doc = app.get(url, headers = baseHeaders).document
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h1")?.text()?.trim()
@@ -318,6 +346,15 @@ class AnizleProvider : MainAPI() {
         getSession() // ensure cookies active for all requests below
         android.util.Log.d("Anizle", "loadLinks: $data")
 
+        // If CF pre-warm is still running, give it up to 30s to finish.
+        // This covers the case where the user clicks an episode very quickly.
+        val job = cfPrewarmJob
+        if (job != null && job.isActive) {
+            android.util.Log.d("Anizle", "loadLinks: waiting up to 30s for CF pre-warm...")
+            kotlinx.coroutines.withTimeoutOrNull(30_000L) { job.join() }
+            android.util.Log.d("Anizle", "loadLinks: CF pre-warm wait done (active=${job.isActive})")
+        }
+
         val epHtml = try {
             app.get(data, headers = baseHeaders).text
         } catch (e: Exception) {
@@ -389,61 +426,137 @@ class AnizleProvider : MainAPI() {
                     continue
                 }
 
-                android.util.Log.d("Anizle", "Step3: processing $videoName -> $videoUrl")
+                android.util.Log.d("Anizle", "Step4: processing $videoName -> $videoUrl")
 
-                // Step 3: XHR GET /video/{id} → JSON {player: "<iframe src=...>"}
-                // This is exactly how the website JS does it — no separate /player/ page fetch needed.
-                // The response contains the player embed HTML which has the FirePlayer hash or Drive ID.
-                val step3Text = try {
-                    app.get(videoUrl,
-                        headers = xhrHeaders + mapOf("Referer" to "$mainUrl/")).text
+                // Step 3: XHR GET /video/{id} → JSON {player:"<iframe src=...>"}
+                // This endpoint is CF-Turnstile protected. We rely on cf_clearance from
+                // the pre-warm job launched in load(). With cf_clearance in the cookie jar,
+                // a plain GET (no cfKiller) should pass. If still challenged, try cfKiller.
+                fun isCfChallenge(h: String) = h.contains("Just a moment", ignoreCase = true) ||
+                    h.contains("cf-browser-verification", ignoreCase = true)
+
+                var videoPageHtml = try {
+                    app.get(videoUrl, headers = xhrHeaders + mapOf("Referer" to "$mainUrl/")).text
                 } catch (e: Exception) {
                     android.util.Log.e("Anizle", "Step3 fetch error: ${e.message}"); continue
                 }
-                android.util.Log.d("Anizle", "Step3 resp len=${step3Text.length} snippet=${step3Text.take(300)}")
+                android.util.Log.d("Anizle", "Step3 resp len=${videoPageHtml.length} snippet=${videoPageHtml.take(200)}")
 
-                // Parse JSON — site returns {player:"<iframe...>"} or {data:"<iframe...>"}
+                // If still CF-challenged, try cfKiller on this specific video URL.
+                if (isCfChallenge(videoPageHtml)) {
+                    android.util.Log.w("Anizle", "Step3: CF challenge, trying cfKiller on $videoUrl")
+                    try {
+                        videoPageHtml = app.get(videoUrl,
+                            headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
+                            interceptor = cfKiller).text
+                        android.util.Log.d("Anizle", "Step3 cfKiller len=${videoPageHtml.length} snippet=${videoPageHtml.take(200)}")
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "Step3 cfKiller error: ${e.message}"); continue
+                    }
+                }
+                if (isCfChallenge(videoPageHtml)) {
+                    android.util.Log.w("Anizle", "Step3: still CF after cfKiller — giving up on $videoUrl")
+                    continue
+                }
+
+                // Parse JSON if the endpoint returns {player:"..."} or similar
                 val step3Html = try {
-                    val obj = JSONObject(step3Text)
-                    obj.optString("player", "")
-                        .ifBlank { obj.optString("data", "") }
+                    val obj = org.json.JSONObject(videoPageHtml)
+                    obj.optString("player", "").ifBlank { obj.optString("data", "") }
                         .ifBlank { obj.optString("html", "") }
-                        .ifBlank { obj.optString("embed", "") }
-                } catch (_: Exception) { step3Text } // fallback: treat raw response as HTML
+                } catch (_: Exception) { videoPageHtml }
 
                 android.util.Log.d("Anizle", "Step3 html len=${step3Html.length} snippet=${step3Html.take(300)}")
+
+                // Extract numeric player ID for the /player/ path
+                val playerId = Regex("""/(?:video|player)/(\d+)""").find(videoUrl)?.groupValues?.get(1)
+                if (playerId == null) {
+                    android.util.Log.w("Anizle", "Step3: no playerId in $videoUrl"); continue
+                }
+
+                // Try to get FirePlayer hash from step3Html first (might be embedded)
+                var pageHtml = if (step3Html.contains("FirePlayer", ignoreCase = true) ||
+                    step3Html.contains("eval(function(p,a,c,k", ignoreCase = true)) step3Html else ""
+
+                // If not found in step3, try fetching /player/{id} directly (might work with cf_clearance)
+                if (pageHtml.isBlank() && isAincrad) {
+                    for (base4 in listOf(mainUrl, videoBase)) {
+                        val html = try {
+                            app.get("$base4/player/$playerId",
+                                headers = baseHeaders + mapOf("Referer" to "$base4/")).text
+                        } catch (e: Exception) {
+                            android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
+                        }
+                        android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length} snippet=${html.take(300)}")
+                        if (isCfChallenge(html)) {
+                            android.util.Log.w("Anizle", "Step4: CF on $base4 — trying cfKiller")
+                            val solved = try {
+                                app.get("$base4/player/$playerId",
+                                    headers = baseHeaders + mapOf("Referer" to "$base4/"),
+                                    interceptor = cfKiller).text
+                            } catch (e: Exception) {
+                                android.util.Log.e("Anizle", "Step4 cfKiller ($base4): ${e.message}"); continue
+                            }
+                            android.util.Log.d("Anizle", "Step4 cfKiller ($base4): len=${solved.length} snippet=${solved.take(300)}")
+                            if (!isCfChallenge(solved) && (solved.contains("FirePlayer", ignoreCase = true) ||
+                                solved.contains("eval(function(p,a,c,k", ignoreCase = true))) {
+                                pageHtml = solved; break
+                            }
+                            continue
+                        }
+                        if (html.contains("FirePlayer", ignoreCase = true) ||
+                            html.contains("eval(function(p,a,c,k", ignoreCase = true)) {
+                            pageHtml = html; break
+                        }
+                        android.util.Log.w("Anizle", "Step4: no FirePlayer in $base4 page (len=${html.length})")
+                    }
+                    if (pageHtml.isBlank()) continue
+                }
 
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
                 // ── GDrive path ──────────────────────────────────────────────
+                // step3Html / videoPageHtml may already contain the Drive file ID if the
+                // video page embeds it directly. Otherwise fall back to fetching anizle.org/player/.
                 if (isGdrive) {
-                    // The player embed URL points to anizle.org/player/{id} or similar.
-                    // Extract the numeric player ID from the embed src, then fetch that page.
-                    // Also try extracting Drive file ID directly from step3Html.
-                    var fileId: String? =
-                        Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(step3Html)?.groupValues?.get(1)
-                        ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(step3Html)?.groupValues?.get(1)
-                        ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""").find(step3Html)?.groupValues?.get(1)
+                    fun extractDriveId(html: String): String? =
+                        Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
+                        ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
+                        ?: Regex("""docs\.google\.com/[^"'\s]*[?&/]d/([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
 
+                    var fileId: String? = extractDriveId(step3Html).also {
+                        if (it != null) android.util.Log.d("Anizle", "GDrive: fileId from step3Html=$it")
+                    }
+
+                    // Fallback: fetch anizle.org/player/{id} (might work with cf_clearance in jar)
                     if (fileId == null) {
-                        // Try fetching the player page whose URL is embedded in the iframe src
-                        val embedSrc = Regex("""src=["']([^"']*anizle\.org/player/[^"']+)["']""").find(step3Html)?.groupValues?.get(1)
-                            ?: Regex("""src=["']([^"']*anizmplayer\.com/player/[^"']+)["']""").find(step3Html)?.groupValues?.get(1)
-                        android.util.Log.d("Anizle", "GDrive: embedSrc=$embedSrc")
-                        if (embedSrc != null) {
-                            val gHtml = try { app.get(embedSrc, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text }
-                                        catch (e: Exception) { android.util.Log.e("Anizle", "GDrive embed fetch: ${e.message}"); "" }
-                            android.util.Log.d("Anizle", "GDrive embed page len=${gHtml.length} snippet=${gHtml.take(300)}")
-                            fileId = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
-                                ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(gHtml)?.groupValues?.get(1)
+                        val gPageUrl = "$videoBase/player/$playerId"
+                        var gHtml = try {
+                            app.get(gPageUrl, headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
+                        } catch (e: Exception) { android.util.Log.e("Anizle", "GDrive page error: ${e.message}"); "" }
+                        android.util.Log.d("Anizle", "GDrive page len=${gHtml.length} snippet=${gHtml.take(500)}")
+                        if (isCfChallenge(gHtml)) {
+                            android.util.Log.w("Anizle", "GDrive: CF on anizle.org, trying cfKiller")
+                            gHtml = try { app.get(gPageUrl,
+                                headers = baseHeaders + mapOf("Referer" to "$videoBase/"),
+                                interceptor = cfKiller).text
+                            } catch (e: Exception) { android.util.Log.e("Anizle", "GDrive cfKiller: ${e.message}"); "" }
+                            android.util.Log.d("Anizle", "GDrive cfKiller len=${gHtml.length} snippet=${gHtml.take(300)}")
+                        }
+                        fileId = extractDriveId(gHtml).also {
+                            if (it != null) android.util.Log.d("Anizle", "GDrive: fileId from anizle.org=$it")
+                        }
+                        if (fileId == null) {
+                            android.util.Log.w("Anizle", "GDrive: no file ID in any source — skipping")
+                            val gIdx = gHtml.indexOf("google")
+                            if (gIdx >= 0) android.util.Log.d("Anizle", "GDrive ctx=${gHtml.substring(gIdx.coerceAtLeast(0), (gIdx+300).coerceAtMost(gHtml.length))}")
+                            continue
                         }
                     }
-
-                    if (fileId == null) {
-                        android.util.Log.w("Anizle", "GDrive: no file ID found in step3 or embed page")
-                        continue
-                    }
                     android.util.Log.d("Anizle", "GDrive: fileId=$fileId")
+
+                    // Direct Google Drive download URL — stable, no session expiry, no third-party CDN.
+                    // confirm=t bypasses the "large file" interstitial Google shows for big files.
                     val directUrl = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t"
                     android.util.Log.d("Anizle", "GDrive: directUrl=$directUrl")
                     callback(newExtractorLink(
@@ -460,27 +573,8 @@ class AnizleProvider : MainAPI() {
                 }
 
                 // ── Aincrad / FirePlayer path ────────────────────────────────
-                // Try to extract FirePlayer hash directly from step3Html (the XHR response).
-                // If the site embeds the player inline we get it without touching /player/ at all.
-                var fireId = extractFireplayerId(step3Html)
-                android.util.Log.d("Anizle", "Step3: fireId from XHR=$fireId")
-
-                // Fallback: extract embed src URL and fetch the player page from it.
-                if (fireId == null) {
-                    val embedSrc = Regex("""src=["']([^"']*(?:anizle\.org|anizmplayer\.com)/player/[^"']+)["']""")
-                        .find(step3Html)?.groupValues?.get(1)
-                    android.util.Log.d("Anizle", "Step3: embedSrc=$embedSrc")
-                    if (embedSrc != null) {
-                        val playerHtml = try {
-                            app.get(embedSrc, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                        } catch (e: Exception) {
-                            android.util.Log.e("Anizle", "Step3 embed fetch: ${e.message}"); null
-                        }
-                        android.util.Log.d("Anizle", "Step3 embed page len=${playerHtml?.length} snippet=${playerHtml?.take(200)}")
-                        if (playerHtml != null) fireId = extractFireplayerId(playerHtml)
-                    }
-                }
-                android.util.Log.d("Anizle", "Step3 final fireId=$fireId")
+                val fireId = extractFireplayerId(pageHtml)
+                android.util.Log.d("Anizle", "Step3/4: fireId=$fireId (pageHtml len=${pageHtml.length})")
                 fireId ?: continue
 
                 val playerReferer = "$playerBase/player/$fireId"
