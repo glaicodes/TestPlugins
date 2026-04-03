@@ -326,55 +326,22 @@ class AnizleProvider : MainAPI() {
         }
         android.util.Log.d("Anizle", "Episode page len=${epHtml.length}")
 
-        // Diagnostic: log a snippet around the fansub section to see what the page looks like.
-        val fansubIdx = epHtml.indexOf("fansub", ignoreCase = true)
-            .takeIf { it >= 0 } ?: epHtml.indexOf("translator", ignoreCase = true)
-        android.util.Log.d("Anizle", "Step1 diag: epHtml len=${epHtml.length}, fansubIdx=$fansubIdx snippet=${epHtml.substring(fansubIdx.coerceAtLeast(0), (fansubIdx + 400).coerceAtMost(epHtml.length))}")
-
-        // Step 1: translator buttons
-        // Supports both old attribute name  translator="URL"
-        // and newer  data-translator="URL"  that the site may have switched to.
+        // Step 1: translator buttons — regex like Python
         val translators = mutableListOf<Pair<String, String>>()
-
-        fun addTranslator(url: String, name: String) {
-            if (url.isNotBlank() && translators.none { it.first == url })
-                translators += url to name.ifBlank { "Fansub" }
-        }
-
-        // Pattern A: translator="URL" ... data-fansub-name="Name"  (original)
-        Regex("""(?:data-)?translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
-            .findAll(epHtml).forEach { m -> addTranslator(m.groupValues[1], m.groupValues[2]) }
-
-        // Pattern B: reversed attribute order
-        if (translators.isEmpty()) {
-            Regex("""data-fansub-name="([^"]*)"[^>]*(?:data-)?translator="([^"]+)"""")
-                .findAll(epHtml).forEach { m -> addTranslator(m.groupValues[2], m.groupValues[1]) }
-        }
-
-        // Pattern C: Jsoup selector fallback — catches any attribute name variant
-        if (translators.isEmpty()) {
-            val epDoc = org.jsoup.Jsoup.parse(epHtml)
-            for (el in epDoc.select("[translator],[data-translator],[data-url][data-fansub-name]")) {
-                val url  = el.attr("translator").ifBlank { el.attr("data-translator") }
-                              .ifBlank { el.attr("data-url") }
-                val name = el.attr("data-fansub-name").ifBlank { el.attr("data-name") }
-                              .ifBlank { el.text().trim() }
-                addTranslator(url, name)
+        Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
+            .findAll(epHtml).forEach { m ->
+                val url = m.groupValues[1]; if (url.isBlank()) return@forEach
+                if (translators.none { it.first == url })
+                    translators += url to m.groupValues[2].ifBlank { "Fansub" }
             }
-            android.util.Log.d("Anizle", "Step1 Jsoup fallback: ${translators.size} found")
-        }
-
-        // Pattern D: href-based links inside the fansub selection box
         if (translators.isEmpty()) {
-            val epDoc = org.jsoup.Jsoup.parse(epHtml)
-            for (el in epDoc.select("div.fansubSecimKutucugu a[href], div[class*=fansub] a[href]")) {
-                val url  = el.attr("abs:href").ifBlank { el.attr("href") }
-                val name = el.attr("data-fansub-name").ifBlank { el.text().trim() }
-                addTranslator(url, name)
-            }
-            android.util.Log.d("Anizle", "Step1 href fallback: ${translators.size} found")
+            Regex("""data-fansub-name="([^"]*)"[^>]*translator="([^"]+)"""")
+                .findAll(epHtml).forEach { m ->
+                    val url = m.groupValues[2]; if (url.isBlank()) return@forEach
+                    if (translators.none { it.first == url })
+                        translators += url to m.groupValues[1].ifBlank { "Fansub" }
+                }
         }
-
         android.util.Log.d("Anizle", "Step1: ${translators.size} translators")
         if (translators.isEmpty()) return false
 
@@ -392,49 +359,20 @@ class AnizleProvider : MainAPI() {
             }
             android.util.Log.d("Anizle", "Step2 resp len=${trText.length}")
 
-            val trHtml = try {
-                val obj = JSONObject(trText)
-                // Site may use key "data", "html", "content", or "player"
-                obj.optString("data", "")
-                    .ifBlank { obj.optString("html", "") }
-                    .ifBlank { obj.optString("content", "") }
-                    .ifBlank { obj.optString("player", "") }
-            } catch (_: Exception) { "" }
+            val trHtml = try { JSONObject(trText).optString("data", "") }
+                         catch (_: Exception) { "" }
             if (trHtml.isBlank()) {
-                android.util.Log.w("Anizle", "Step2: no data field, raw=${trText.take(200)}")
+                android.util.Log.w("Anizle", "Step2: no data field, raw=${trText.take(80)}")
                 continue
             }
-            android.util.Log.d("Anizle", "Step2: trHtml len=${trHtml.length} snippet=${trHtml.take(300)}")
 
-            // video="URL" data-video-name="Name" — original pattern + data-video variant
+            // video="URL" data-video-name="Name" — exact Python pattern
             val videos = mutableListOf<Pair<String, String>>()
-
-            fun addVideo(url: String, name: String) {
-                if (url.isNotBlank()) videos += url to name.ifBlank { "Player" }
-            }
-
-            // Pattern A: video="URL" ... data-video-name="Name"
-            Regex("""(?:data-)?video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
-                .findAll(trHtml).forEach { m -> addVideo(m.groupValues[1], m.groupValues[2]) }
-
-            // Pattern B: reversed attribute order
+            Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
+                .findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
             if (videos.isEmpty()) {
-                Regex("""data-video-name="([^"]*)"[^>]*(?:data-)?video="([^"]+)"""")
-                    .findAll(trHtml).forEach { m -> addVideo(m.groupValues[2], m.groupValues[1]) }
-            }
-
-            // Pattern C: Jsoup selector fallback
-            if (videos.isEmpty()) {
-                val trDoc = org.jsoup.Jsoup.parse(trHtml)
-                for (el in trDoc.select("[video],[data-video],[data-src][data-video-name],a.videoPlayerButtons")) {
-                    val url  = el.attr("video").ifBlank { el.attr("data-video") }
-                                  .ifBlank { el.attr("data-src") }
-                                  .ifBlank { el.attr("href") }
-                    val name = el.attr("data-video-name").ifBlank { el.attr("data-name") }
-                                  .ifBlank { el.text().trim() }
-                    addVideo(url, name)
-                }
-                android.util.Log.d("Anizle", "Step2 Jsoup fallback: ${videos.size} found")
+                Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
+                    .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
             }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
             for ((videoUrl, videoName) in videos) {
@@ -444,19 +382,17 @@ class AnizleProvider : MainAPI() {
                 //   Aincrad → FirePlayer (anizmplayer.com)
                 //   GDrive  → Google Drive direct link
                 // Skipping everything else avoids N×M /player/ requests that block later fansubs.
-                val isAincrad = videoNameL.contains("aincrad") || videoNameL.contains("fire")
-                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google") || videoNameL.contains("drive")
+                val isAincrad = videoNameL.contains("aincrad")
+                val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
                 if (!isAincrad && !isGdrive) {
-                    android.util.Log.d("Anizle", "Step4: skipping unsupported host '$videoName' url=$videoUrl")
+                    android.util.Log.d("Anizle", "Step4: skipping unsupported host $videoName")
                     continue
                 }
 
                 android.util.Log.d("Anizle", "Step4: processing $videoName -> $videoUrl")
 
                 // /video/{id} is CF-Turnstile-blocked — extract numeric ID from URL directly.
-                // Also handle /player/{id} or ?id={id} if the URL format changed.
-                val playerId = Regex("""/(?:video|player)/(\d+)""").find(videoUrl)?.groupValues?.get(1)
-                    ?: Regex("""[?&]id=(\d+)""").find(videoUrl)?.groupValues?.get(1)
+                val playerId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1)
                 if (playerId == null) {
                     android.util.Log.w("Anizle", "Step4: no playerId in $videoUrl"); continue
                 }
@@ -465,19 +401,43 @@ class AnizleProvider : MainAPI() {
                 // GDrive gets its player HTML from /video/{id} (Step 3) via cfKiller instead.
                 var pageHtml = ""
                 if (isAincrad) {
+                    fun isCfChallenge(h: String) =
+                        h.contains("Just a moment", ignoreCase = true) ||
+                        h.contains("cf-browser-verification", ignoreCase = true) ||
+                        h.contains("Checking your browser", ignoreCase = true)
+
                     for (base4 in listOf(mainUrl, videoBase)) {
-                        val html = try {
-                            app.get("$base4/player/$playerId",
-                                headers = baseHeaders + mapOf("Referer" to "$base4/")).text
+                        val playerUrl = "$base4/player/$playerId"
+                        var html = try {
+                            app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to "$base4/")).text
                         } catch (e: Exception) {
                             android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
                         }
-                        android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length}")
-                        if (html.contains("Just a moment", ignoreCase = true) ||
-                            html.contains("cf-browser-verification", ignoreCase = true) ||
-                            html.contains("Checking your browser", ignoreCase = true) ||
-                            html.length < 8000) {
-                            android.util.Log.w("Anizle", "Step4: bad page ($base4) len=${html.length} snippet=${html.take(120)}")
+                        android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length} snippet=${html.take(200)}")
+
+                        // If CF challenge OR suspiciously short (anizle.org changed ~Apr 2025),
+                        // retry with cfKiller which solves both Turnstile and JS challenges.
+                        if (isCfChallenge(html) || html.length < 8000) {
+                            android.util.Log.w("Anizle", "Step4: trying cfKiller for $base4 (len=${html.length})")
+                            try {
+                                html = app.get(playerUrl,
+                                    headers = baseHeaders + mapOf("Referer" to "$base4/"),
+                                    interceptor = cfKiller).text
+                                android.util.Log.d("Anizle", "Step4 cfKiller ($base4): len=${html.length} snippet=${html.take(200)}")
+                            } catch (e: Exception) {
+                                android.util.Log.e("Anizle", "Step4 cfKiller error ($base4): ${e.message}")
+                            }
+                        }
+
+                        if (isCfChallenge(html)) {
+                            android.util.Log.w("Anizle", "Step4: still CF after cfKiller ($base4) — skipping")
+                            continue
+                        }
+                        // Accept if it contains FirePlayer content (packed JS or direct call).
+                        // Even a small page may have it if the site restructured.
+                        if (!html.contains("FirePlayer", ignoreCase = true) &&
+                            !html.contains("eval(function(p,a,c,k", ignoreCase = true)) {
+                            android.util.Log.w("Anizle", "Step4: no FirePlayer content in $base4 len=${html.length}")
                             continue
                         }
                         pageHtml = html; break
@@ -492,19 +452,33 @@ class AnizleProvider : MainAPI() {
                 // set Referer=https://gdplayer.vip/ on the final video links.
                 // Without this referer the CDN (vycdn.sbs/vtcdn.sbs) returns 403 on downloads.
                 if (isGdrive) {
-                    val gHtml = try {
-                        val h = app.get("$videoBase/player/$playerId",
-                            headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
-                        if (h.isBlank() || h.length < 8000 ||
-                            h.contains("Just a moment", ignoreCase = true) ||
-                            h.contains("cf-browser-verification", ignoreCase = true)) {
-                            android.util.Log.w("Anizle", "GDrive: player page unavailable len=${h.length} — skipping")
-                            continue
-                        }
-                        h
+                    val playerUrlG = "$videoBase/player/$playerId"
+                    var hG = try {
+                        app.get(playerUrlG, headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
                     } catch (e: Exception) {
                         android.util.Log.e("Anizle", "GDrive player fetch error: ${e.message}"); continue
                     }
+                    android.util.Log.d("Anizle", "GDrive: player page len=${hG.length} snippet=${hG.take(300)}")
+
+                    val isCfG = hG.contains("Just a moment", ignoreCase = true) ||
+                                hG.contains("cf-browser-verification", ignoreCase = true)
+                    if (isCfG || hG.length < 8000) {
+                        android.util.Log.w("Anizle", "GDrive: retrying with cfKiller (len=${hG.length})")
+                        try {
+                            hG = app.get(playerUrlG,
+                                headers = baseHeaders + mapOf("Referer" to "$videoBase/"),
+                                interceptor = cfKiller).text
+                            android.util.Log.d("Anizle", "GDrive cfKiller: len=${hG.length} snippet=${hG.take(300)}")
+                        } catch (e: Exception) {
+                            android.util.Log.e("Anizle", "GDrive cfKiller error: ${e.message}")
+                        }
+                    }
+                    if (hG.isBlank() || hG.contains("Just a moment", ignoreCase = true) ||
+                        hG.contains("cf-browser-verification", ignoreCase = true)) {
+                        android.util.Log.w("Anizle", "GDrive: player page still unavailable len=${hG.length} — skipping")
+                        continue
+                    }
+                    val gHtml = hG
                     android.util.Log.d("Anizle", "GDrive: player page len=${gHtml.length}")
 
                     val fileId =
