@@ -409,8 +409,12 @@ class AnizleProvider : MainAPI() {
                             android.util.Log.e("Anizle", "Player page error ($base4): ${e.message}"); continue
                         }
                         android.util.Log.d("Anizle", "Step4 ($base4): len=${html.length}")
-                        if (html.contains("Just a moment", ignoreCase = true)) {
-                            android.util.Log.w("Anizle", "Step4: CF on $base4/player/$playerId"); continue
+                        if (html.contains("Just a moment", ignoreCase = true) ||
+                            html.contains("cf-browser-verification", ignoreCase = true) ||
+                            html.contains("Checking your browser", ignoreCase = true) ||
+                            html.length < 8000) {
+                            android.util.Log.w("Anizle", "Step4: bad page ($base4) len=${html.length} snippet=${html.take(120)}")
+                            continue
                         }
                         pageHtml = html; break
                     }
@@ -427,7 +431,11 @@ class AnizleProvider : MainAPI() {
                     val gHtml = try {
                         var h = app.get("$videoBase/player/$playerId",
                             headers = baseHeaders + mapOf("Referer" to "$videoBase/")).text
-                        if (h.isBlank() || h.contains("Just a moment", ignoreCase = true)) {
+                        val isBad = { s: String -> s.isBlank() || s.length < 8000 ||
+                            s.contains("Just a moment", ignoreCase = true) ||
+                            s.contains("cf-browser-verification", ignoreCase = true) }
+                        if (isBad(h)) {
+                            android.util.Log.w("Anizle", "GDrive: anizle.org bad len=${h.length} snippet=${h.take(100)}")
                             h = app.get("$mainUrl/player/$playerId",
                                 headers = baseHeaders + mapOf("Referer" to "$mainUrl/"),
                                 interceptor = cfKiller).text
