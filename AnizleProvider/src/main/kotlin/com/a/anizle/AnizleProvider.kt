@@ -385,6 +385,23 @@ class AnizleProvider : MainAPI() {
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
             }
+            // Fallback: also try raw XHR text (in case response is plain HTML, not JSON)
+            if (videos.isEmpty() && trText.isNotBlank()) {
+                Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
+                    .findAll(trText).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
+            }
+            // Fallback: website now pre-embeds video buttons for the active (first) translator directly
+            // in the episode page HTML instead of returning them via XHR.
+            if (videos.isEmpty() && trUrl == translators.first().first) {
+                Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
+                    .findAll(epHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
+                if (videos.isEmpty()) {
+                    Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
+                        .findAll(epHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
+                }
+                if (videos.isNotEmpty())
+                    android.util.Log.d("Anizle", "Step2: using ${videos.size} videos from epHtml (pre-embedded)")
+            }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
             for ((videoUrl, videoName) in videos) {
                 val videoNameL = videoName.lowercase()
@@ -405,7 +422,8 @@ class AnizleProvider : MainAPI() {
                 fun isCfPage(h: String) = h.contains("Just a moment", ignoreCase = true) ||
                     h.contains("cf-browser-verification", ignoreCase = true)
                 fun hasFirePlayer(h: String) = h.contains("FirePlayer", ignoreCase = true) ||
-                    h.contains("eval(function(p,a,c,k", ignoreCase = true)
+                    h.contains("eval(function(p,a,c,k", ignoreCase = true) ||
+                    h.contains("anizmplayer.com", ignoreCase = true)
 
                 // Extract numeric ID from the video URL
                 val playerId = Regex("""/(?:video|player)/(\d+)""").find(videoUrl)?.groupValues?.get(1)
@@ -587,6 +605,11 @@ class AnizleProvider : MainAPI() {
     // ── JS helpers ────────────────────────────────────────────────────────────
 
     private fun extractFireplayerId(html: String): String? {
+        // Fast path: hash is embedded directly in an anizmplayer.com URL
+        // e.g. https://anizmplayer.com/video/a6e45e77e2828da5826939b2446b7495
+        Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
+            .find(html)?.groupValues?.get(1)?.let { return it }
+
         val evalMatch = Regex(
             """eval\(function\(p,a,c,k,e,d\)\{.*?return p\}\('(.*?)',(\d+),(\d+),'([^']+)'\.split\('\|'\),0,\{\}\)\)""",
             setOf(RegexOption.DOT_MATCHES_ALL)
