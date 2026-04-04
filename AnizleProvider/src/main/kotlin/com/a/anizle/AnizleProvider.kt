@@ -320,14 +320,6 @@ class AnizleProvider : MainAPI() {
         getSession() // ensure cookies active for all requests below
         android.util.Log.d("Anizle", "loadLinks: $data")
 
-        // Warm up anizle.org session — the /player/ page needs homepage cookies.
-        // This is a plain GET (no cfKiller), fast and cheap.
-        try {
-            app.get(videoBase, headers = baseHeaders + mapOf("Referer" to "$mainUrl/"))
-            android.util.Log.d("Anizle", "anizle.org session warmed")
-        } catch (e: Exception) {
-            android.util.Log.w("Anizle", "anizle.org warm: ${e.message}")
-        }
 
         val epHtml = try {
             app.get(data, headers = baseHeaders).text
@@ -385,13 +377,12 @@ class AnizleProvider : MainAPI() {
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
             }
-            // Fallback: also try raw XHR text (in case response is plain HTML, not JSON)
+            // Fallback: raw XHR response as plain HTML (if not JSON)
             if (videos.isEmpty() && trText.isNotBlank()) {
                 Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
                     .findAll(trText).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
             }
-            // Fallback: website now pre-embeds video buttons for the active (first) translator directly
-            // in the episode page HTML instead of returning them via XHR.
+            // Fallback: videos pre-embedded in episode page for active (first) translator
             if (videos.isEmpty() && trUrl == translators.first().first) {
                 Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
                     .findAll(epHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
@@ -400,7 +391,7 @@ class AnizleProvider : MainAPI() {
                         .findAll(epHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
                 }
                 if (videos.isNotEmpty())
-                    android.util.Log.d("Anizle", "Step2: using ${videos.size} videos from epHtml (pre-embedded)")
+                    android.util.Log.d("Anizle", "Step2: using ${videos.size} videos from epHtml")
             }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
             for ((videoUrl, videoName) in videos) {
@@ -424,59 +415,42 @@ class AnizleProvider : MainAPI() {
                 fun hasFirePlayer(h: String) = h.contains("FirePlayer", ignoreCase = true) ||
                     h.contains("eval(function(p,a,c,k", ignoreCase = true) ||
                     h.contains("anizmplayer.com", ignoreCase = true)
-
                 // Extract numeric ID from the video URL
                 val playerId = Regex("""/(?:video|player)/(\d+)""").find(videoUrl)?.groupValues?.get(1)
                 if (playerId == null) {
                     android.util.Log.w("Anizle", "Step3: no playerId in $videoUrl"); continue
                 }
 
-                // Strategy: anizm.net/video/{id} is CF-blocked (proven). Skip it.
-                // anizle.org/player/{id} returns a Turkish page — needs homepage cookies
-                // (already warmed above). Try it first, then anizm.net/player/{id} as fallback.
-                // No cfKiller anywhere — it blocks for 60-120s and always fails on this site.
+                // Step 3: GET anizm.net/video/{id} — the XHR endpoint the site JS uses.
+                // anizle.org/player/{id} is always 404. anizm.net/player/{id} is Turnstile-blocked.
+                // anizm.net/video/{id} has a smaller JS challenge (len~4982) that cfKiller can solve.
+                // cfKiller caches the clearance cookie after the first solve, so subsequent calls are fast.
                 var pageHtml = ""
                 var step3Html = ""
 
-                if (isAincrad || isGdrive) {
-                    for (base4 in listOf(videoBase, mainUrl)) {
-                        val playerUrl = "$base4/player/$playerId"
-                        val html = try {
-                            app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to "$base4/")).text
-                        } catch (e: Exception) {
-                            android.util.Log.e("Anizle", "player fetch error ($base4): ${e.message}"); continue
-                        }
-                        android.util.Log.d("Anizle", "player ($base4): len=${html.length} snippet=${html.take(400)}")
-                        if (isCfPage(html)) {
-                            android.util.Log.w("Anizle", "player: CF on $base4 — skipping (cfKiller disabled)")
-                            continue
-                        }
-                        // Accept even a small page if it has what we need
-                        if (hasFirePlayer(html) ||
-                            Regex("""drive\.google\.com/file/d/""").containsMatchIn(html) ||
-                            Regex("""[?&]id=[A-Za-z0-9_-]{25}""").containsMatchIn(html)) {
-                            pageHtml = html
-                            step3Html = html
-                            break
-                        }
-                        android.util.Log.w("Anizle", "player: no content in $base4 page (len=${html.length})")
+                android.util.Log.d("Anizle", "Step3: fetching $videoUrl with cfKiller")
+                val vRaw = try {
+                    app.get(videoUrl,
+                        headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
+                        interceptor = cfKiller).text
+                } catch (e: Exception) {
+                    android.util.Log.e("Anizle", "Step3 cfKiller error: ${e.message}"); ""
+                }
+                android.util.Log.d("Anizle", "Step3: len=${vRaw.length} snippet=${vRaw.take(300)}")
+
+                if (vRaw.isNotBlank() && !isCfPage(vRaw)) {
+                    // Response is JSON {player/data/html: "<iframe or script with hash>"}
+                    val parsed = try {
+                        val obj = JSONObject(vRaw)
+                        obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
+                    } catch (_: Exception) { vRaw }
+                    if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
+                        pageHtml = parsed; step3Html = parsed
+                    } else {
+                        android.util.Log.w("Anizle", "Step3: no content in response — $parsed")
                     }
-                    // Fallback: try anizm.net/video/{id} directly (may work with session cookies)
-                    if (pageHtml.isBlank()) {
-                        val vHtml = try {
-                            app.get(videoUrl, headers = xhrHeaders + mapOf("Referer" to "$mainUrl/")).text
-                        } catch (e: Exception) { android.util.Log.e("Anizle", "video fetch: ${e.message}"); "" }
-                        android.util.Log.d("Anizle", "video/{id}: len=${vHtml.length} snippet=${vHtml.take(300)}")
-                        if (!isCfPage(vHtml) && vHtml.isNotBlank()) {
-                            val parsed = try {
-                                val obj = org.json.JSONObject(vHtml)
-                                obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
-                            } catch (_: Exception) { vHtml }
-                            if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
-                                pageHtml = parsed; step3Html = parsed
-                            }
-                        }
-                    }
+                } else {
+                    android.util.Log.w("Anizle", "Step3: CF still blocking or empty response")
                 }
 
                 if (isAincrad && pageHtml.isBlank()) {
@@ -605,11 +579,10 @@ class AnizleProvider : MainAPI() {
     // ── JS helpers ────────────────────────────────────────────────────────────
 
     private fun extractFireplayerId(html: String): String? {
-        // Fast path: hash is embedded directly in an anizmplayer.com URL
+        // Fast path: hash directly in anizmplayer.com URL
         // e.g. https://anizmplayer.com/video/a6e45e77e2828da5826939b2446b7495
         Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
             .find(html)?.groupValues?.get(1)?.let { return it }
-
         val evalMatch = Regex(
             """eval\(function\(p,a,c,k,e,d\)\{.*?return p\}\('(.*?)',(\d+),(\d+),'([^']+)'\.split\('\|'\),0,\{\}\)\)""",
             setOf(RegexOption.DOT_MATCHES_ALL)
