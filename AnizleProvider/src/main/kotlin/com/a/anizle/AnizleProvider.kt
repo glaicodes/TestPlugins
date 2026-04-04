@@ -2,7 +2,6 @@ package com.a.anizle
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
-import kotlinx.coroutines.withTimeoutOrNull
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -321,16 +320,16 @@ class AnizleProvider : MainAPI() {
         getSession() // ensure cookies active for all requests below
         android.util.Log.d("Anizle", "loadLinks: $data")
 
-        // One-shot CF pre-warm: solves Turnstile via WebView, deposits cf_clearance
-        // into the shared cookie jar so all /video/* fetches pass without another solve.
+        // One-shot CF pre-warm: cfKiller opens a WebView, solves Turnstile, and
+        // deposits cf_clearance into the shared OkHttp cookie jar so all subsequent
+        // /video/* fetches in this session pass through without another challenge.
+        // cfKiller has a built-in 60s WebView timeout, so no wrapper is needed.
         try {
-            withTimeoutOrNull(55_000L) {
-                android.util.Log.d("Anizle", "CF pre-warm: running cfKiller…")
-                app.get("$mainUrl/video/1",
-                    headers = baseHeaders + mapOf("Referer" to "$mainUrl/"),
-                    interceptor = cfKiller)
-                android.util.Log.d("Anizle", "CF pre-warm: done")
-            } ?: android.util.Log.w("Anizle", "CF pre-warm: timed out (55s)")
+            android.util.Log.d("Anizle", "CF pre-warm: running cfKiller…")
+            app.get("$mainUrl/video/1",
+                headers = baseHeaders + mapOf("Referer" to "$mainUrl/"),
+                interceptor = cfKiller)
+            android.util.Log.d("Anizle", "CF pre-warm: done")
         } catch (e: Exception) {
             android.util.Log.w("Anizle", "CF pre-warm: ${e.message}")
         }
