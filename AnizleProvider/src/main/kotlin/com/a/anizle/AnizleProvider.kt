@@ -9,13 +9,15 @@ import org.json.JSONObject
 /**
  * Anizle / Anizm CloudStream 3 Provider
  *
- * Video link chain (confirmed from logcat + network capture):
+ * Video link chain:
  *  Step 1: Episode HTML → translator="URL" attrs
  *  Step 2: GET translator URL (XHR) → JSON {data: html} → video="URL" buttons
- *  Step 3: /video/{id} is CF-blocked from app; skip it.
- *          Derive /player/{id} from same numeric ID and fetch directly.
- *          /player/{id} is a normal iframe page → packed JS → FirePlayer hash (32 hex)
- *  Step 4: POST anizmplayer.com/player/index.php?data={hash}&do=getVideo → {hls, securedLink}
+ *  Step 3: GET /video/{id} as XHR with X-CSRF-TOKEN
+ *          → JSON {player: "<iframe src='anizmplayer.com/player/{hash}'>"}
+ *          → extract 32-hex hash
+ *  Step 4a (Aincrad): POST anizmplayer.com/player/index.php?data={hash}&do=getVideo → {hls, securedLink}
+ *  Step 4b (GDrive):  GET anizmplayer.com/player/{hash} → find drive file ID → direct link
+ *  Step 4c (others):  GET anizmplayer.com/player/{hash} → find iframe src → loadExtractor
  */
 class AnizleProvider : MainAPI() {
 
@@ -39,8 +41,7 @@ class AnizleProvider : MainAPI() {
         try {
             var resp = app.get(mainUrl, headers = baseHeaders)
             var html = resp.text
-            if (html.contains("Just a moment", ignoreCase = true) ||
-                html.contains("cf-browser-verification", ignoreCase = true)) {
+            if (isCf(html)) {
                 resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller)
                 html = resp.text
             }
@@ -54,6 +55,10 @@ class AnizleProvider : MainAPI() {
             android.util.Log.e("Anizle", "getSession error: ${e.message}")
         }
     }
+
+    private fun isCf(html: String) =
+        html.contains("Just a moment", ignoreCase = true) ||
+        html.contains("cf-browser-verification", ignoreCase = true)
 
     private val baseHeaders get() = mapOf(
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -214,11 +219,10 @@ class AnizleProvider : MainAPI() {
         if (translators.isEmpty()) return false
 
         var found = false
-        fun isCf(h: String) = h.contains("Just a moment", ignoreCase = true) || h.contains("cf-browser-verification", ignoreCase = true)
 
         for ((trUrl, fansubName) in translators) {
             android.util.Log.d("Anizle", "Step2: $fansubName -> $trUrl")
-            val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to mainUrl)).text }
+            val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text }
                 catch (e: Exception) { android.util.Log.e("Anizle", "Translator fetch: ${e.message}"); continue }
             android.util.Log.d("Anizle", "Step2 len=${trText.length}")
 
@@ -231,16 +235,6 @@ class AnizleProvider : MainAPI() {
             if (videos.isEmpty())
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
-            if (videos.isEmpty())
-                Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
-                    .findAll(trText).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
-            if (videos.isEmpty() && trUrl == translators.first().first) {
-                Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
-                    .findAll(epHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
-                if (videos.isEmpty())
-                    Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
-                        .findAll(epHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
-            }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
 
             for ((videoUrl, videoName) in videos) {
@@ -257,70 +251,130 @@ class AnizleProvider : MainAPI() {
                 android.util.Log.d("Anizle", "Step3: $videoName -> $videoUrl")
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
-                // ── Step 3: resolve player page ───────────────────────────────
-                //
-                // CONFIRMED from logcat: /video/{id} returns CF "Just a moment" page
-                // even with the CSRF token (CF blocks XHR endpoint from non-browser UA).
-                //
-                // FIX: derive /player/{id} from the same numeric ID.
-                //   /video/{id} would return JSON { player: '<iframe src="/player/{id}">' }
-                //   We just construct that URL directly — skips the blocked XHR entirely.
-                //
-                // Path A: hash embedded in existing HTML (0 requests)
-                // Path B: GET anizm.net/player/{id} directly (plain GET)
-                // Path C: same URL retried with cfKiller if plain GET returns CF challenge
+                // ── Step 3: GET /video/{id} as XHR with CSRF token ────────────
+                // The browser XHRs this endpoint which returns JSON:
+                //   {"status":"success","player":"<iframe src='anizmplayer.com/player/{hash}'>"}
+                // We extract the 32-hex hash from the iframe src.
+                // This avoids /player/{id} which is CF-protected.
+                val videoXhrHeaders = xhrHeaders + mapOf(
+                    "X-CSRF-TOKEN" to (csrfToken ?: ""),
+                    "Referer"      to data,
+                )
+                val videoRespText = try {
+                    app.get(videoUrl, headers = videoXhrHeaders).text
+                } catch (e: Exception) {
+                    android.util.Log.e("Anizle", "Step3 XHR error: ${e.message}"); continue
+                }
+                android.util.Log.d("Anizle", "Step3 XHR len=${videoRespText.length} snippet=${videoRespText.take(120)}")
 
-                var pageHtml = ""
-
-                // Path A: hash already present in cached HTML
-                val hashRe = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
-                val embeddedHash = hashRe.find(trHtml)?.groupValues?.get(1)
-                    ?: hashRe.find(trText)?.groupValues?.get(1)
-                    ?: hashRe.find(epHtml)?.groupValues?.get(1)
-                if (embeddedHash != null) {
-                    android.util.Log.d("Anizle", "PathA: hash=$embeddedHash in cached HTML")
-                    pageHtml = "anizmplayer.com/video/$embeddedHash"
+                if (isCf(videoRespText)) {
+                    android.util.Log.w("Anizle", "Step3: CF blocked for $videoName"); continue
                 }
 
-                // Path B/C: GET anizm.net/player/{numericId} directly
-                if (pageHtml.isBlank()) {
-                    val numId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1)
-                    if (numId == null) {
-                        android.util.Log.w("Anizle", "Step3: no numeric ID in $videoUrl"); continue
-                    }
-                    val playerUrl = "$mainUrl/player/$numId"
-                    android.util.Log.d("Anizle", "PathB: GET $playerUrl")
-
-                    // Plain attempt — uses cf_clearance cookie from getSession()
-                    var raw = try {
-                        app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                    } catch (e: Exception) { android.util.Log.w("Anizle", "PathB plain: ${e.message}"); "" }
-                    android.util.Log.d("Anizle", "PathB plain: len=${raw.length} cf=${isCf(raw)}")
-
-                    // Path C: cfKiller if still challenged
-                    if (raw.isBlank() || isCf(raw)) {
-                        android.util.Log.d("Anizle", "PathC: cfKiller for $playerUrl")
-                        raw = try {
-                            app.get(playerUrl,
-                                headers = baseHeaders + mapOf("Referer" to "$mainUrl/"),
-                                interceptor = cfKiller).text
-                        } catch (e: Exception) { android.util.Log.w("Anizle", "PathC cfKiller: ${e.message}"); "" }
-                        android.util.Log.d("Anizle", "PathC cfKiller: len=${raw.length} cf=${isCf(raw)}")
-                    }
-
-                    if (raw.isNotBlank() && !isCf(raw)) pageHtml = raw
-                }
-
-                if (pageHtml.isBlank()) {
-                    android.util.Log.w("Anizle", "Step3: all paths failed for $videoName")
+                val videoJson = try { JSONObject(videoRespText) } catch (_: Exception) {
+                    android.util.Log.w("Anizle", "Step3: not JSON for $videoName: ${videoRespText.take(80)}")
                     continue
                 }
 
-                // ── GDrive ────────────────────────────────────────────────────
+                val playerField = videoJson.optString("player", "")
+                android.util.Log.d("Anizle", "Step3: player field=${playerField.take(120)}")
+
+                // playerField = <iframe src="https://anizm.net/player/{numId}">
+                // We need to fetch that page to get anizmplayer.com/video/{hash}
+                val playerPageUrl = Regex("""src=["'](https://anizm\.net/player/[^"']+)["']""")
+                    .find(playerField)?.groupValues?.get(1)
+                if (playerPageUrl == null) {
+                    android.util.Log.w("Anizle", "Step3: no player page URL for $videoName"); continue
+                }
+                android.util.Log.d("Anizle", "Step3: fetching player page $playerPageUrl")
+
+                // Fetch /player/{numId} mimicking an iframe navigation.
+                // Sec-Fetch-Dest: iframe tells CF this is a legitimate embedded iframe,
+                // which bypasses the stricter bot-check applied to direct navigation.
+                val iframeHeaders = mapOf(
+                    "User-Agent"                to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                    "Accept"                    to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language"           to "tr-TR,tr;q=0.9,en;q=0.7",
+                    "Referer"                   to data,
+                    "Sec-Fetch-Dest"            to "iframe",
+                    "Sec-Fetch-Mode"            to "navigate",
+                    "Sec-Fetch-Site"            to "same-origin",
+                    "Upgrade-Insecure-Requests" to "1",
+                )
+                var playerPageHtml = try {
+                    app.get(playerPageUrl, headers = iframeHeaders).text
+                } catch (e: Exception) {
+                    android.util.Log.e("Anizle", "Step3 player page: ${e.message}"); ""
+                }
+                android.util.Log.d("Anizle", "Step3 player page: len=${playerPageHtml.length} cf=${isCf(playerPageHtml)}")
+
+                // Fallback: cfKiller if still CF-challenged
+                if (playerPageHtml.isBlank() || isCf(playerPageHtml)) {
+                    android.util.Log.d("Anizle", "Step3: trying cfKiller for $playerPageUrl")
+                    playerPageHtml = try {
+                        app.get(playerPageUrl, headers = iframeHeaders, interceptor = cfKiller).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "Step3 cfKiller: ${e.message}"); ""
+                    }
+                    android.util.Log.d("Anizle", "Step3 cfKiller: len=${playerPageHtml.length} cf=${isCf(playerPageHtml)}")
+                }
+
+                if (playerPageHtml.isBlank() || isCf(playerPageHtml)) {
+                    android.util.Log.w("Anizle", "Step3: player page blocked for $videoName"); continue
+                }
+
+                // anizm.net/player/{numId} embeds anizmplayer.com/video/{hash} directly
+                val hash = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
+                    .find(playerPageHtml)?.groupValues?.get(1)
+                if (hash == null) {
+                    android.util.Log.w("Anizle", "Step3: no hash in player page for $videoName"); continue
+                }
+                android.util.Log.d("Anizle", "Step3: hash=$hash for $videoName")
+
+                val playerRef = "$playerBase/player/$hash"
+
+                // ── Step 4a: Aincrad / FirePlayer ─────────────────────────────
+                if (isAincrad) {
+                    val aHeaders = mapOf(
+                        "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Accept"           to "application/json, */*; q=0.01",
+                        "Referer"          to playerRef,
+                        "Origin"           to playerBase,
+                    )
+                    val streamText = try {
+                        app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text
+                    } catch (e: Exception) { android.util.Log.e("Anizle", "getVideo: ${e.message}"); continue }
+                    android.util.Log.d("Anizle", "Step4a: ${streamText.take(300)}")
+
+                    val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
+                    val securedLink = json.optString("securedLink", "")
+                    val videoSource = json.optString("videoSource", "")
+
+                    if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
+                        callback(newExtractorLink(source = label, name = label, url = securedLink,
+                            type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value; referer = playerRef })
+                        found = true; continue
+                    }
+                    if (videoSource.isNotBlank()) {
+                        callback(newExtractorLink(source = label, name = label, url = videoSource,
+                            type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
+                        found = true
+                    }
+                    continue
+                }
+
+                // ── Step 4b/c: GET anizmplayer.com/player/{hash} for the rest ─
+                val pageHtml = try {
+                    app.get(playerRef, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+                } catch (e: Exception) { android.util.Log.e("Anizle", "Step4 player page: ${e.message}"); continue }
+                android.util.Log.d("Anizle", "Step4 player page len=${pageHtml.length}")
+
+                // ── Step 4b: GDrive ───────────────────────────────────────────
                 if (isGdrive) {
-                    val fileId = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                    if (fileId == null) { android.util.Log.w("Anizle", "GDrive: no fileId"); continue }
+                    val fileId = Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                    if (fileId == null) { android.util.Log.w("Anizle", "Step4b: no fileId"); continue }
                     callback(newExtractorLink(source = label, name = label,
                         url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
                         type = ExtractorLinkType.VIDEO) {
@@ -329,80 +383,15 @@ class AnizleProvider : MainAPI() {
                     found = true; continue
                 }
 
-                // ── Generic hosts (Voe, FileMoon, UQload, etc.) ───────────────
-                if (!isAincrad) {
-                    val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                // ── Step 4c: Generic hosts (Voe, FileMoon, UQload, etc.) ──────
+                val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                    .find(pageHtml)?.groupValues?.get(1)
+                    ?: Regex("""<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
                         .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
-                            .find(pageHtml)?.groupValues?.get(1)
-                    android.util.Log.d("Anizle", "loadExtractor: $videoName embedUrl=$embedUrl")
-                    if (embedUrl != null) { loadExtractor(embedUrl, mainUrl, subtitleCallback, callback); found = true }
-                    continue
-                }
-
-                // ── Aincrad / FirePlayer ──────────────────────────────────────
-                val fireId = extractFireplayerId(pageHtml)
-                android.util.Log.d("Anizle", "Step4: fireId=$fireId pageHtml len=${pageHtml.length}")
-                fireId ?: continue
-
-                val playerRef = "$playerBase/player/$fireId"
-                val aHeaders = mapOf(
-                    "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Accept"           to "application/json, */*; q=0.01",
-                    "Referer"          to playerRef,
-                    "Origin"           to playerBase,
-                )
-                val streamText = try { app.post("$playerBase/player/index.php?data=$fireId&do=getVideo", headers = aHeaders).text }
-                    catch (e: Exception) { android.util.Log.e("Anizle", "getVideo: ${e.message}"); continue }
-                android.util.Log.d("Anizle", "Step5: ${streamText.take(300)}")
-
-                val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
-                val securedLink = json.optString("securedLink", "")
-                val videoSource = json.optString("videoSource", "")
-
-                if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = label, url = securedLink,
-                        type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value; referer = playerRef })
-                    found = true; continue
-                }
-                if (videoSource.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = label, url = videoSource,
-                        type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
-                    found = true
-                }
+                android.util.Log.d("Anizle", "Step4c: $videoName embedUrl=$embedUrl")
+                if (embedUrl != null) { loadExtractor(embedUrl, mainUrl, subtitleCallback, callback); found = true }
             }
         }
         return found
-    }
-
-    // ── JS helpers ────────────────────────────────────────────────────────────
-    private fun extractFireplayerId(html: String): String? {
-        Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
-            .find(html)?.groupValues?.get(1)?.let { return it }
-        val evalMatch = Regex(
-            """eval\(function\(p,a,c,k,e,d\)\{.*?return p\}\('(.*?)',(\d+),(\d+),'([^']+)'\.split\('\|'\),0,\{\}\)\)""",
-            setOf(RegexOption.DOT_MATCHES_ALL)
-        ).find(html)
-        if (evalMatch != null) {
-            runCatching {
-                val decoded = unpackJs(evalMatch.groupValues[1], evalMatch.groupValues[2].toInt(),
-                    evalMatch.groupValues[3].toInt(), evalMatch.groupValues[4].split("|"))
-                Regex("""FirePlayer\s*\(\s*["']([a-f0-9]{32})["']""").find(decoded)
-                    ?.groupValues?.get(1)?.let { return it }
-            }
-        }
-        return Regex("""FirePlayer\(["']([a-f0-9]{32})["']""").find(html)?.groupValues?.get(1)
-    }
-
-    private fun unpackJs(p: String, a: Int, c: Int, k: List<String>): String {
-        fun toBase(n: Int, base: Int): String {
-            val head = if (n < base) "" else toBase(n / base, base)
-            val rem  = n % base
-            return head + when { rem > 35 -> (rem + 29).toChar(); rem > 9 -> (rem + 87).toChar(); else -> ('0' + rem) }
-        }
-        var idx = c; val dict = mutableMapOf<String, String>()
-        while (idx-- > 0) { val key = toBase(idx, a); dict[key] = if (idx < k.size && k[idx].isNotEmpty()) k[idx] else key }
-        return Regex("""\b\w+\b""").replace(p) { dict[it.value] ?: it.value }
     }
 }
