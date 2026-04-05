@@ -397,14 +397,20 @@ class AnizleProvider : MainAPI() {
             for ((videoUrl, videoName) in videos) {
                 val videoNameL = videoName.lowercase()
 
-                // Only handle hosts we can extract:
-                //   Aincrad → FirePlayer (anizmplayer.com)
-                //   GDrive  → Google Drive direct link
-                // Skipping everything else avoids N×M /player/ requests that block later fansubs.
+                // Only handle hosts we can extract.
+                // Aincrad → FirePlayer (anizmplayer.com)
+                // GDrive  → Google Drive direct link
+                // Others  → loadExtractor (Voe, FileMoon, UQload, Vidmoly, Sibnet, SendVid, etc.)
                 val isAincrad = videoNameL.contains("aincrad")
                 val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
-                if (!isAincrad && !isGdrive) {
-                    android.util.Log.d("Anizle", "Step4: skipping unsupported host $videoName")
+                val isKnownHost = isAincrad || isGdrive ||
+                    videoNameL.contains("voe")       || videoNameL.contains("filemoon")  ||
+                    videoNameL.contains("uqload")    || videoNameL.contains("vidmoly")   ||
+                    videoNameL.contains("sibnet")    || videoNameL.contains("sendvid")   ||
+                    videoNameL.contains("doodstream") || videoNameL.contains("ok.ru")   ||
+                    videoNameL.contains("odnoklassniki") || videoNameL.contains("sistenn")
+                if (!isKnownHost) {
+                    android.util.Log.d("Anizle", "Step4: skipping unknown host $videoName")
                     continue
                 }
 
@@ -431,7 +437,7 @@ class AnizleProvider : MainAPI() {
                 //         anizmplayer.com has no Cloudflare — if the numeric ID maps to a page,
                 //         either the URL itself contains the hash or Content-Location header does.
                 //
-                // Path C: GET anizm.net/video/{id} with cfKiller — last resort, often times out.
+                // Path B2: plain GET anizm.net/video/{id} using session cf_clearance cookie.
                 var pageHtml = ""
                 var step3Html = ""
 
@@ -487,34 +493,13 @@ class AnizleProvider : MainAPI() {
                     }
                 }
 
-                // ── Path C: anizm.net/video/{id} with cfKiller (last resort) ─
-                if (pageHtml.isBlank()) {
-                    android.util.Log.d("Anizle", "Step3 PathC: $videoUrl with cfKiller")
-                    val vRaw = try {
-                        app.get(videoUrl,
-                            headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
-                            interceptor = cfKiller).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "Step3 PathC error: ${e.message}"); ""
-                    }
-                    android.util.Log.d("Anizle", "Step3 PathC: len=${vRaw.length} snippet=${vRaw.take(200)}")
-                    if (vRaw.isNotBlank() && !isCfPage(vRaw)) {
-                        val parsed = try {
-                            val obj = JSONObject(vRaw)
-                            obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
-                        } catch (_: Exception) { vRaw }
-                        if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
-                            pageHtml = parsed; step3Html = parsed
-                        } else {
-                            android.util.Log.w("Anizle", "Step3 PathC: no content — $parsed")
-                        }
-                    } else {
-                        android.util.Log.w("Anizle", "Step3 PathC: CF blocked or empty")
-                    }
-                }
+                // Path C (cfKiller) REMOVED: anizm.net/video/{id} has an interactive Cloudflare
+                // Turnstile that cfKiller cannot solve. Its 120s timeout consumes the entire
+                // coroutine budget, causing all subsequent translator XHR calls to fail immediately.
 
-                if (isAincrad && pageHtml.isBlank()) {
-                    android.util.Log.w("Anizle", "Aincrad: all 3 paths failed — skipping"); continue
+                if (pageHtml.isBlank()) {
+                    android.util.Log.w("Anizle", "Step3: all paths failed for $videoName — skipping")
+                    continue
                 }
 
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
@@ -550,6 +535,24 @@ class AnizleProvider : MainAPI() {
                         referer = "https://drive.google.com/"
                     })
                     found = true
+                    continue
+                }
+
+                // ── Generic loadExtractor path (Voe, FileMoon, UQload, Vidmoly, Sibnet, etc.) ─
+                if (!isAincrad && !isGdrive) {
+                    // pageHtml should contain the player page HTML with an embedded iframe/video src.
+                    // Extract any URL that looks like an embed (iframe src or video src).
+                    val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        .find(pageHtml)?.groupValues?.get(1)
+                        ?: Regex("""<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
+                            .find(pageHtml)?.groupValues?.get(1)
+                    android.util.Log.d("Anizle", "loadExtractor: $videoName embedUrl=$embedUrl")
+                    if (embedUrl != null) {
+                        loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
+                        found = true
+                    } else {
+                        android.util.Log.w("Anizle", "loadExtractor: no embed URL in pageHtml for $videoName")
+                    }
                     continue
                 }
 
