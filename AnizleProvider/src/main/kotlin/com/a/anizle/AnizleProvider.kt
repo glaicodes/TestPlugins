@@ -1,18 +1,15 @@
 package com.a.anizle
 
 import android.os.Looper
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayInputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -20,8 +17,8 @@ import kotlin.coroutines.suspendCoroutine
  * Video link chain:
  *  Step 1: Episode HTML → translator="URL" attrs
  *  Step 2: GET translator URL (XHR) → JSON {data: html} → video="URL" buttons
- *  Step 3: numId from video URL → custom WebView loads anizm.net/player/{numId}
- *          (real WebView bypasses CF) → intercepts anizmplayer.com/video/{hash}
+ *  Step 3: numId from video URL → WebView JS fetch() bypasses CF:
+ *          fetch(/video/{numId}) → JSON {player} → fetch(/player/{numId}) → hash
  *  Step 4a (Aincrad): POST anizmplayer.com/player/index.php?data={hash}&do=getVideo
  *  Step 4b (GDrive):  GET anizmplayer.com/player/{hash} → drive file ID
  *  Step 4c (others):  GET anizmplayer.com/player/{hash} → iframe → loadExtractor
@@ -81,15 +78,18 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
-    // ── WebView-based hash resolver ─────────────────────────────────────────
-    // CF blocks /player/{numId} from OkHttp (TLS fingerprint mismatch).
-    // A real Android WebView has a genuine browser TLS stack and solves CF.
-    // We load the page and intercept the anizmplayer.com iframe URL.
-    // Uses only kotlin.coroutines (stdlib) + Android framework — no kotlinx.
-    private suspend fun resolvePlayerHash(numId: String, timeoutMs: Long = 35_000): String? {
-        val targetUrl = "$mainUrl/player/$numId"
-        android.util.Log.d("Anizle", "WebView: loading $targetUrl")
-        val hashPattern = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
+    // ── WebView JS fetch resolver ──────────────────────────────────────────
+    // CF blocks /player/{numId} from OkHttp AND from WebView page loads.
+    // But fetch() inside a WebView uses the browser's real HTTP stack
+    // (correct TLS fingerprint) with same-origin cookies from cfKiller.
+    // We load a blank page with anizm.net origin, then use JS fetch()
+    // to call /video/{numId} → /player/{numId} → extract hash.
+    private suspend fun resolvePlayerHash(
+        numId: String,
+        episodeUrl: String,
+        timeoutMs: Long = 20_000
+    ): String? {
+        android.util.Log.d("Anizle", "JSFetch: resolving numId=$numId")
 
         return suspendCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
@@ -99,7 +99,7 @@ class AnizleProvider : MainAPI() {
                     com.lagradost.cloudstream3.AcraApplication.context
                 } catch (_: Exception) { null }
                 if (ctx == null) {
-                    android.util.Log.e("Anizle", "WebView: no app context")
+                    android.util.Log.e("Anizle", "JSFetch: no app context")
                     cont.resume(null); return@post
                 }
 
@@ -110,66 +110,94 @@ class AnizleProvider : MainAPI() {
                     settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                 }
 
-                // Ensure cookies from cfKiller session are available
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
                 fun finish(hash: String?) {
                     if (!resumed) {
                         resumed = true
-                        webView.stopLoading()
-                        webView.destroy()
+                        try { webView.stopLoading() } catch (_: Exception) {}
+                        try { webView.destroy() } catch (_: Exception) {}
                         cont.resume(hash)
                     }
                 }
 
-                // Timeout
                 val timeoutRunnable = Runnable {
-                    android.util.Log.w("Anizle", "WebView: timeout after ${timeoutMs}ms")
+                    android.util.Log.w("Anizle", "JSFetch: timeout")
                     finish(null)
                 }
                 handler.postDelayed(timeoutRunnable, timeoutMs)
 
-                webView.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(
-                        view: WebView?,
-                        request: WebResourceRequest?
-                    ): WebResourceResponse? {
-                        val url = request?.url?.toString() ?: return null
-                        val match = hashPattern.find(url)
-                        if (match != null) {
-                            val hash = match.groupValues[1]
-                            android.util.Log.d("Anizle", "WebView: intercepted hash=$hash from $url")
-                            handler.removeCallbacks(timeoutRunnable)
-                            handler.post { finish(hash) }
-                            // Block the iframe from actually loading
-                            return WebResourceResponse(
-                                "text/plain", "utf-8",
-                                ByteArrayInputStream(ByteArray(0))
-                            )
-                        }
-                        return null
+                // JS bridge for callback from fetch
+                class JsBridge {
+                    @android.webkit.JavascriptInterface
+                    fun onResult(hash: String) {
+                        android.util.Log.d("Anizle", "JSFetch: onResult hash='$hash'")
+                        handler.removeCallbacks(timeoutRunnable)
+                        handler.post { finish(hash.ifBlank { null }) }
                     }
+                }
+                webView.addJavascriptInterface(JsBridge(), "AnizleBridge")
 
+                webView.webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        android.util.Log.d("Anizle", "WebView: pageFinished $url")
-                        // Fallback: extract hash from rendered HTML via JS
-                        view?.evaluateJavascript(
-                            "(function(){var f=document.querySelector('iframe[src*=\"anizmplayer.com\"]');return f?f.src:''})()"
-                        ) { result ->
-                            val cleaned = result?.trim('"') ?: ""
-                            val m = hashPattern.find(cleaned)
-                            if (m != null && !resumed) {
-                                android.util.Log.d("Anizle", "WebView: JS fallback hash=${m.groupValues[1]}")
-                                handler.removeCallbacks(timeoutRunnable)
-                                finish(m.groupValues[1])
-                            }
-                        }
+                        android.util.Log.d("Anizle", "JSFetch: pageFinished $url")
+
+                        // Now use fetch() through the WebView's browser HTTP stack.
+                        // Step A: GET /video/{numId} XHR → JSON {player: "<iframe src=...>"}
+                        // Step B: extract numId from iframe src → GET /player/{numId}
+                        // Step C: extract anizmplayer hash from HTML
+                        val js = """
+                        (function(){
+                            var numId = '$numId';
+                            fetch('/video/' + numId, {
+                                headers: {
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'Accept': 'application/json, text/javascript, */*; q=0.01'
+                                },
+                                credentials: 'include'
+                            })
+                            .then(function(r){ return r.text(); })
+                            .then(function(text){
+                                console.log('AnizleStep1: len=' + text.length);
+                                try {
+                                    var j = JSON.parse(text);
+                                    var player = j.player || '';
+                                    var m = player.match(/player\/(\d+)/);
+                                    if(m) return m[1];
+                                } catch(e){}
+                                // If JSON parse fails, it might be CF page
+                                // Try /player/ directly
+                                return numId;
+                            })
+                            .then(function(pid){
+                                console.log('AnizleStep2: fetching /player/' + pid);
+                                return fetch('/player/' + pid, {credentials: 'include'});
+                            })
+                            .then(function(r){ return r.text(); })
+                            .then(function(html){
+                                console.log('AnizleStep3: playerPage len=' + html.length);
+                                var m = html.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
+                                AnizleBridge.onResult(m ? m[1] : '');
+                            })
+                            .catch(function(e){
+                                console.log('AnizleFetchErr: ' + e);
+                                AnizleBridge.onResult('');
+                            });
+                        })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
                     }
                 }
 
-                webView.loadUrl(targetUrl)
+                // Load blank page with anizm.net origin — no network request,
+                // but establishes same-origin for fetch() + shares cfKiller cookies
+                webView.loadDataWithBaseURL(
+                    "$mainUrl/blank",
+                    "<html><body></body></html>",
+                    "text/html", "utf-8", null
+                )
             }
         }
     }
@@ -348,8 +376,8 @@ class AnizleProvider : MainAPI() {
             for ((numId, videoList) in numIdToVideos) {
                 android.util.Log.d("Anizle", "Step3: resolving numId=$numId (${videoList.size} videos)")
 
-                // ── Step 3: get hash via real WebView ──────────────────────
-                val hash = try { resolvePlayerHash(numId) } catch (e: Exception) {
+                // ── Step 3: get hash via WebView JS fetch ─────────────────
+                val hash = try { resolvePlayerHash(numId, data) } catch (e: Exception) {
                     android.util.Log.e("Anizle", "Step3 WebView error: ${e.message}"); null
                 }
                 if (hash == null) {
