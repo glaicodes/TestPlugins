@@ -192,7 +192,8 @@ class AnizleProvider : MainAPI() {
                             android.util.Log.d("Anizle", "JSFetch: csrf=${csrf.take(10)}...")
 
                             // Step A: fetch /video/{numId} → JSON
-                            // Step B: fetch /player/{numId} → HTML → hash
+                            // Look for anizmplayer hash in response directly
+                            // Only fetch /player/ if hash not found in /video/ response
                             val fetchJs = """
                             (function(){
                                 var numId = '$numId';
@@ -211,29 +212,76 @@ class AnizleProvider : MainAPI() {
                                     return r.text();
                                 })
                                 .then(function(text){
-                                    AnizleBridge.log('video len=' + text.length + ' start=' + text.substring(0,80));
+                                    AnizleBridge.log('video len=' + text.length);
+                                    // Check for hash anywhere in the full response
+                                    var hashMatch = text.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
+                                    if(hashMatch){
+                                        AnizleBridge.log('found hash in /video/ response: ' + hashMatch[1]);
+                                        AnizleBridge.onResult(hashMatch[1]);
+                                        return;
+                                    }
+                                    // Parse JSON and log all keys
                                     try {
                                         var j = JSON.parse(text);
-                                        var player = j.player || '';
-                                        var m = player.match(/player\/(\d+)/);
-                                        if(m) return m[1];
+                                        var keys = Object.keys(j);
+                                        AnizleBridge.log('JSON keys: ' + keys.join(','));
+                                        // Log the player field specifically
+                                        if(j.player){
+                                            AnizleBridge.log('player field: ' + j.player.substring(0,200));
+                                            var pm = j.player.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
+                                            if(pm){
+                                                AnizleBridge.log('hash from player field: ' + pm[1]);
+                                                AnizleBridge.onResult(pm[1]);
+                                                return;
+                                            }
+                                        }
+                                        // Log data field too
+                                        if(j.data){
+                                            AnizleBridge.log('data field (200): ' + String(j.data).substring(0,200));
+                                        }
+                                        // Log translator field summary
+                                        if(j.translator){
+                                            AnizleBridge.log('translator len=' + j.translator.length);
+                                        }
+                                        // Look for any iframe src in all fields
+                                        var allText = JSON.stringify(j);
+                                        var iframeMatch = allText.match(/src=\\\\?"([^"\\\\]*anizmplayer[^"\\\\]*)\\\\?"/);
+                                        if(iframeMatch){
+                                            AnizleBridge.log('iframe src: ' + iframeMatch[1]);
+                                            var hm = iframeMatch[1].match(/([a-f0-9]{32})/);
+                                            if(hm){
+                                                AnizleBridge.onResult(hm[1]);
+                                                return;
+                                            }
+                                        }
                                     } catch(e){
-                                        AnizleBridge.log('JSON parse error: ' + e);
+                                        AnizleBridge.log('JSON err: ' + e);
                                     }
-                                    return numId;
-                                })
-                                .then(function(pid){
-                                    AnizleBridge.log('fetch /player/' + pid);
-                                    return fetch('/player/' + pid, {credentials: 'include'});
-                                })
-                                .then(function(r){
-                                    AnizleBridge.log('player status=' + r.status);
-                                    return r.text();
-                                })
-                                .then(function(html){
-                                    AnizleBridge.log('player len=' + html.length + ' start=' + html.substring(0,80));
-                                    var m = html.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
-                                    AnizleBridge.onResult(m ? m[1] : '');
+                                    // No hash found - try /player/ as last resort
+                                    AnizleBridge.log('no hash in /video/, trying /player/' + numId);
+                                    fetch('/player/' + numId, {
+                                        credentials: 'include',
+                                        redirect: 'manual'
+                                    })
+                                    .then(function(r){
+                                        AnizleBridge.log('player status=' + r.status + ' type=' + r.type + ' redirected=' + r.redirected);
+                                        if(r.type === 'opaqueredirect'){
+                                            AnizleBridge.log('player redirected (CF), giving up');
+                                            AnizleBridge.onResult('');
+                                            return '';
+                                        }
+                                        return r.text();
+                                    })
+                                    .then(function(html){
+                                        if(!html){ return; }
+                                        AnizleBridge.log('player len=' + html.length);
+                                        var m = html.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
+                                        AnizleBridge.onResult(m ? m[1] : '');
+                                    })
+                                    .catch(function(e2){
+                                        AnizleBridge.log('player fetchErr: ' + e2);
+                                        AnizleBridge.onResult('');
+                                    });
                                 })
                                 .catch(function(e){
                                     AnizleBridge.log('fetchErr: ' + e);
