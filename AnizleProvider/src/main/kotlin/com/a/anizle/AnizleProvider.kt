@@ -7,17 +7,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Anizle / Anizm CloudStream 3 Provider
- *
  * Video link chain:
  *  Step 1: Episode HTML → translator="URL" attrs
  *  Step 2: GET translator URL (XHR) → JSON {data: html} → video="URL" buttons
- *  Step 3: GET /video/{id} as XHR with X-CSRF-TOKEN
- *          → JSON {player: "<iframe src='anizmplayer.com/player/{hash}'>"}
- *          → extract 32-hex hash
- *  Step 4a (Aincrad): POST anizmplayer.com/player/index.php?data={hash}&do=getVideo → {hls, securedLink}
- *  Step 4b (GDrive):  GET anizmplayer.com/player/{hash} → find drive file ID → direct link
- *  Step 4c (others):  GET anizmplayer.com/player/{hash} → find iframe src → loadExtractor
+ *  Step 3: numId from video URL → WebViewResolver loads anizm.net/player/{numId}
+ *          (real WebView bypasses CF) → intercepts anizmplayer.com/video/{hash}
+ *  Step 4a (Aincrad): POST anizmplayer.com/player/index.php?data={hash}&do=getVideo
+ *  Step 4b (GDrive):  GET anizmplayer.com/player/{hash} → drive file ID
+ *  Step 4c (others):  GET anizmplayer.com/player/{hash} → iframe → loadExtractor
  */
 class AnizleProvider : MainAPI() {
 
@@ -147,7 +144,7 @@ class AnizleProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
-    // ── Load (anime detail page) ───────────────────────────────────────────────
+    // ── Load ──────────────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         getSession()
         val doc = app.get(url, headers = baseHeaders).document
@@ -248,92 +245,39 @@ class AnizleProvider : MainAPI() {
                     vl.contains("odnoklassniki") || vl.contains("sistenn")
                 if (!isKnown) { android.util.Log.d("Anizle", "Step3: skip unknown $videoName"); continue }
 
-                android.util.Log.d("Anizle", "Step3: $videoName -> $videoUrl")
-                val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
+                // ── Step 3: get hash via WebViewResolver ──────────────────────
+                // anizm.net/video/{id} XHR and anizm.net/player/{id} page are
+                // both CF-blocked from the HTTP client. WebViewResolver uses a
+                // real Android WebView that passes CF naturally.
+                // The numId is already in the video URL — no extra request needed.
+                // We intercept the anizmplayer.com/video/{hash} iframe load.
+                val numId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1)
+                if (numId == null) {
+                    android.util.Log.w("Anizle", "Step3: no numId in $videoUrl"); continue
+                }
+                val playerPageUrl = "$mainUrl/player/$numId"
+                android.util.Log.d("Anizle", "Step3: WebView $playerPageUrl for $videoName")
 
-                // ── Step 3: GET /video/{id} as XHR with CSRF token ────────────
-                // The browser XHRs this endpoint which returns JSON:
-                //   {"status":"success","player":"<iframe src='anizmplayer.com/player/{hash}'>"}
-                // We extract the 32-hex hash from the iframe src.
-                // This avoids /player/{id} which is CF-protected.
-                val videoXhrHeaders = xhrHeaders + mapOf(
-                    "X-CSRF-TOKEN" to (csrfToken ?: ""),
-                    "Referer"      to data,
-                )
-                val videoRespText = try {
-                    app.get(videoUrl, headers = videoXhrHeaders).text
+                val webViewResult = try {
+                    WebViewResolver(
+                        Regex("""anizmplayer\.com/(?:video|player)/[a-f0-9]{32}""")
+                    ).resolveUrl(playerPageUrl, mapOf("Referer" to data))
                 } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Step3 XHR error: ${e.message}"); continue
-                }
-                android.util.Log.d("Anizle", "Step3 XHR len=${videoRespText.length} snippet=${videoRespText.take(120)}")
-
-                if (isCf(videoRespText)) {
-                    android.util.Log.w("Anizle", "Step3: CF blocked for $videoName"); continue
+                    android.util.Log.e("Anizle", "Step3 WebView error: ${e.message}"); null
                 }
 
-                val videoJson = try { JSONObject(videoRespText) } catch (_: Exception) {
-                    android.util.Log.w("Anizle", "Step3: not JSON for $videoName: ${videoRespText.take(80)}")
-                    continue
+                val hash = webViewResult?.first?.let {
+                    Regex("""([a-f0-9]{32})""").find(it)?.groupValues?.get(1)
                 }
-
-                val playerField = videoJson.optString("player", "")
-                android.util.Log.d("Anizle", "Step3: player field=${playerField.take(120)}")
-
-                // playerField = <iframe src="https://anizm.net/player/{numId}">
-                // We need to fetch that page to get anizmplayer.com/video/{hash}
-                val playerPageUrl = Regex("""src=["'](https://anizm\.net/player/[^"']+)["']""")
-                    .find(playerField)?.groupValues?.get(1)
-                if (playerPageUrl == null) {
-                    android.util.Log.w("Anizle", "Step3: no player page URL for $videoName"); continue
-                }
-                android.util.Log.d("Anizle", "Step3: fetching player page $playerPageUrl")
-
-                // Fetch /player/{numId} mimicking an iframe navigation.
-                // Sec-Fetch-Dest: iframe tells CF this is a legitimate embedded iframe,
-                // which bypasses the stricter bot-check applied to direct navigation.
-                val iframeHeaders = mapOf(
-                    "User-Agent"                to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                    "Accept"                    to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language"           to "tr-TR,tr;q=0.9,en;q=0.7",
-                    "Referer"                   to data,
-                    "Sec-Fetch-Dest"            to "iframe",
-                    "Sec-Fetch-Mode"            to "navigate",
-                    "Sec-Fetch-Site"            to "same-origin",
-                    "Upgrade-Insecure-Requests" to "1",
-                )
-                var playerPageHtml = try {
-                    app.get(playerPageUrl, headers = iframeHeaders).text
-                } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Step3 player page: ${e.message}"); ""
-                }
-                android.util.Log.d("Anizle", "Step3 player page: len=${playerPageHtml.length} cf=${isCf(playerPageHtml)}")
-
-                // Fallback: cfKiller if still CF-challenged
-                if (playerPageHtml.isBlank() || isCf(playerPageHtml)) {
-                    android.util.Log.d("Anizle", "Step3: trying cfKiller for $playerPageUrl")
-                    playerPageHtml = try {
-                        app.get(playerPageUrl, headers = iframeHeaders, interceptor = cfKiller).text
-                    } catch (e: Exception) {
-                        android.util.Log.e("Anizle", "Step3 cfKiller: ${e.message}"); ""
-                    }
-                    android.util.Log.d("Anizle", "Step3 cfKiller: len=${playerPageHtml.length} cf=${isCf(playerPageHtml)}")
-                }
-
-                if (playerPageHtml.isBlank() || isCf(playerPageHtml)) {
-                    android.util.Log.w("Anizle", "Step3: player page blocked for $videoName"); continue
-                }
-
-                // anizm.net/player/{numId} embeds anizmplayer.com/video/{hash} directly
-                val hash = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
-                    .find(playerPageHtml)?.groupValues?.get(1)
                 if (hash == null) {
-                    android.util.Log.w("Anizle", "Step3: no hash in player page for $videoName"); continue
+                    android.util.Log.w("Anizle", "Step3: no hash for $videoName (result=${webViewResult?.first})"); continue
                 }
                 android.util.Log.d("Anizle", "Step3: hash=$hash for $videoName")
 
+                val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
                 val playerRef = "$playerBase/player/$hash"
 
-                // ── Step 4a: Aincrad / FirePlayer ─────────────────────────────
+                // ── Step 4a: Aincrad ──────────────────────────────────────────
                 if (isAincrad) {
                     val aHeaders = mapOf(
                         "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
@@ -364,11 +308,11 @@ class AnizleProvider : MainAPI() {
                     continue
                 }
 
-                // ── Step 4b/c: GET anizmplayer.com/player/{hash} for the rest ─
+                // ── Step 4b/c: fetch anizmplayer.com/player/{hash} (no CF) ────
                 val pageHtml = try {
                     app.get(playerRef, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                } catch (e: Exception) { android.util.Log.e("Anizle", "Step4 player page: ${e.message}"); continue }
-                android.util.Log.d("Anizle", "Step4 player page len=${pageHtml.length}")
+                } catch (e: Exception) { android.util.Log.e("Anizle", "Step4 page: ${e.message}"); continue }
+                android.util.Log.d("Anizle", "Step4 page len=${pageHtml.length}")
 
                 // ── Step 4b: GDrive ───────────────────────────────────────────
                 if (isGdrive) {
@@ -383,7 +327,7 @@ class AnizleProvider : MainAPI() {
                     found = true; continue
                 }
 
-                // ── Step 4c: Generic hosts (Voe, FileMoon, UQload, etc.) ──────
+                // ── Step 4c: other hosts ──────────────────────────────────────
                 val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                     .find(pageHtml)?.groupValues?.get(1)
                     ?: Regex("""<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
