@@ -2,6 +2,8 @@ package com.a.anizle
 
 import android.os.Looper
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -10,6 +12,7 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -79,17 +82,17 @@ class AnizleProvider : MainAPI() {
     )
 
     // ── WebView JS fetch resolver ──────────────────────────────────────────
-    // CF blocks /player/{numId} from OkHttp AND from WebView page loads.
-    // But fetch() inside a WebView uses the browser's real HTTP stack
-    // (correct TLS fingerprint) with same-origin cookies from cfKiller.
-    // We load a blank page with anizm.net origin, then use JS fetch()
-    // to call /video/{numId} → /player/{numId} → extract hash.
+    // CF blocks /player/{numId} from OkHttp AND from offscreen WebView.
+    // Fix: load the REAL episode page in WebView (not CF-protected, ~188KB)
+    // but block all sub-resources (CSS/JS/images) for speed. This gives us
+    // a true same-origin context on anizm.net. Then use JS fetch() through
+    // the WebView's browser HTTP stack (correct TLS fingerprint + cookies).
     private suspend fun resolvePlayerHash(
         numId: String,
         episodeUrl: String,
-        timeoutMs: Long = 20_000
+        timeoutMs: Long = 25_000
     ): String? {
-        android.util.Log.d("Anizle", "JSFetch: resolving numId=$numId")
+        android.util.Log.d("Anizle", "JSFetch: resolving numId=$numId via $episodeUrl")
 
         return suspendCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
@@ -107,6 +110,7 @@ class AnizleProvider : MainAPI() {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    settings.blockNetworkImage = true
                     settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                 }
 
@@ -136,68 +140,115 @@ class AnizleProvider : MainAPI() {
                         handler.removeCallbacks(timeoutRunnable)
                         handler.post { finish(hash.ifBlank { null }) }
                     }
+                    @android.webkit.JavascriptInterface
+                    fun log(msg: String) {
+                        android.util.Log.d("Anizle", "JS: $msg")
+                    }
                 }
                 webView.addJavascriptInterface(JsBridge(), "AnizleBridge")
 
+                var jsFired = false
+
                 webView.webViewClient = object : WebViewClient() {
+                    // Block all sub-resources — we only need the HTML for origin
+                    private val blockExt = listOf(".css", ".js", ".png", ".jpg", ".jpeg",
+                        ".gif", ".webp", ".svg", ".woff", ".woff2", ".ttf", ".ico")
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        val url = request?.url?.toString()?.lowercase() ?: return null
+                        // Allow the main page and fetch() XHRs
+                        val isXhr = request.requestHeaders?.get("X-Requested-With") == "XMLHttpRequest"
+                                || request.requestHeaders?.get("Accept")?.contains("json") == true
+                        if (isXhr) return null // let fetch() through
+                        // Block sub-resources
+                        if (blockExt.any { url.contains(it) } ||
+                            url.contains("semantic") || url.contains("font") ||
+                            url.contains("statbest") || url.contains("analytics")) {
+                            return WebResourceResponse(
+                                "text/plain", "utf-8",
+                                ByteArrayInputStream(ByteArray(0))
+                            )
+                        }
+                        return null
+                    }
+
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        android.util.Log.d("Anizle", "JSFetch: pageFinished $url")
+                        android.util.Log.d("Anizle", "JSFetch: pageFinished $url (jsFired=$jsFired)")
+                        if (jsFired) return
+                        jsFired = true
 
-                        // Now use fetch() through the WebView's browser HTTP stack.
-                        // Step A: GET /video/{numId} XHR → JSON {player: "<iframe src=...>"}
-                        // Step B: extract numId from iframe src → GET /player/{numId}
-                        // Step C: extract anizmplayer hash from HTML
-                        val js = """
+                        // Get CSRF token from the page
+                        val csrfJs = """
                         (function(){
-                            var numId = '$numId';
-                            fetch('/video/' + numId, {
-                                headers: {
-                                    'X-Requested-With': 'XMLHttpRequest',
-                                    'Accept': 'application/json, text/javascript, */*; q=0.01'
-                                },
-                                credentials: 'include'
-                            })
-                            .then(function(r){ return r.text(); })
-                            .then(function(text){
-                                console.log('AnizleStep1: len=' + text.length);
-                                try {
-                                    var j = JSON.parse(text);
-                                    var player = j.player || '';
-                                    var m = player.match(/player\/(\d+)/);
-                                    if(m) return m[1];
-                                } catch(e){}
-                                // If JSON parse fails, it might be CF page
-                                // Try /player/ directly
-                                return numId;
-                            })
-                            .then(function(pid){
-                                console.log('AnizleStep2: fetching /player/' + pid);
-                                return fetch('/player/' + pid, {credentials: 'include'});
-                            })
-                            .then(function(r){ return r.text(); })
-                            .then(function(html){
-                                console.log('AnizleStep3: playerPage len=' + html.length);
-                                var m = html.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
-                                AnizleBridge.onResult(m ? m[1] : '');
-                            })
-                            .catch(function(e){
-                                console.log('AnizleFetchErr: ' + e);
-                                AnizleBridge.onResult('');
-                            });
-                        })();
+                            var meta = document.querySelector('meta[name="csrf-token"]');
+                            return meta ? meta.getAttribute('content') : '';
+                        })()
                         """.trimIndent()
-                        view?.evaluateJavascript(js, null)
+                        view?.evaluateJavascript(csrfJs) { csrfResult ->
+                            val csrf = csrfResult?.trim('"') ?: ""
+                            android.util.Log.d("Anizle", "JSFetch: csrf=${csrf.take(10)}...")
+
+                            // Step A: fetch /video/{numId} → JSON
+                            // Step B: fetch /player/{numId} → HTML → hash
+                            val fetchJs = """
+                            (function(){
+                                var numId = '$numId';
+                                var csrf = '$csrf';
+                                AnizleBridge.log('fetch /video/' + numId);
+                                fetch('/video/' + numId, {
+                                    headers: {
+                                        'X-Requested-With': 'XMLHttpRequest',
+                                        'X-CSRF-TOKEN': csrf,
+                                        'Accept': 'application/json, text/javascript, */*; q=0.01'
+                                    },
+                                    credentials: 'include'
+                                })
+                                .then(function(r){
+                                    AnizleBridge.log('video status=' + r.status);
+                                    return r.text();
+                                })
+                                .then(function(text){
+                                    AnizleBridge.log('video len=' + text.length + ' start=' + text.substring(0,80));
+                                    try {
+                                        var j = JSON.parse(text);
+                                        var player = j.player || '';
+                                        var m = player.match(/player\/(\d+)/);
+                                        if(m) return m[1];
+                                    } catch(e){
+                                        AnizleBridge.log('JSON parse error: ' + e);
+                                    }
+                                    return numId;
+                                })
+                                .then(function(pid){
+                                    AnizleBridge.log('fetch /player/' + pid);
+                                    return fetch('/player/' + pid, {credentials: 'include'});
+                                })
+                                .then(function(r){
+                                    AnizleBridge.log('player status=' + r.status);
+                                    return r.text();
+                                })
+                                .then(function(html){
+                                    AnizleBridge.log('player len=' + html.length + ' start=' + html.substring(0,80));
+                                    var m = html.match(/anizmplayer\.com\/(?:video|player)\/([a-f0-9]{32})/);
+                                    AnizleBridge.onResult(m ? m[1] : '');
+                                })
+                                .catch(function(e){
+                                    AnizleBridge.log('fetchErr: ' + e);
+                                    AnizleBridge.onResult('');
+                                });
+                            })();
+                            """.trimIndent()
+                            view?.evaluateJavascript(fetchJs, null)
+                        }
                     }
                 }
 
-                // Load blank page with anizm.net origin — no network request,
-                // but establishes same-origin for fetch() + shares cfKiller cookies
-                webView.loadDataWithBaseURL(
-                    "$mainUrl/blank",
-                    "<html><body></body></html>",
-                    "text/html", "utf-8", null
-                )
+                // Load the REAL episode page — not CF-protected, gives us
+                // true same-origin context + CSRF token from meta tag
+                webView.loadUrl(episodeUrl)
             }
         }
     }
