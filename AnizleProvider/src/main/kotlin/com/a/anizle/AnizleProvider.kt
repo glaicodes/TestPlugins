@@ -421,40 +421,100 @@ class AnizleProvider : MainAPI() {
                     android.util.Log.w("Anizle", "Step3: no playerId in $videoUrl"); continue
                 }
 
-                // Step 3: GET anizm.net/video/{id} — the XHR endpoint the site JS uses.
-                // anizle.org/player/{id} is always 404. anizm.net/player/{id} is Turnstile-blocked.
-                // anizm.net/video/{id} has a smaller JS challenge (len~4982) that cfKiller can solve.
-                // cfKiller caches the clearance cookie after the first solve, so subsequent calls are fast.
+                // Step 3: Resolve anizmplayer hash — three attempts, cheapest first.
+                //
+                // Path A: hash already embedded in trHtml/trText from Step 2 XHR.
+                //         Most sites put it in an iframe src or data attr in the same response.
+                //         Zero extra requests if found.
+                //
+                // Path B: GET anizmplayer.com/video/{numericId} directly.
+                //         anizmplayer.com has no Cloudflare — if the numeric ID maps to a page,
+                //         either the URL itself contains the hash or Content-Location header does.
+                //
+                // Path C: GET anizm.net/video/{id} with cfKiller — last resort, often times out.
                 var pageHtml = ""
                 var step3Html = ""
 
-                android.util.Log.d("Anizle", "Step3: fetching $videoUrl with cfKiller")
-                val vRaw = try {
-                    app.get(videoUrl,
-                        headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
-                        interceptor = cfKiller).text
-                } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Step3 cfKiller error: ${e.message}"); ""
+                // ── Path A: scan XHR response for embedded hash ──────────────
+                val hashRe = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
+                // Also scan epHtml — the episode page often pre-embeds the active video iframe.
+                val embeddedHash = hashRe.find(trHtml)?.groupValues?.get(1)
+                    ?: hashRe.find(trText)?.groupValues?.get(1)
+                    ?: hashRe.find(epHtml)?.groupValues?.get(1)
+                if (embeddedHash != null) {
+                    android.util.Log.d("Anizle", "Step3 PathA: hash=$embeddedHash found in XHR response")
+                    pageHtml = "anizmplayer.com/video/$embeddedHash"  // synthetic marker, just needs to contain the URL
+                    step3Html = pageHtml
                 }
-                android.util.Log.d("Anizle", "Step3: len=${vRaw.length} snippet=${vRaw.take(300)}")
 
-                if (vRaw.isNotBlank() && !isCfPage(vRaw)) {
-                    // Response is JSON {player/data/html: "<iframe or script with hash>"}
-                    val parsed = try {
-                        val obj = JSONObject(vRaw)
-                        obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
-                    } catch (_: Exception) { vRaw }
-                    if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
-                        pageHtml = parsed; step3Html = parsed
-                    } else {
-                        android.util.Log.w("Anizle", "Step3: no content in response — $parsed")
+                // ── Path B: anizmplayer.com/video/{numericId} (no CF) ────────
+                if (pageHtml.isBlank() && playerId != null) {
+                    val directPlayerUrl = "$playerBase/video/$playerId"
+                    android.util.Log.d("Anizle", "Step3 PathB: $directPlayerUrl")
+                    val bRaw = try {
+                        app.get(directPlayerUrl,
+                            headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+                    } catch (e: Exception) {
+                        android.util.Log.w("Anizle", "Step3 PathB error: ${e.message}"); ""
                     }
-                } else {
-                    android.util.Log.w("Anizle", "Step3: CF still blocking or empty response")
+                    android.util.Log.d("Anizle", "Step3 PathB: len=${bRaw.length} snippet=${bRaw.take(200)}")
+                    if (bRaw.isNotBlank() && !isCfPage(bRaw)) {
+                        if (hasFirePlayer(bRaw) || bRaw.contains("drive.google.com", ignoreCase = true)) {
+                            pageHtml = bRaw; step3Html = bRaw
+                        }
+                    }
+                }
+
+                // ── Path B2: plain GET anizm.net/video/{id} (no cfKiller) ────
+                // The homepage cf_clearance from getSession() may cover this endpoint.
+                if (pageHtml.isBlank()) {
+                    android.util.Log.d("Anizle", "Step3 PathB2: plain GET $videoUrl")
+                    val b2Raw = try {
+                        app.get(videoUrl, headers = xhrHeaders + mapOf("Referer" to "$mainUrl/")).text
+                    } catch (e: Exception) {
+                        android.util.Log.w("Anizle", "Step3 PathB2 error: ${e.message}"); ""
+                    }
+                    android.util.Log.d("Anizle", "Step3 PathB2: len=${b2Raw.length} cf=${isCfPage(b2Raw)} snip=${b2Raw.take(120)}")
+                    if (b2Raw.isNotBlank() && !isCfPage(b2Raw)) {
+                        val parsed = try {
+                            val obj = JSONObject(b2Raw)
+                            obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
+                        } catch (_: Exception) { b2Raw }
+                        if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
+                            pageHtml = parsed; step3Html = parsed
+                            android.util.Log.d("Anizle", "Step3 PathB2: success")
+                        }
+                    }
+                }
+
+                // ── Path C: anizm.net/video/{id} with cfKiller (last resort) ─
+                if (pageHtml.isBlank()) {
+                    android.util.Log.d("Anizle", "Step3 PathC: $videoUrl with cfKiller")
+                    val vRaw = try {
+                        app.get(videoUrl,
+                            headers = xhrHeaders + mapOf("Referer" to "$mainUrl/"),
+                            interceptor = cfKiller).text
+                    } catch (e: Exception) {
+                        android.util.Log.e("Anizle", "Step3 PathC error: ${e.message}"); ""
+                    }
+                    android.util.Log.d("Anizle", "Step3 PathC: len=${vRaw.length} snippet=${vRaw.take(200)}")
+                    if (vRaw.isNotBlank() && !isCfPage(vRaw)) {
+                        val parsed = try {
+                            val obj = JSONObject(vRaw)
+                            obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
+                        } catch (_: Exception) { vRaw }
+                        if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
+                            pageHtml = parsed; step3Html = parsed
+                        } else {
+                            android.util.Log.w("Anizle", "Step3 PathC: no content — $parsed")
+                        }
+                    } else {
+                        android.util.Log.w("Anizle", "Step3 PathC: CF blocked or empty")
+                    }
                 }
 
                 if (isAincrad && pageHtml.isBlank()) {
-                    android.util.Log.w("Anizle", "Aincrad: no player content found — skipping"); continue
+                    android.util.Log.w("Anizle", "Aincrad: all 3 paths failed — skipping"); continue
                 }
 
                 val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
