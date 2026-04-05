@@ -17,6 +17,13 @@ import org.json.JSONObject
  *  - Episodes: div#episodesMiddle a[href]
  *  - Fansubs:  div.fansubSecimKutucugu a[translator]
  *  - Videos:   a.videoPlayerButtons[video]  (XHR JSON → player html → FirePlayer hash)
+ *
+ * Video link resolution (confirmed from network capture):
+ *  Step 1: Episode HTML → translator="URL" attributes
+ *  Step 2: GET translator URL (XHR + CSRF) → JSON {data: html} → video="URL" buttons
+ *  Step 3: GET /video/{id} (XHR + CSRF) → JSON {player: "<iframe src='anizm.net/player/{id}'>"}
+ *  Step 4: GET anizm.net/player/{id} → packed JS → FirePlayer hash (32 hex chars)
+ *  Step 5: POST anizmplayer.com/player/index.php?data={hash}&do=getVideo → {hls, securedLink}
  */
 class AnizleProvider : MainAPI() {
 
@@ -27,13 +34,9 @@ class AnizleProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private val playerBase = "https://anizmplayer.com"
-    // Python source uses anizle.org specifically for player page requests (step 4)
-    private val videoBase  = "https://anizle.org"
 
-    // CloudflareKiller — used as fallback in getSession() when CF challenges the homepage.
     private val cfKiller = CloudflareKiller()
 
-    // Session cache — reused across search/load/loadLinks calls within the same session.
     private var csrfToken: String? = null
     private var sessionFetchedAt: Long = 0L
     private val sessionTtlMs = 5 * 60 * 1000L // 5 minutes
@@ -47,12 +50,10 @@ class AnizleProvider : MainAPI() {
         }
         android.util.Log.d("Anizle", "getSession: refreshing")
         try {
-            // Fast path: plain request reuses CF cookies pre-warmed by the Anizm extension.
             var resp = app.get(mainUrl, headers = baseHeaders)
             var html = resp.text
             android.util.Log.d("Anizle", "getSession HTTP ${resp.code} len=${html.length}")
 
-            // Fallback: if CF challenged us, solve it once with cfKiller (~3-5s, first time only).
             if (html.contains("Just a moment", ignoreCase = true) ||
                 html.contains("cf-browser-verification", ignoreCase = true)) {
                 android.util.Log.w("Anizle", "getSession: CF challenge, retrying with cfKiller")
@@ -61,7 +62,6 @@ class AnizleProvider : MainAPI() {
                 android.util.Log.d("Anizle", "getSession cfKiller HTTP ${resp.code} len=${html.length}")
             }
 
-            // Extract CSRF token from meta tag: <meta name="csrf-token" content="...">
             csrfToken = Regex("""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']""")
                 .find(html)?.groupValues?.get(1)
                 ?: Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""")
@@ -79,6 +79,8 @@ class AnizleProvider : MainAPI() {
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7",
         "Referer"         to "$mainUrl/",
     )
+
+    // Standard XHR headers WITHOUT CSRF — used for translator URL fetches (Step 2).
     private val xhrHeaders get() = mapOf(
         "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -89,11 +91,16 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
+    // XHR headers WITH CSRF token — required for /video/{id} endpoint (Step 3).
+    // Confirmed from network capture: X-CSRF-TOKEN must be present or the server rejects the request.
+    private val xhrHeadersWithCsrf get(): Map<String, String> {
+        val base = xhrHeaders.toMutableMap()
+        csrfToken?.let { base["X-CSRF-TOKEN"] = it }
+        return base
+    }
+
 
     // ── Search ────────────────────────────────────────────────────────────────
-    // GET /searchAnime?query=TERM&type=detailed&limit=10&...
-    // Returns JSON: {"data": [{"info_title":"..","info_slug":"..","info_poster":"..","info_year":2020}]}
-    // Confirmed by reverse-engineering: search uses Jackson readValue, NOT HTML parsing.
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim()
         if (q.isBlank()) return emptyList()
@@ -160,19 +167,16 @@ class AnizleProvider : MainAPI() {
         val url = if (isEpisodePage) "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
         val doc = app.get(url, headers = baseHeaders).document
 
-
-        // Helper: make a src attribute value absolute
         fun toAbsUrl(src: String): String? {
             if (src.isBlank() || src.startsWith("data:")) return null
             return when {
                 src.startsWith("http") -> src
                 src.startsWith("//")   -> "https:$src"
                 src.startsWith("/")    -> "$mainUrl$src"
-                else                   -> "$mainUrl/$src"  // bare relative path
+                else                   -> "$mainUrl/$src"
             }
         }
 
-        // Helper: strip site suffix from alt-derived titles ("Name - Anizm.TV" → "Name")
         fun cleanTitle(raw: String): String =
             raw.replace(Regex("""\s*-\s*Anizm[.\w]*$""", RegexOption.IGNORE_CASE), "").trim()
 
@@ -183,17 +187,12 @@ class AnizleProvider : MainAPI() {
                 val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
                 val isEpLink = href.contains("-bolum")
 
-                // ── Poster extraction ────────────────────────────────────────
-                // img.attr("src") returns the raw relative path; abs:src is empty because
-                // Jsoup has no base URI. Manually resolve relative paths.
                 val img = el.selectFirst("img")
                 val poster: String? = img?.let {
                     toAbsUrl(it.attr("src"))
                         ?: toAbsUrl(it.attr("data-src"))
                         ?: toAbsUrl(it.attr("data-original"))
                 } ?: run {
-                    // posterBlock images are JS-loaded and commented out as <!--src="URL"-->
-                    // Extract from the HTML comment inside div.poster
                     val posterDiv = el.selectFirst("div.poster")
                     if (posterDiv != null) {
                         val html = posterDiv.html()
@@ -202,9 +201,7 @@ class AnizleProvider : MainAPI() {
                     } else null
                 }
 
-                // ── Title extraction ─────────────────────────────────────────
                 val title: String? = if (isEpLink) {
-                    // Anime name is in a sibling element outside the episode <a>
                     val container = el.parent()
                     val siblingAnimeLink = container
                         ?.select("a[href]:not([href*=-bolum])")
@@ -213,7 +210,6 @@ class AnizleProvider : MainAPI() {
                         ?: container?.selectFirst(".animeName, .anime-name, h4, h5, h3, strong")
                             ?.clone()?.also { it.select("span").remove() }
                             ?.text()?.trim()?.let { cleanTitle(it) }?.ifBlank { null }
-                        // Last resort: strip episode number and site name from img alt
                         ?: img?.attr("alt")?.trim()
                             ?.replace(Regex("""\s*\d+\.?\s*[Bb][oöô]l[uüû]m.*$"""), "")
                             ?.let { cleanTitle(it) }?.ifBlank { null }
@@ -263,8 +259,6 @@ class AnizleProvider : MainAPI() {
         val tags = doc.select("span.dataValue > span.tag > span.label, a[href*=/kategoriler/]")
             .map { it.text().trim() }.filter { it.isNotBlank() }.take(4).ifEmpty { null }
 
-        // Episodes are inside div#episodesMiddle
-        // Exclude trailers (fragman) and PVs; separate OVAs to the end
         val allLinks = doc.select("div#episodesMiddle a[href]")
             .ifEmpty { doc.select("div.episodeListTabContent a[href]") }
             .distinctBy { it.attr("abs:href") }
@@ -276,14 +270,12 @@ class AnizleProvider : MainAPI() {
                 val label = el.text().trim().ifBlank { continue }
                 val hrefL = href.lowercase()
                 val labelL = label.lowercase()
-                // Skip trailers and PVs
                 if (hrefL.contains("fragman") || labelL.contains("fragman")) continue
                 if (hrefL.contains("-pv") || labelL.contains(" pv") || labelL == "pv") continue
                 val isOva = hrefL.contains("ova") || labelL.contains("ova")
                 val ep = newEpisode(href) { name = label }
                 if (isOva) ovas.add(ep) else regular.add(ep)
             }
-            // Number regular episodes in order, then append OVAs unnumbered
             regular.mapIndexed { i, ep ->
                 val num = Regex("""(\d+)[.\s]*[Bb]ölüm""").find(ep.name ?: "")
                     ?.groupValues?.get(1)?.toIntOrNull()
@@ -304,22 +296,27 @@ class AnizleProvider : MainAPI() {
     }
 
     // ── Load links ────────────────────────────────────────────────────────────
-    // Step 1: div.fansubSecimKutucugu a[translator]  → translator URLs
-    // Step 2: GET translator URL (XHR) → JSON {data: html}
-    //         html contains: a.videoPlayerButtons[video]
-    // Step 3: GET video URL (XHR) → JSON {player: html} → /player/{id}
-    // Step 4: GET /player/{id} → packed JS → FirePlayer hash (32 hex)
-    // Step 5: POST anizmplayer.com/player/index.php?data={hash}&do=getVideo
-    //         → JSON {hls, securedLink} or {videoSource}
+    //
+    // Confirmed flow from network capture (GET /video/1552459):
+    //
+    //  Step 1: Episode HTML → translator="URL" attrs
+    //  Step 2: GET translator URL (XHR + CSRF) → JSON {data: html} → video="URL" buttons
+    //  Step 3: GET /video/{id} with X-CSRF-TOKEN header
+    //          → JSON {player: '<iframe src="anizm.net/player/{id}">', status: "success"}
+    //          NOTE: Without X-CSRF-TOKEN this endpoint rejects the request.
+    //  Step 4: GET anizm.net/player/{id} → page with packed JS
+    //          → unpack → FirePlayer("{hash}")
+    //  Step 5: POST anizmplayer.com/player/index.php?data={hash}&do=getVideo
+    //          → JSON {hls: true, securedLink: "https://...master.m3u8"}
+    //
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        getSession() // ensure cookies active for all requests below
+        getSession() // ensure CSRF token is fresh
         android.util.Log.d("Anizle", "loadLinks: $data")
-
 
         val epHtml = try {
             app.get(data, headers = baseHeaders).text
@@ -329,7 +326,7 @@ class AnizleProvider : MainAPI() {
         }
         android.util.Log.d("Anizle", "Episode page len=${epHtml.length}")
 
-        // Step 1: translator buttons — regex like Python
+        // Step 1: translator buttons
         val translators = mutableListOf<Pair<String, String>>()
         Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
             .findAll(epHtml).forEach { m ->
@@ -355,8 +352,7 @@ class AnizleProvider : MainAPI() {
 
             // Step 2: GET translator URL → JSON {data: html} → video buttons
             val trText = try {
-                app.get(trUrl,
-                    headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
+                app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to mainUrl)).text
             } catch (e: Exception) {
                 android.util.Log.e("Anizle", "Translator fetch error: ${e.message}"); continue
             }
@@ -369,7 +365,7 @@ class AnizleProvider : MainAPI() {
                 continue
             }
 
-            // video="URL" data-video-name="Name" — exact Python pattern
+            // video="URL" data-video-name="Name"
             val videos = mutableListOf<Pair<String, String>>()
             Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
                 .findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
@@ -377,12 +373,10 @@ class AnizleProvider : MainAPI() {
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
             }
-            // Fallback: raw XHR response as plain HTML (if not JSON)
             if (videos.isEmpty() && trText.isNotBlank()) {
                 Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
                     .findAll(trText).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
             }
-            // Fallback: videos pre-embedded in episode page for active (first) translator
             if (videos.isEmpty() && trUrl == translators.first().first) {
                 Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
                     .findAll(epHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
@@ -394,13 +388,10 @@ class AnizleProvider : MainAPI() {
                     android.util.Log.d("Anizle", "Step2: using ${videos.size} videos from epHtml")
             }
             android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
+
             for ((videoUrl, videoName) in videos) {
                 val videoNameL = videoName.lowercase()
 
-                // Only handle hosts we can extract.
-                // Aincrad → FirePlayer (anizmplayer.com)
-                // GDrive  → Google Drive direct link
-                // Others  → loadExtractor (Voe, FileMoon, UQload, Vidmoly, Sibnet, SendVid, etc.)
                 val isAincrad = videoNameL.contains("aincrad")
                 val isGdrive  = videoNameL.contains("gdrive") || videoNameL.contains("google")
                 val isKnownHost = isAincrad || isGdrive ||
@@ -410,121 +401,101 @@ class AnizleProvider : MainAPI() {
                     videoNameL.contains("doodstream") || videoNameL.contains("ok.ru")   ||
                     videoNameL.contains("odnoklassniki") || videoNameL.contains("sistenn")
                 if (!isKnownHost) {
-                    android.util.Log.d("Anizle", "Step4: skipping unknown host $videoName")
+                    android.util.Log.d("Anizle", "Step3: skipping unknown host $videoName")
                     continue
                 }
 
-                android.util.Log.d("Anizle", "Step4: processing $videoName -> $videoUrl")
+                android.util.Log.d("Anizle", "Step3: processing $videoName -> $videoUrl")
 
-                fun isCfPage(h: String) = h.contains("Just a moment", ignoreCase = true) ||
-                    h.contains("cf-browser-verification", ignoreCase = true)
-                fun hasFirePlayer(h: String) = h.contains("FirePlayer", ignoreCase = true) ||
-                    h.contains("eval(function(p,a,c,k", ignoreCase = true) ||
-                    h.contains("anizmplayer.com", ignoreCase = true)
-                // Extract numeric ID from the video URL
-                val playerId = Regex("""/(?:video|player)/(\d+)""").find(videoUrl)?.groupValues?.get(1)
-                if (playerId == null) {
-                    android.util.Log.w("Anizle", "Step3: no playerId in $videoUrl"); continue
-                }
+                val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
 
-                // Step 3: Resolve anizmplayer hash — three attempts, cheapest first.
+                // ── Resolve the player page ──────────────────────────────────
                 //
-                // Path A: hash already embedded in trHtml/trText from Step 2 XHR.
-                //         Most sites put it in an iframe src or data attr in the same response.
-                //         Zero extra requests if found.
+                // Network capture shows /video/{id} returns JSON:
+                //   { "player": "<iframe src='https://anizm.net/player/{id}'>", "status": "success" }
                 //
-                // Path B: GET anizmplayer.com/video/{numericId} directly.
-                //         anizmplayer.com has no Cloudflare — if the numeric ID maps to a page,
-                //         either the URL itself contains the hash or Content-Location header does.
+                // We must:
+                //   1. GET /video/{id} with X-CSRF-TOKEN (required!) → parse JSON["player"] iframe src
+                //   2. GET anizm.net/player/{id} → packed JS page → extract FirePlayer hash
                 //
-                // Path B2: plain GET anizm.net/video/{id} using session cf_clearance cookie.
+                // Path A: Check if hash is already embedded in step2 XHR responses (zero extra requests)
+                // Path B: Follow the proper /video/{id} → /player/{id} chain
+                //
                 var pageHtml = ""
-                var step3Html = ""
 
-                // ── Path A: scan XHR response for embedded hash ──────────────
+                // ── Path A: scan existing HTML for embedded anizmplayer hash ─
                 val hashRe = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
-                // Also scan epHtml — the episode page often pre-embeds the active video iframe.
                 val embeddedHash = hashRe.find(trHtml)?.groupValues?.get(1)
                     ?: hashRe.find(trText)?.groupValues?.get(1)
                     ?: hashRe.find(epHtml)?.groupValues?.get(1)
                 if (embeddedHash != null) {
-                    android.util.Log.d("Anizle", "Step3 PathA: hash=$embeddedHash found in XHR response")
-                    pageHtml = "anizmplayer.com/video/$embeddedHash"  // synthetic marker, just needs to contain the URL
-                    step3Html = pageHtml
+                    android.util.Log.d("Anizle", "Step3 PathA: embedded hash=$embeddedHash")
+                    pageHtml = "anizmplayer.com/video/$embeddedHash" // synthetic — contains the hash URL
                 }
 
-                // ── Path B: anizmplayer.com/video/{numericId} (no CF) ────────
-                if (pageHtml.isBlank() && playerId != null) {
-                    val directPlayerUrl = "$playerBase/video/$playerId"
-                    android.util.Log.d("Anizle", "Step3 PathB: $directPlayerUrl")
-                    val bRaw = try {
-                        app.get(directPlayerUrl,
-                            headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                    } catch (e: Exception) {
-                        android.util.Log.w("Anizle", "Step3 PathB error: ${e.message}"); ""
-                    }
-                    android.util.Log.d("Anizle", "Step3 PathB: len=${bRaw.length} snippet=${bRaw.take(200)}")
-                    if (bRaw.isNotBlank() && !isCfPage(bRaw)) {
-                        if (hasFirePlayer(bRaw) || bRaw.contains("drive.google.com", ignoreCase = true)) {
-                            pageHtml = bRaw; step3Html = bRaw
-                        }
-                    }
-                }
-
-                // ── Path B2: plain GET anizm.net/video/{id} (no cfKiller) ────
-                // The homepage cf_clearance from getSession() may cover this endpoint.
+                // ── Path B: GET /video/{id} with X-CSRF-TOKEN → follow iframe to /player/{id} ─
                 if (pageHtml.isBlank()) {
-                    android.util.Log.d("Anizle", "Step3 PathB2: plain GET $videoUrl")
-                    val b2Raw = try {
-                        app.get(videoUrl, headers = xhrHeaders + mapOf("Referer" to "$mainUrl/")).text
+                    android.util.Log.d("Anizle", "Step3 PathB: GET $videoUrl (with CSRF token)")
+                    val videoJson = try {
+                        app.get(videoUrl, headers = xhrHeadersWithCsrf).text
                     } catch (e: Exception) {
-                        android.util.Log.w("Anizle", "Step3 PathB2 error: ${e.message}"); ""
+                        android.util.Log.w("Anizle", "Step3 PathB /video fetch error: ${e.message}"); ""
                     }
-                    android.util.Log.d("Anizle", "Step3 PathB2: len=${b2Raw.length} cf=${isCfPage(b2Raw)} snip=${b2Raw.take(120)}")
-                    if (b2Raw.isNotBlank() && !isCfPage(b2Raw)) {
-                        val parsed = try {
-                            val obj = JSONObject(b2Raw)
-                            obj.optString("player","").ifBlank{obj.optString("data","")}.ifBlank{obj.optString("html","")}
-                        } catch (_: Exception) { b2Raw }
-                        if (hasFirePlayer(parsed) || parsed.contains("drive.google.com", ignoreCase = true)) {
-                            pageHtml = parsed; step3Html = parsed
-                            android.util.Log.d("Anizle", "Step3 PathB2: success")
+                    android.util.Log.d("Anizle", "Step3 PathB: len=${videoJson.length} snippet=${videoJson.take(120)}")
+
+                    if (videoJson.isNotBlank()) {
+                        // Parse the JSON and extract the iframe src from the "player" field.
+                        // e.g. player = "<iframe ... src=\"https://anizm.net/player/1552459\"></iframe>"
+                        val playerIframeSrc = try {
+                            val obj = JSONObject(videoJson)
+                            val playerField = obj.optString("player", "")
+                            android.util.Log.d("Anizle", "Step3 PathB: player field = ${playerField.take(120)}")
+                            // Extract src="..." from the iframe HTML
+                            Regex("""src=["']([^"']+)["']""").find(playerField)?.groupValues?.get(1)
+                                ?.replace("\\/", "/") // unescape JSON-encoded slashes
+                        } catch (e: Exception) {
+                            android.util.Log.w("Anizle", "Step3 PathB JSON parse error: ${e.message}"); null
+                        }
+                        android.util.Log.d("Anizle", "Step3 PathB: playerIframeSrc=$playerIframeSrc")
+
+                        if (playerIframeSrc != null) {
+                            // Fetch the player page — this is the packed JS page with FirePlayer hash.
+                            // anizm.net/player/{id} uses the same cf_clearance from getSession().
+                            android.util.Log.d("Anizle", "Step3 PathB: fetching player page $playerIframeSrc")
+                            val playerPageHtml = try {
+                                app.get(
+                                    playerIframeSrc,
+                                    headers = baseHeaders + mapOf("Referer" to "$mainUrl/")
+                                ).text
+                            } catch (e: Exception) {
+                                android.util.Log.w("Anizle", "Step3 PathB player page error: ${e.message}"); ""
+                            }
+                            android.util.Log.d("Anizle", "Step3 PathB: player page len=${playerPageHtml.length} hasFirePlayer=${playerPageHtml.contains("FirePlayer", ignoreCase=true)}")
+
+                            if (playerPageHtml.isNotBlank()) {
+                                pageHtml = playerPageHtml
+                            }
                         }
                     }
                 }
-
-                // Path C (cfKiller) REMOVED: anizm.net/video/{id} has an interactive Cloudflare
-                // Turnstile that cfKiller cannot solve. Its 120s timeout consumes the entire
-                // coroutine budget, causing all subsequent translator XHR calls to fail immediately.
 
                 if (pageHtml.isBlank()) {
                     android.util.Log.w("Anizle", "Step3: all paths failed for $videoName — skipping")
                     continue
                 }
 
-                val label = "$fansubName - ${videoName.replace("(Reklamsız)", "").replace("(reklamsız)", "").trim()}"
-
                 // ── GDrive path ──────────────────────────────────────────────
-                // step3Html is already populated from the player page fetch above.
-                // No separate fetch needed; no cfKiller.
                 if (isGdrive) {
                     fun extractDriveId(html: String): String? =
                         Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
                         ?: Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(html)?.groupValues?.get(1)
 
-                    val fileId = extractDriveId(step3Html).also {
-                        if (it != null) android.util.Log.d("Anizle", "GDrive: fileId=$it")
-                    }
+                    val fileId = extractDriveId(pageHtml)
                     if (fileId == null) {
-                        android.util.Log.w("Anizle", "GDrive: no file ID in page (len=${step3Html.length}) — skipping")
+                        android.util.Log.w("Anizle", "GDrive: no file ID in page — skipping")
                         continue
                     }
-                    android.util.Log.d("Anizle", "GDrive: fileId=$fileId")
-
-                    // Direct Google Drive download URL — stable, no session expiry, no third-party CDN.
-                    // confirm=t bypasses the "large file" interstitial Google shows for big files.
                     val directUrl = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t"
-                    android.util.Log.d("Anizle", "GDrive: directUrl=$directUrl")
                     callback(newExtractorLink(
                         source = label,
                         name   = label,
@@ -538,10 +509,8 @@ class AnizleProvider : MainAPI() {
                     continue
                 }
 
-                // ── Generic loadExtractor path (Voe, FileMoon, UQload, Vidmoly, Sibnet, etc.) ─
-                if (!isAincrad && !isGdrive) {
-                    // pageHtml should contain the player page HTML with an embedded iframe/video src.
-                    // Extract any URL that looks like an embed (iframe src or video src).
+                // ── Generic loadExtractor path (Voe, FileMoon, UQload, etc.) ─
+                if (!isAincrad) {
                     val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                         .find(pageHtml)?.groupValues?.get(1)
                         ?: Regex("""<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
@@ -550,15 +519,14 @@ class AnizleProvider : MainAPI() {
                     if (embedUrl != null) {
                         loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
                         found = true
-                    } else {
-                        android.util.Log.w("Anizle", "loadExtractor: no embed URL in pageHtml for $videoName")
                     }
                     continue
                 }
 
                 // ── Aincrad / FirePlayer path ────────────────────────────────
+                // pageHtml is the player page from anizm.net/player/{id}
                 val fireId = extractFireplayerId(pageHtml)
-                android.util.Log.d("Anizle", "Step3/4: fireId=$fireId (pageHtml len=${pageHtml.length})")
+                android.util.Log.d("Anizle", "Step4: fireId=$fireId (pageHtml len=${pageHtml.length})")
                 fireId ?: continue
 
                 val playerReferer = "$playerBase/player/$fireId"
@@ -570,9 +538,7 @@ class AnizleProvider : MainAPI() {
                     "Origin"           to playerBase,
                 )
 
-                // Step 5: POST do=getVideo → HLS master.m3u8 for streaming.
-                // ExoPlayer handles the separate audio track natively in the player.
-                // Downloads should use the GDrive link (registered earlier) which is a direct MP4.
+                // Step 5: POST do=getVideo → HLS master.m3u8
                 val streamText = try {
                     app.post(
                         "$playerBase/player/index.php?data=$fireId&do=getVideo",
@@ -611,12 +577,8 @@ class AnizleProvider : MainAPI() {
     
     // ── Stream helpers ───────────────────────────────────────────────────────
 
-    // Fetches a master.m3u8, picks the highest-quality sub-playlist, and returns
-    // its absolute URL. Returns null if the manifest can't be fetched or parsed.
     private suspend fun resolveM3u8Quality(masterUrl: String): String? {
         val master = try { app.get(masterUrl).text } catch (_: Exception) { return null }
-        // Lines starting with "#EXT-X-STREAM-INF" are followed by a playlist URL.
-        // Pick the one with the highest BANDWIDTH or RESOLUTION value.
         data class Entry(val bandwidth: Int, val url: String)
         val entries = mutableListOf<Entry>()
         val lines = master.lines()
@@ -643,7 +605,6 @@ class AnizleProvider : MainAPI() {
 
     private fun extractFireplayerId(html: String): String? {
         // Fast path: hash directly in anizmplayer.com URL
-        // e.g. https://anizmplayer.com/video/a6e45e77e2828da5826939b2446b7495
         Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
             .find(html)?.groupValues?.get(1)?.let { return it }
         val evalMatch = Regex(
@@ -662,7 +623,7 @@ class AnizleProvider : MainAPI() {
                     ?.groupValues?.get(1)?.let { return it }
             }
         }
-        return Regex("""FirePlayer\s*\(["']([a-f0-9]{32})["']""")
+        return Regex("""FirePlayer\(["']([a-f0-9]{32})["']""")
             .find(html)?.groupValues?.get(1)
     }
 
