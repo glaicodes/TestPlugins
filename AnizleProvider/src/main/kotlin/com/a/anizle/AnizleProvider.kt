@@ -10,11 +10,11 @@ import android.webkit.WebSettings
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 /**
  * Video link chain:
@@ -85,16 +85,23 @@ class AnizleProvider : MainAPI() {
     // CF blocks /player/{numId} from OkHttp (TLS fingerprint mismatch).
     // A real Android WebView has a genuine browser TLS stack and solves CF.
     // We load the page and intercept the anizmplayer.com iframe URL.
+    // Uses only kotlin.coroutines (stdlib) + Android framework — no kotlinx.
     private suspend fun resolvePlayerHash(numId: String, timeoutMs: Long = 35_000): String? {
         val targetUrl = "$mainUrl/player/$numId"
         android.util.Log.d("Anizle", "WebView: loading $targetUrl")
         val hashPattern = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
 
-        return withContext(Dispatchers.Main) {
-            suspendCancellableCoroutine { cont ->
+        return suspendCoroutine { cont ->
+            val handler = android.os.Handler(Looper.getMainLooper())
+            handler.post {
                 var resumed = false
-                val ctx = com.lagradost.cloudstream3.AcraApplication.context
-                    ?: run { cont.resume(null); return@suspendCancellableCoroutine }
+                val ctx = try {
+                    com.lagradost.cloudstream3.AcraApplication.context
+                } catch (_: Exception) { null }
+                if (ctx == null) {
+                    android.util.Log.e("Anizle", "WebView: no app context")
+                    cont.resume(null); return@post
+                }
 
                 val webView = WebView(ctx).apply {
                     settings.javaScriptEnabled = true
@@ -116,18 +123,12 @@ class AnizleProvider : MainAPI() {
                     }
                 }
 
-                // Timeout handler
-                val handler = android.os.Handler(Looper.getMainLooper())
+                // Timeout
                 val timeoutRunnable = Runnable {
                     android.util.Log.w("Anizle", "WebView: timeout after ${timeoutMs}ms")
                     finish(null)
                 }
                 handler.postDelayed(timeoutRunnable, timeoutMs)
-
-                cont.invokeOnCancellation {
-                    handler.removeCallbacks(timeoutRunnable)
-                    handler.post { finish(null) }
-                }
 
                 webView.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(
@@ -141,7 +142,7 @@ class AnizleProvider : MainAPI() {
                             android.util.Log.d("Anizle", "WebView: intercepted hash=$hash from $url")
                             handler.removeCallbacks(timeoutRunnable)
                             handler.post { finish(hash) }
-                            // Return empty response to prevent actually loading the iframe
+                            // Block the iframe from actually loading
                             return WebResourceResponse(
                                 "text/plain", "utf-8",
                                 ByteArrayInputStream(ByteArray(0))
