@@ -42,7 +42,7 @@ class AnizleProvider : MainAPI() {
             csrfToken = Regex("""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
                 ?: Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""").find(html)?.groupValues?.get(1)
             sessionFetchedAt = System.currentTimeMillis()
-            log("session: csrf=${csrfToken?.take(8)}")
+            log("session: ok")
         } catch (e: Exception) { log("session error: ${e.message}") }
     }
 
@@ -56,95 +56,140 @@ class AnizleProvider : MainAPI() {
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Origin" to mainUrl, "Referer" to "$mainUrl/",
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
 
-    // ── Embed resolver ──────────────────────────────────────────────────────
-    // Returns map of numId -> "ap:{hash}" | "gd:{fileId}" | "url:{embedUrl}"
-    private suspend fun resolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
-        if (numIds.isEmpty()) return emptyMap()
-        val results = mutableMapOf<String, String>()
-        val apRe = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
-        val gdRe = Regex("""drive\.google\.com/(?:file/d/|uc\?[^"]*id=)([A-Za-z0-9_-]{25,})""")
+    // ── All-in-WebView resolver ─────────────────────────────────────────────
+    // Loads episode page in WebView, extracts translators + video lists via JS,
+    // then resolves each numId by injecting iframes with random delays.
+    // Returns: list of (fansubName, videoName, embedInfo) where embedInfo is
+    // "ap:{hash}" for anizmplayer or "gd:{fileId}" for GDrive
+    private data class ResolvedLink(val fansub: String, val videoName: String, val embed: String)
+
+    private suspend fun resolveAll(episodeUrl: String): List<ResolvedLink> {
+        val results = mutableListOf<ResolvedLink>()
 
         return suspendCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
             handler.post {
                 var done = false
                 val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (_: Exception) { null }
-                if (ctx == null) { cont.resume(emptyMap()); return@post }
+                if (ctx == null) { cont.resume(emptyList()); return@post }
 
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true; settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    settings.blockNetworkImage = true
+                    // Don't block images — stealth: looks like real browsing
                     settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-                fun finish() { if (!done) { done = true; try { wv.stopLoading(); wv.destroy() } catch (_: Exception) {}; cont.resume(results) } }
-
-                val globalTimeout = Runnable { log("resolve: global timeout (${results.size}/${numIds.size} done)"); finish() }
-                handler.postDelayed(globalTimeout, 55_000L)
-
-                var currentTarget = ""; var currentIdx = -1
-                val perIdTimeout = arrayOfNulls<Runnable>(1)
-
-                fun resolveNext() {
-                    perIdTimeout[0]?.let { handler.removeCallbacks(it) }
-                    currentIdx++
-                    if (currentIdx >= numIds.size || done) { handler.removeCallbacks(globalTimeout); finish(); return }
-                    currentTarget = numIds[currentIdx]
-                    val nid = numIds[currentIdx]
-                    log("resolve: [$currentIdx/${numIds.size}] numId=$nid")
-                    perIdTimeout[0] = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout for $nid"); resolveNext() } }
-                    handler.postDelayed(perIdTimeout[0]!!, 10_000L)
-                    wv.evaluateJavascript("""
-                        (function(){var old=document.getElementById('_pf');if(old)old.remove();
-                        var f=document.createElement('iframe');f.id='_pf';
-                        f.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
-                        f.src='/player/$nid';document.body.appendChild(f);})();
-                    """.trimIndent(), null)
+                fun finish() {
+                    if (!done) { done = true; try { wv.stopLoading(); wv.destroy() } catch (_: Exception) {}; cont.resume(results) }
                 }
 
+                val globalTimeout = Runnable { log("resolve: global timeout (${results.size} found)"); finish() }
+                handler.postDelayed(globalTimeout, 60_000L)
+
+                // State for iframe resolution phase
+                val apRe = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
+                val gdRe = Regex("""drive\.google\.com/(?:file/d/|uc\?[^"]*id=)([A-Za-z0-9_-]{25,})""")
+                var currentTarget = ""
+                var resolveIdx = -1
+                // Populated after translator fetch phase
+                data class WantedVideo(val numId: String, val name: String, val fansub: String)
+                val wanted = mutableListOf<WantedVideo>()
+                val hashMap = mutableMapOf<String, String>()
+                var uniqueIds = listOf<String>()
+                val perIdTimeout = arrayOfNulls<Runnable>(1)
+
+                fun resolveNextId() {
+                    perIdTimeout[0]?.let { handler.removeCallbacks(it) }
+                    resolveIdx++
+                    if (resolveIdx >= uniqueIds.size || done) {
+                        // All resolved — build results
+                        for (w in wanted) {
+                            val embed = hashMap[w.numId] ?: continue
+                            results.add(ResolvedLink(w.fansub, w.name, embed))
+                        }
+                        handler.removeCallbacks(globalTimeout)
+                        finish()
+                        return
+                    }
+                    currentTarget = uniqueIds[resolveIdx]
+                    val nid = uniqueIds[resolveIdx]
+                    log("resolve: [${resolveIdx}/${uniqueIds.size}] numId=$nid")
+
+                    perIdTimeout[0] = Runnable {
+                        if (currentTarget == nid && !done) { log("resolve: timeout for $nid"); resolveNextId() }
+                    }
+                    handler.postDelayed(perIdTimeout[0]!!, 10_000L)
+
+                    // Random delay 500-1500ms between iframes — mimics human clicking
+                    val delay = if (resolveIdx == 0) 0L else (500L + (Math.random() * 1000).toLong())
+                    handler.postDelayed({
+                        if (done) return@postDelayed
+                        wv.evaluateJavascript("""
+                            (function(){var old=document.getElementById('_pf');if(old)old.remove();
+                            var f=document.createElement('iframe');f.id='_pf';
+                            f.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+                            f.src='/player/$nid';document.body.appendChild(f);})();
+                        """.trimIndent(), null)
+                    }, delay)
+                }
+
+                // JS bridge
                 wv.addJavascriptInterface(object {
                     @android.webkit.JavascriptInterface
-                    fun h(v: String) {
+                    fun onHash(v: String) {
                         val tgt = currentTarget
-                        if (v.isNotBlank() && tgt.isNotBlank() && !results.containsKey(tgt)) {
-                            log("resolve: $v for numId=$tgt"); results[tgt] = v
+                        if (v.isNotBlank() && tgt.isNotBlank() && !hashMap.containsKey(tgt)) {
+                            log("resolve: $v for numId=$tgt"); hashMap[tgt] = v
                         }
-                        handler.post { resolveNext() }
+                        handler.post { resolveNextId() }
                     }
+                    @android.webkit.JavascriptInterface
+                    fun onVideos(json: String) {
+                        // Called from JS after fetching all translator data
+                        try {
+                            val arr = JSONArray(json)
+                            for (i in 0 until arr.length()) {
+                                val obj = arr.getJSONObject(i)
+                                wanted.add(WantedVideo(obj.getString("numId"), obj.getString("name"), obj.getString("fansub")))
+                            }
+                        } catch (e: Exception) { log("onVideos parse error: ${e.message}") }
+                        uniqueIds = wanted.map { it.numId }.distinct()
+                        log("resolve: ${wanted.size} wanted, ${uniqueIds.size} unique numIds")
+                        if (uniqueIds.isEmpty()) { handler.removeCallbacks(globalTimeout); finish(); return }
+                        resolveNextId()
+                    }
+                    @android.webkit.JavascriptInterface
+                    fun log(msg: String) { this@AnizleProvider.log("JS: $msg") }
                 }, "_b")
 
                 var pageReady = false
+
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
-
                         // Intercept anizmplayer.com → Aincrad hash
                         apRe.find(url)?.let { m ->
-                            handler.post { wv.evaluateJavascript("_b.h('ap:${m.groupValues[1]}')", null) }
+                            handler.post { wv.evaluateJavascript("_b.onHash('ap:${m.groupValues[1]}')", null) }
                             return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         }
                         // Intercept drive.google.com → GDrive file ID
                         gdRe.find(url)?.let { m ->
-                            log("resolve: intercepted GDrive url=$url")
-                            handler.post { wv.evaluateJavascript("_b.h('gd:${m.groupValues[1]}')", null) }
+                            log("resolve: intercepted GDrive: ${m.groupValues[1]}")
+                            handler.post { wv.evaluateJavascript("_b.onHash('gd:${m.groupValues[1]}')", null) }
                             return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         }
-
                         // Block ALL /player/ EXCEPT current target
                         if (url.contains("/player/")) {
                             val tgt = currentTarget
                             if (tgt.isBlank() || !url.endsWith("/player/$tgt"))
                                 return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         }
-                        // Block heavy resources
+                        // Block analytics only — let everything else (CSS/JS/images) load naturally
                         val l = url.lowercase()
-                        if (l.contains("statbest") || l.contains("analytics") ||
-                            l.endsWith(".png") || l.endsWith(".jpg") || l.endsWith(".gif") ||
-                            l.endsWith(".webp") || l.endsWith(".svg") || l.endsWith(".woff2") ||
-                            l.endsWith(".woff") || l.endsWith(".ttf"))
+                        if (l.contains("statbest") || l.contains("analytics") || l.contains("adservice") || l.contains("doubleclick"))
                             return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         return null
                     }
@@ -152,10 +197,72 @@ class AnizleProvider : MainAPI() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         if (!pageReady && url?.contains("anizm.net") == true) {
-                            pageReady = true; log("resolve: page ready, ${numIds.size} to resolve"); resolveNext()
+                            pageReady = true
+                            log("resolve: page loaded, extracting translators via JS")
+
+                            // Phase 1: Extract translator URLs from the loaded page,
+                            // fetch their video lists via JS fetch(), collect wanted videos,
+                            // then call back to Kotlin with the list.
+                            val extractJs = """
+                            (async function(){
+                                try {
+                                    // Find translator buttons
+                                    var trBtns = document.querySelectorAll('[translator]');
+                                    var translators = [];
+                                    trBtns.forEach(function(el){
+                                        var url = el.getAttribute('translator');
+                                        var name = el.getAttribute('data-fansub-name') || 'Fansub';
+                                        if(url && !translators.find(function(t){return t.url===url}))
+                                            translators.push({url:url, name:name});
+                                    });
+                                    _b.log('translators: ' + translators.length + ' ' + translators.map(function(t){return t.name}).join(','));
+                                    if(!translators.length){ _b.onVideos('[]'); return; }
+
+                                    var csrf = '';
+                                    var meta = document.querySelector('meta[name="csrf-token"]');
+                                    if(meta) csrf = meta.getAttribute('content') || '';
+
+                                    var allWanted = [];
+                                    for(var i=0; i<translators.length; i++){
+                                        var tr = translators[i];
+                                        try {
+                                            var resp = await fetch(tr.url, {
+                                                headers: {'X-Requested-With':'XMLHttpRequest',
+                                                    'X-CSRF-TOKEN': csrf,
+                                                    'Accept':'application/json, text/javascript, */*; q=0.01'},
+                                                credentials:'include'
+                                            });
+                                            var text = await resp.text();
+                                            var j = JSON.parse(text);
+                                            var html = j.data || '';
+                                            // Parse video buttons from HTML string
+                                            var div = document.createElement('div');
+                                            div.innerHTML = html;
+                                            var vBtns = div.querySelectorAll('[video]');
+                                            var names = [];
+                                            vBtns.forEach(function(el){
+                                                var vUrl = el.getAttribute('video');
+                                                var vName = el.getAttribute('data-video-name') || 'Player';
+                                                names.push(vName);
+                                                var vl = vName.toLowerCase();
+                                                if(vl.indexOf('aincrad')<0 && vl.indexOf('gdrive')<0 && vl.indexOf('google')<0 && vl.indexOf('drive')<0) return;
+                                                var m = vUrl.match(/\/video\/(\d+)/);
+                                                if(m) allWanted.push({numId:m[1], name:vName, fansub:tr.name});
+                                            });
+                                            _b.log(tr.name + ': ' + names.length + ' videos: ' + names.join(', '));
+                                        } catch(e){ _b.log('tr fetch error ' + tr.name + ': ' + e); }
+                                    }
+                                    _b.log('total wanted: ' + allWanted.length);
+                                    _b.onVideos(JSON.stringify(allWanted));
+                                } catch(e){ _b.log('extract error: ' + e); _b.onVideos('[]'); }
+                            })();
+                            """.trimIndent()
+                            view?.evaluateJavascript(extractJs, null)
                         }
                     }
                 }
+
+                // Single page load — the ONLY request to anizm.net
                 wv.loadUrl(episodeUrl)
             }
         }
@@ -226,7 +333,6 @@ class AnizleProvider : MainAPI() {
         val year = doc.select("span.dataValue, li, td").map { it.text().trim() }.firstOrNull { it.matches(Regex("""\d{4}""")) }?.toIntOrNull()
         val tags = doc.select("span.dataValue > span.tag > span.label, a[href*=/kategoriler/]").map { it.text().trim() }.filter { it.isNotBlank() }.take(4).ifEmpty { null }
         val allLinks = doc.select("div#episodesMiddle a[href]").ifEmpty { doc.select("div.episodeListTabContent a[href]") }.distinctBy { it.attr("abs:href") }
-        // Show everything except fragman/PV, sequential numbering
         val episodes = allLinks.mapNotNull { el ->
             val href = el.attr("abs:href").ifBlank { return@mapNotNull null }; val label = el.text().trim().ifBlank { return@mapNotNull null }
             val ll = label.lowercase()
@@ -240,59 +346,18 @@ class AnizleProvider : MainAPI() {
     // ── Load links ────────────────────────────────────────────────────────────
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         getSession(); log("loadLinks: $data")
-        val epHtml = try { app.get(data, headers = baseHeaders).text } catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return false }
-        log("loadLinks: page len=${epHtml.length}")
 
-        // Step 1: all translators
-        val translators = mutableListOf<Pair<String, String>>()
-        Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)""").findAll(epHtml).forEach { m ->
-            val u = m.groupValues[1]; if (u.isNotBlank() && translators.none { it.first == u }) translators += u to m.groupValues[2].ifBlank { "Fansub" }
-        }
-        if (translators.isEmpty()) Regex("""data-fansub-name="([^"]*)"[^>]*translator="([^"]+)""").findAll(epHtml).forEach { m ->
-            val u = m.groupValues[2]; if (u.isNotBlank() && translators.none { it.first == u }) translators += u to m.groupValues[1].ifBlank { "Fansub" }
-        }
-        log("loadLinks: ${translators.size} translators: ${translators.map { it.second }}")
-        if (translators.isEmpty()) return false
+        val resolved = try { resolveAll(data) } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}"); emptyList() }
+        log("loadLinks: ${resolved.size} links resolved")
 
-        // Step 2: collect wanted videos across all translators
-        data class VidInfo(val numId: String, val name: String, val fansubName: String)
-        val allWanted = mutableListOf<VidInfo>()
-        for ((trUrl, fansubName) in translators) {
-            val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text } catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); continue }
-            val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
-            if (trHtml.isBlank()) { log("loadLinks: empty data for $fansubName"); continue }
-            val videos = mutableListOf<Pair<String, String>>()
-            Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)""").findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
-            if (videos.isEmpty()) Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)""").findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
-            log("loadLinks: $fansubName has ${videos.size} videos: ${videos.map { it.second }}")
-            for ((videoUrl, videoName) in videos) {
-                val vl = videoName.lowercase()
-                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive")) continue
-                val numId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1) ?: continue
-                allWanted.add(VidInfo(numId, videoName, fansubName))
-                log("loadLinks: wanted: $fansubName/$videoName numId=$numId")
-            }
-        }
-        log("loadLinks: total wanted=${allWanted.size}")
-        if (allWanted.isEmpty()) return false
-
-        // Step 3: batch resolve all in one WebView
-        val uniqueIds = allWanted.map { it.numId }.distinct()
-        log("loadLinks: resolving ${uniqueIds.size} unique numIds")
-        val embedMap = try { resolveEmbeds(uniqueIds, data) } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}"); emptyMap() }
-        log("loadLinks: resolved ${embedMap.size}/${uniqueIds.size}: $embedMap")
-
-        // Step 4: process results
         var found = false
-        for (vi in allWanted) {
-            val embed = embedMap[vi.numId]
-            log("step4: ${vi.fansubName}/${vi.name} numId=${vi.numId} embed=${embed ?: "MISSING"}")
-            if (embed == null) continue
-            val label = "${vi.fansubName} - ${vi.name.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
+        for (r in resolved) {
+            val label = "${r.fansub} - ${r.videoName.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
+            log("step4: $label embed=${r.embed}")
 
             // ── Aincrad (ap:{hash}) ────────────────────────────────────
-            if (embed.startsWith("ap:")) {
-                val hash = embed.removePrefix("ap:")
+            if (r.embed.startsWith("ap:")) {
+                val hash = r.embed.removePrefix("ap:")
                 val playerRef = "$playerBase/player/$hash"
                 val aHeaders = mapOf(
                     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
@@ -300,25 +365,37 @@ class AnizleProvider : MainAPI() {
                     "Referer" to playerRef, "Origin" to playerBase)
                 val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
                     catch (e: Exception) { log("aincrad error: ${e.message}"); continue }
-                log("aincrad: getVideo len=${streamText.length}")
                 val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
                 val securedLink = json.optString("securedLink", "")
                 val videoSource = json.optString("videoSource", "")
+                log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.take(60)} source=${videoSource.take(60)}")
+
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    log("aincrad: HLS found for $label")
+                    // Primary: securedLink with auth tokens (plays immediately)
                     callback(newExtractorLink(source = label, name = label, url = securedLink, type = ExtractorLinkType.M3U8) {
-                        quality = Qualities.P1080.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
+                        quality = Qualities.P1080.value; referer = playerRef
+                        headers = mapOf("Origin" to playerBase, "Referer" to playerRef)
+                    })
                     found = true
+                    // Secondary: videoSource without expiry tokens (better for download)
+                    if (videoSource.isNotBlank() && videoSource != securedLink) {
+                        val dlLabel = "$label (DL)"
+                        callback(newExtractorLink(source = dlLabel, name = dlLabel, url = videoSource, type = ExtractorLinkType.M3U8) {
+                            quality = Qualities.P1080.value; referer = playerRef
+                            headers = mapOf("Origin" to playerBase, "Referer" to playerRef)
+                        })
+                    }
                 } else if (videoSource.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = label, url = videoSource, type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value; referer = playerRef })
+                    callback(newExtractorLink(source = label, name = label, url = videoSource, type = ExtractorLinkType.VIDEO) {
+                        quality = Qualities.Unknown.value; referer = playerRef })
                     found = true
                 }
                 continue
             }
 
             // ── GDrive (gd:{fileId}) ───────────────────────────────────
-            if (embed.startsWith("gd:")) {
-                val fileId = embed.removePrefix("gd:")
+            if (r.embed.startsWith("gd:")) {
+                val fileId = r.embed.removePrefix("gd:")
                 log("gdrive: fileId=$fileId for $label")
                 callback(newExtractorLink(source = label, name = label,
                     url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
