@@ -67,8 +67,12 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
-    // Loads episode page ONCE, resolves each numId by injecting iframes.
-    // Blocks the page's own player iframe so each numId gets its own hash.
+    private fun log(msg: String) {
+        android.util.Log.d("Anizle", msg)
+    }
+
+    // Loads episode page ONCE, resolves each numId by injecting iframes sequentially.
+    // Blocks the page's default player iframe so each numId gets its own hash.
     private suspend fun resolveHashes(
         numIds: List<String>,
         episodeUrl: String
@@ -105,17 +109,15 @@ class AnizleProvider : MainAPI() {
                     }
                 }
 
-                val globalTimeout = Runnable { finish() }
-                handler.postDelayed(globalTimeout, 50_000L)
+                val globalTimeout = Runnable { log("resolve: global timeout"); finish() }
+                handler.postDelayed(globalTimeout, 55_000L)
 
                 var currentTarget = ""
                 var currentIdx = -1
                 val perIdTimeout = arrayOfNulls<Runnable>(1)
 
                 fun resolveNext() {
-                    // Remove previous per-id timeout
                     perIdTimeout[0]?.let { handler.removeCallbacks(it) }
-
                     currentIdx++
                     if (currentIdx >= numIds.size || done) {
                         handler.removeCallbacks(globalTimeout)
@@ -124,15 +126,17 @@ class AnizleProvider : MainAPI() {
                     }
                     currentTarget = numIds[currentIdx]
                     val nid = numIds[currentIdx]
+                    log("resolve: [$currentIdx/${numIds.size}] numId=$nid")
 
-                    // Per-numId timeout: skip after 8s
                     val r = Runnable {
-                        if (currentTarget == nid && !done) resolveNext()
+                        if (currentTarget == nid && !done) {
+                            log("resolve: timeout for $nid")
+                            resolveNext()
+                        }
                     }
                     perIdTimeout[0] = r
-                    handler.postDelayed(r, 8_000L)
+                    handler.postDelayed(r, 10_000L)
 
-                    // Remove old iframe, inject new one
                     val js = """
                     (function(){
                         var old=document.getElementById('_pf');
@@ -151,7 +155,10 @@ class AnizleProvider : MainAPI() {
                     @android.webkit.JavascriptInterface
                     fun h(v: String) {
                         val tgt = currentTarget
-                        if (v.isNotBlank() && tgt.isNotBlank()) results[tgt] = v
+                        if (v.isNotBlank() && tgt.isNotBlank()) {
+                            log("resolve: hash=$v for numId=$tgt")
+                            results[tgt] = v
+                        }
                         handler.post { resolveNext() }
                     }
                 }, "_b")
@@ -164,7 +171,6 @@ class AnizleProvider : MainAPI() {
                     ): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
 
-                        // Intercept anizmplayer → extract hash
                         val m = hp.find(url)
                         if (m != null) {
                             val hash = m.groupValues[1]
@@ -182,7 +188,7 @@ class AnizleProvider : MainAPI() {
                             }
                         }
 
-                        // Block heavy resources
+                        // Block heavy resources but allow CSS/JS for stealth
                         val l = url.lowercase()
                         if (l.contains("statbest") || l.contains("analytics") ||
                             l.endsWith(".png") || l.endsWith(".jpg") ||
@@ -199,6 +205,7 @@ class AnizleProvider : MainAPI() {
                         super.onPageFinished(view, url)
                         if (!pageReady && url?.contains("anizm.net") == true) {
                             pageReady = true
+                            log("resolve: page ready, starting ${numIds.size} resolves")
                             resolveNext()
                         }
                     }
@@ -335,7 +342,7 @@ class AnizleProvider : MainAPI() {
         val epHtml = try { app.get(data, headers = baseHeaders).text }
             catch (_: Exception) { return false }
 
-        // Step 1: translator buttons
+        // Step 1: all translators
         val translators = mutableListOf<Pair<String, String>>()
         Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)"""")
             .findAll(epHtml).forEach { m ->
@@ -350,12 +357,13 @@ class AnizleProvider : MainAPI() {
                 }
         if (translators.isEmpty()) return false
 
-        var found = false
+        // Step 2: collect ALL wanted videos across ALL translators first
+        data class VidInfo(val numId: String, val name: String, val fansubName: String)
+        val allWanted = mutableListOf<VidInfo>()
 
         for ((trUrl, fansubName) in translators) {
             val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text }
                 catch (_: Exception) { continue }
-
             val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
             if (trHtml.isBlank()) continue
 
@@ -366,92 +374,106 @@ class AnizleProvider : MainAPI() {
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
 
-            // Filter: only Aincrad + GDrive
-            data class VidInfo(val numId: String, val name: String)
-            val wanted = mutableListOf<VidInfo>()
             for ((videoUrl, videoName) in videos) {
                 val vl = videoName.lowercase()
                 if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google")) continue
                 val numId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1) ?: continue
-                wanted.add(VidInfo(numId, videoName))
+                allWanted.add(VidInfo(numId, videoName, fansubName))
             }
-            if (wanted.isEmpty()) continue
+        }
 
-            // Batch resolve all hashes in one WebView
-            val uniqueIds = wanted.map { it.numId }.distinct()
-            val hashMap = try { resolveHashes(uniqueIds, data) } catch (_: Exception) { emptyMap() }
+        if (allWanted.isEmpty()) return false
 
-            for (vi in wanted) {
-                val hash = hashMap[vi.numId] ?: continue
-                val vl = vi.name.lowercase()
-                val label = "$fansubName - ${vi.name.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
-                val playerRef = "$playerBase/player/$hash"
+        // Step 3: batch resolve ALL unique numIds in ONE WebView
+        val uniqueIds = allWanted.map { it.numId }.distinct()
+        log("loadLinks: ${allWanted.size} wanted videos, ${uniqueIds.size} unique numIds")
+        val hashMap = try { resolveHashes(uniqueIds, data) } catch (_: Exception) { emptyMap() }
+        log("loadLinks: resolved ${hashMap.size}/${uniqueIds.size} hashes")
 
-                // ── Aincrad ────────────────────────────────────────────
-                if (vl.contains("aincrad")) {
-                    val aHeaders = mapOf(
-                        "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept"           to "application/json, */*; q=0.01",
-                        "Referer"          to playerRef,
-                        "Origin"           to playerBase,
-                    )
-                    val streamText = try {
-                        app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text
-                    } catch (_: Exception) { continue }
+        // Step 4: process each video
+        var found = false
+        for (vi in allWanted) {
+            val hash = hashMap[vi.numId] ?: continue
+            val vl = vi.name.lowercase()
+            val label = "${vi.fansubName} - ${vi.name.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
+            val playerRef = "$playerBase/player/$hash"
 
-                    val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
-                    val securedLink = json.optString("securedLink", "")
-                    val videoSource = json.optString("videoSource", "")
-
-                    if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                        callback(newExtractorLink(
-                            source = label, name = label, url = securedLink,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            quality = Qualities.P1080.value
-                            referer = playerRef
-                            headers = mapOf("Origin" to playerBase, "Referer" to playerRef)
-                        })
-                        found = true
-                    } else if (videoSource.isNotBlank()) {
-                        callback(newExtractorLink(
-                            source = label, name = label, url = videoSource,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            quality = Qualities.Unknown.value
-                            referer = playerRef
-                        })
-                        found = true
-                    }
-                    continue
-                }
-
-                // ── GDrive ─────────────────────────────────────────────
-                val pageHtml = try {
-                    app.get(playerRef, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+            // ── Aincrad ────────────────────────────────────────────────
+            if (vl.contains("aincrad")) {
+                val aHeaders = mapOf(
+                    "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Accept"           to "application/json, */*; q=0.01",
+                    "Referer"          to playerRef,
+                    "Origin"           to playerBase,
+                )
+                val streamText = try {
+                    app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text
                 } catch (_: Exception) { continue }
 
-                val fileId = Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                    ?: Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                if (fileId != null) {
+                val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
+                val securedLink = json.optString("securedLink", "")
+                val videoSource = json.optString("videoSource", "")
+
+                if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
                     callback(newExtractorLink(
-                        source = label, name = label,
-                        url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
+                        source = label, name = label, url = securedLink,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        quality = Qualities.P1080.value
+                        referer = playerRef
+                        headers = mapOf("Origin" to playerBase, "Referer" to playerRef)
+                    })
+                    found = true
+                } else if (videoSource.isNotBlank()) {
+                    callback(newExtractorLink(
+                        source = label, name = label, url = videoSource,
                         type = ExtractorLinkType.VIDEO
                     ) {
                         quality = Qualities.Unknown.value
-                        referer = "https://drive.google.com/"
+                        referer = playerRef
                     })
                     found = true
-                } else {
-                    // Fallback: iframe embed
-                    val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                }
+                continue
+            }
+
+            // ── GDrive ─────────────────────────────────────────────────
+            val pageHtml = try {
+                app.get(playerRef, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+            } catch (e: Exception) {
+                log("gdrive page error: ${e.message}")
+                continue
+            }
+            log("gdrive page len=${pageHtml.length} hash=$hash")
+            log("gdrive page start: ${pageHtml.take(300)}")
+
+            // Try multiple patterns for Google Drive
+            val fileId = Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                ?: Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                ?: Regex("""drive\.google\.com/uc\?.*?id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+
+            if (fileId != null) {
+                log("gdrive fileId=$fileId")
+                callback(newExtractorLink(
+                    source = label, name = label,
+                    url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    quality = Qualities.Unknown.value
+                    referer = "https://drive.google.com/"
+                })
+                found = true
+            } else {
+                // Fallback: try iframe embed or direct link
+                val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                    .find(pageHtml)?.groupValues?.get(1)
+                    ?: Regex("""<source[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                         .find(pageHtml)?.groupValues?.get(1)
-                    if (embedUrl != null) {
-                        loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
-                        found = true
-                    }
+                log("gdrive fallback embedUrl=$embedUrl")
+                if (embedUrl != null) {
+                    loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
+                    found = true
                 }
             }
         }
