@@ -108,7 +108,7 @@ class AnizleProvider : MainAPI() {
                 val globalTimeout = Runnable { finish() }
                 handler.postDelayed(globalTimeout, 50_000L)
 
-                @Volatile var currentTarget = ""
+                var currentTarget = ""
                 var currentIdx = -1
                 val perIdTimeout = arrayOfNulls<Runnable>(1)
 
