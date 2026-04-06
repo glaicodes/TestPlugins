@@ -307,22 +307,16 @@ class AnizleProvider : MainAPI() {
         val allLinks = doc.select("div#episodesMiddle a[href]")
             .ifEmpty { doc.select("div.episodeListTabContent a[href]") }
             .distinctBy { it.attr("abs:href") }
-        val episodes = run {
-            val regular = mutableListOf<Episode>(); val ovas = mutableListOf<Episode>()
-            for (el in allLinks) {
-                val href  = el.attr("abs:href").ifBlank { continue }
-                val label = el.text().trim().ifBlank { continue }
-                if (href.contains("fragman") || label.lowercase().contains("fragman")) continue
-                if (href.contains("-pv") || label.lowercase().let { it.contains(" pv") || it == "pv" }) continue
-                val ep = newEpisode(href) { name = label }
-                if (href.contains("ova") || label.lowercase().contains("ova")) ovas.add(ep) else regular.add(ep)
-            }
-            regular.mapIndexed { i, ep ->
-                val num = Regex("""(\d+)[.\s]*[Bb]ölüm""").find(ep.name ?: "")?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("""-(\d+)[-.]?bolum""").find(ep.data)?.groupValues?.get(1)?.toIntOrNull()
-                    ?: (i + 1)
-                ep.apply { episode = num }
-            } + ovas
+        val episodes = allLinks.mapNotNull { el ->
+            val href  = el.attr("abs:href").ifBlank { return@mapNotNull null }
+            val label = el.text().trim().ifBlank { return@mapNotNull null }
+            val ll = label.lowercase()
+            // Only skip fragman (trailers) and PV (previews)
+            if (href.contains("fragman") || ll.contains("fragman")) return@mapNotNull null
+            if (href.contains("-pv-") || ll == "pv" || ll.endsWith(" pv")) return@mapNotNull null
+            newEpisode(href) { name = label }
+        }.mapIndexed { i, ep ->
+            ep.apply { episode = i + 1 }
         }
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
@@ -338,9 +332,11 @@ class AnizleProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         getSession()
+        log("loadLinks: $data")
 
         val epHtml = try { app.get(data, headers = baseHeaders).text }
-            catch (_: Exception) { return false }
+            catch (e: Exception) { log("loadLinks: episode page error: ${e.message}"); return false }
+        log("loadLinks: episode page len=${epHtml.length}")
 
         // Step 1: all translators
         val translators = mutableListOf<Pair<String, String>>()
@@ -355,6 +351,7 @@ class AnizleProvider : MainAPI() {
                     val u = m.groupValues[2]; if (u.isBlank()) return@forEach
                     if (translators.none { it.first == u }) translators += u to m.groupValues[1].ifBlank { "Fansub" }
                 }
+        log("loadLinks: ${translators.size} translators: ${translators.map { it.second }}")
         if (translators.isEmpty()) return false
 
         // Step 2: collect ALL wanted videos across ALL translators first
@@ -363,9 +360,9 @@ class AnizleProvider : MainAPI() {
 
         for ((trUrl, fansubName) in translators) {
             val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text }
-                catch (_: Exception) { continue }
+                catch (e: Exception) { log("loadLinks: translator fetch error ($fansubName): ${e.message}"); continue }
             val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
-            if (trHtml.isBlank()) continue
+            if (trHtml.isBlank()) { log("loadLinks: empty data for $fansubName"); continue }
 
             val videos = mutableListOf<Pair<String, String>>()
             Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
@@ -374,26 +371,36 @@ class AnizleProvider : MainAPI() {
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
 
+            // Log ALL video names for this translator
+            log("loadLinks: $fansubName has ${videos.size} videos: ${videos.map { it.second }}")
+
             for ((videoUrl, videoName) in videos) {
                 val vl = videoName.lowercase()
-                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google")) continue
+                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive")) continue
                 val numId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1) ?: continue
                 allWanted.add(VidInfo(numId, videoName, fansubName))
+                log("loadLinks: wanted: $fansubName/$videoName numId=$numId")
             }
         }
 
+        log("loadLinks: total wanted=${allWanted.size}")
         if (allWanted.isEmpty()) return false
 
         // Step 3: batch resolve ALL unique numIds in ONE WebView
         val uniqueIds = allWanted.map { it.numId }.distinct()
-        log("loadLinks: ${allWanted.size} wanted videos, ${uniqueIds.size} unique numIds")
-        val hashMap = try { resolveHashes(uniqueIds, data) } catch (_: Exception) { emptyMap() }
-        log("loadLinks: resolved ${hashMap.size}/${uniqueIds.size} hashes")
+        log("loadLinks: resolving ${uniqueIds.size} unique numIds: $uniqueIds")
+        val hashMap = try { resolveHashes(uniqueIds, data) } catch (e: Exception) {
+            log("loadLinks: resolveHashes error: ${e.message}")
+            emptyMap()
+        }
+        log("loadLinks: resolved ${hashMap.size}/${uniqueIds.size} hashes: $hashMap")
 
         // Step 4: process each video
         var found = false
         for (vi in allWanted) {
-            val hash = hashMap[vi.numId] ?: continue
+            val hash = hashMap[vi.numId]
+            log("step4: ${vi.fansubName}/${vi.name} numId=${vi.numId} hash=${hash ?: "MISSING"}")
+            if (hash == null) continue
             val vl = vi.name.lowercase()
             val label = "${vi.fansubName} - ${vi.name.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
             val playerRef = "$playerBase/player/$hash"
@@ -409,13 +416,15 @@ class AnizleProvider : MainAPI() {
                 )
                 val streamText = try {
                     app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text
-                } catch (_: Exception) { continue }
+                } catch (e: Exception) { log("aincrad getVideo error: ${e.message}"); continue }
+                log("aincrad getVideo len=${streamText.length}")
 
                 val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
                 val securedLink = json.optString("securedLink", "")
                 val videoSource = json.optString("videoSource", "")
 
                 if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
+                    log("aincrad: HLS link found for $label")
                     callback(newExtractorLink(
                         source = label, name = label, url = securedLink,
                         type = ExtractorLinkType.M3U8
