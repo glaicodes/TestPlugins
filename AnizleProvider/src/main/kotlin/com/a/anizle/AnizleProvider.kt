@@ -56,8 +56,9 @@ class AnizleProvider : MainAPI() {
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
 
     // ── Batch embed resolver ────────────────────────────────────────────────
-    // Loads episode page in WebView, injects iframes for each numId with
-    // random delays, intercepts anizmplayer/gdrive URLs.
+    // Uses loadDataWithBaseURL to establish anizm.net context instantly (no
+    // network request), then injects iframes for each numId with random delays.
+    // If CF rejects iframes from this context, fall back to wv.loadUrl.
     // Returns: numId -> "ap:{hash}" | "gd:{fileId}"
     private suspend fun resolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
         if (numIds.isEmpty()) return emptyMap()
@@ -75,7 +76,6 @@ class AnizleProvider : MainAPI() {
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true; settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    // Stealth: don't block images, let page load naturally
                     settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
@@ -86,21 +86,32 @@ class AnizleProvider : MainAPI() {
                 }
 
                 val globalTimeout = Runnable { log("resolve: global timeout (${results.size}/${numIds.size})"); finish() }
-                handler.postDelayed(globalTimeout, 55_000L)
+                handler.postDelayed(globalTimeout, 40_000L)
 
                 var currentTarget = ""; var currentIdx = -1
                 val perIdTimeout = arrayOfNulls<Runnable>(1)
+                var usedFallback = false
 
                 fun resolveNext() {
                     perIdTimeout[0]?.let { handler.removeCallbacks(it) }
                     currentIdx++
+
+                    // If first numId timed out, try fallback (loadUrl instead of loadData)
+                    if (currentIdx == 1 && results.isEmpty() && !usedFallback) {
+                        log("resolve: first numId failed, falling back to loadUrl")
+                        usedFallback = true
+                        currentIdx = -1
+                        wv.loadUrl(episodeUrl)
+                        return // onPageFinished will call resolveNext again
+                    }
+
                     if (currentIdx >= numIds.size || done) { handler.removeCallbacks(globalTimeout); finish(); return }
                     currentTarget = numIds[currentIdx]
                     val nid = numIds[currentIdx]
                     log("resolve: [${currentIdx}/${numIds.size}] numId=$nid")
 
                     perIdTimeout[0] = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
-                    handler.postDelayed(perIdTimeout[0]!!, 10_000L)
+                    handler.postDelayed(perIdTimeout[0]!!, 8_000L)
 
                     // Stealth: random delay 500-1500ms between iframes
                     val delay = if (currentIdx == 0) 0L else (500L + (Math.random() * 1000).toLong())
@@ -130,24 +141,20 @@ class AnizleProvider : MainAPI() {
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
-                        // Intercept anizmplayer → Aincrad
                         apRe.find(url)?.let { m ->
                             handler.post { wv.evaluateJavascript("_b.h('ap:${m.groupValues[1]}')", null) }
                             return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         }
-                        // Intercept Google Drive
                         gdRe.find(url)?.let { m ->
-                            log("resolve: GDrive intercepted: ${m.groupValues[1]}")
+                            log("resolve: GDrive: ${m.groupValues[1]}")
                             handler.post { wv.evaluateJavascript("_b.h('gd:${m.groupValues[1]}')", null) }
                             return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         }
-                        // Block ALL /player/ EXCEPT current target
                         if (url.contains("/player/")) {
                             val tgt = currentTarget
                             if (tgt.isBlank() || !url.endsWith("/player/$tgt"))
                                 return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                         }
-                        // Block only analytics/ads — everything else loads naturally
                         val l = url.lowercase()
                         if (l.contains("statbest") || l.contains("analytics") || l.contains("adservice") || l.contains("doubleclick"))
                             return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
@@ -156,15 +163,28 @@ class AnizleProvider : MainAPI() {
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        log("resolve: pageFinished url=$url pageReady=$pageReady")
-                        if (!pageReady && url?.contains("anizm.net") == true) {
+                        log("resolve: pageFinished url=$url ready=$pageReady fallback=$usedFallback")
+                        if (!pageReady) {
                             pageReady = true
-                            log("resolve: starting ${numIds.size} iframe resolves")
-                            resolveNext()
+                            if (usedFallback && url?.contains("anizm.net") == true) {
+                                log("resolve: fallback page loaded, restarting resolves")
+                                resolveNext()
+                            }
                         }
                     }
                 }
-                wv.loadUrl(episodeUrl)
+
+                // Fast path: loadDataWithBaseURL establishes anizm.net context
+                // instantly without any network request. No double page load.
+                log("resolve: loading blank with base=$episodeUrl")
+                wv.loadDataWithBaseURL(
+                    episodeUrl,
+                    "<html><body></body></html>",
+                    "text/html", "utf-8", null
+                )
+                // Start resolving immediately — no need to wait for onPageFinished
+                // since loadDataWithBaseURL is synchronous
+                handler.post { resolveNext() }
             }
         }
     }
@@ -248,7 +268,6 @@ class AnizleProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         getSession(); log("loadLinks: $data")
 
-        // Step 1-2: OkHttp fetches episode page + translator XHRs (fast, reliable)
         val epHtml = try { app.get(data, headers = baseHeaders).text } catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return false }
         log("loadLinks: page len=${epHtml.length}")
 
@@ -271,7 +290,7 @@ class AnizleProvider : MainAPI() {
             val videos = mutableListOf<Pair<String, String>>()
             Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)""").findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
             if (videos.isEmpty()) Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)""").findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
-            log("loadLinks: $fansubName: ${videos.size} videos: ${videos.map { it.second }}")
+            log("loadLinks: $fansubName: ${videos.map { it.second }}")
             for ((videoUrl, videoName) in videos) {
                 val vl = videoName.lowercase()
                 if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive")) continue
@@ -282,13 +301,11 @@ class AnizleProvider : MainAPI() {
         log("loadLinks: ${allWanted.size} wanted")
         if (allWanted.isEmpty()) return false
 
-        // Step 3: batch resolve in WebView
         val uniqueIds = allWanted.map { it.numId }.distinct()
         log("loadLinks: resolving ${uniqueIds.size} numIds")
         val embedMap = try { resolveEmbeds(uniqueIds, data) } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}"); emptyMap() }
         log("loadLinks: resolved ${embedMap.size}/${uniqueIds.size}: $embedMap")
 
-        // Step 4: process
         var found = false
         for (vi in allWanted) {
             val embed = embedMap[vi.numId]
@@ -311,11 +328,6 @@ class AnizleProvider : MainAPI() {
                     callback(newExtractorLink(source = label, name = label, url = securedLink, type = ExtractorLinkType.M3U8) {
                         quality = Qualities.P1080.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
                     found = true
-                    if (videoSource.isNotBlank() && videoSource != securedLink) {
-                        val dlLabel = "$label (DL)"
-                        callback(newExtractorLink(source = dlLabel, name = dlLabel, url = videoSource, type = ExtractorLinkType.M3U8) {
-                            quality = Qualities.P1080.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
-                    }
                 } else if (videoSource.isNotBlank()) {
                     callback(newExtractorLink(source = label, name = label, url = videoSource, type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value; referer = playerRef })
                     found = true
