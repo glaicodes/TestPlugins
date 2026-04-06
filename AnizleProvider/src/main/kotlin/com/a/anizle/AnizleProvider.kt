@@ -16,16 +16,6 @@ import java.io.ByteArrayInputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
-/**
- * Video link chain:
- *  Step 1: Episode HTML → translator="URL" attrs
- *  Step 2: GET translator URL (XHR) → JSON {data: html} → video="URL" buttons
- *  Step 3: numId from video URL → WebView JS fetch() bypasses CF:
- *          fetch(/video/{numId}) → JSON {player} → fetch(/player/{numId}) → hash
- *  Step 4a (Aincrad): POST anizmplayer.com/player/index.php?data={hash}&do=getVideo
- *  Step 4b (GDrive):  GET anizmplayer.com/player/{hash} → drive file ID
- *  Step 4c (others):  GET anizmplayer.com/player/{hash} → iframe → loadExtractor
- */
 class AnizleProvider : MainAPI() {
 
     override var mainUrl    = "https://anizm.net"
@@ -44,7 +34,6 @@ class AnizleProvider : MainAPI() {
     private suspend fun getSession() {
         val now = System.currentTimeMillis()
         if (csrfToken != null && (now - sessionFetchedAt) < sessionTtlMs) return
-        android.util.Log.d("Anizle", "getSession: refreshing")
         try {
             var resp = app.get(mainUrl, headers = baseHeaders)
             var html = resp.text
@@ -57,10 +46,7 @@ class AnizleProvider : MainAPI() {
                 ?: Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""")
                 .find(html)?.groupValues?.get(1)
             sessionFetchedAt = System.currentTimeMillis()
-            android.util.Log.d("Anizle", "CSRF: ${csrfToken?.take(10)}")
-        } catch (e: Exception) {
-            android.util.Log.e("Anizle", "getSession error: ${e.message}")
-        }
+        } catch (_: Exception) {}
     }
 
     private fun isCf(html: String) =
@@ -81,141 +67,144 @@ class AnizleProvider : MainAPI() {
         "Accept"           to "application/json, text/javascript, */*; q=0.01",
     )
 
-    // ── WebView iframe resolver ───────────────────────────────────────────
-    // CF blocks /player/{numId} from direct loads AND from fetch().
-    // BUT: iframe navigations from a same-origin page send Sec-Fetch-Dest:iframe
-    // headers, which CF may treat differently.
-    // Strategy: load the episode page (not CF-protected), then inject a hidden
-    // iframe pointing to /player/{numId}. If CF lets the iframe through,
-    // the iframe will load anizmplayer.com/video/{hash} — we intercept that.
-    private suspend fun resolvePlayerHash(
-        numId: String,
-        episodeUrl: String,
-        timeoutMs: Long = 30_000
-    ): String? {
-        android.util.Log.d("Anizle", "IFrame: resolving numId=$numId")
-        val hashPattern = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
+    // Loads episode page ONCE, resolves each numId by injecting iframes.
+    // Blocks the page's own player iframe so each numId gets its own hash.
+    private suspend fun resolveHashes(
+        numIds: List<String>,
+        episodeUrl: String
+    ): Map<String, String> {
+        if (numIds.isEmpty()) return emptyMap()
+        val results = mutableMapOf<String, String>()
+        val hp = Regex("""anizmplayer\.com/(?:video|player)/([a-f0-9]{32})""")
 
         return suspendCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
             handler.post {
-                var resumed = false
-                val ctx = try {
-                    com.lagradost.cloudstream3.AcraApplication.context
-                } catch (_: Exception) { null }
-                if (ctx == null) {
-                    cont.resume(null); return@post
-                }
+                var done = false
+                val ctx = try { com.lagradost.cloudstream3.AcraApplication.context }
+                    catch (_: Exception) { null }
+                if (ctx == null) { cont.resume(emptyMap()); return@post }
 
-                val webView = WebView(ctx).apply {
+                val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                     settings.blockNetworkImage = true
+                    settings.userAgentString =
+                        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                 }
-
                 CookieManager.getInstance().setAcceptCookie(true)
-                CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-                fun finish(hash: String?) {
-                    if (!resumed) {
-                        resumed = true
-                        try { webView.stopLoading() } catch (_: Exception) {}
-                        try { webView.destroy() } catch (_: Exception) {}
-                        cont.resume(hash)
+                fun finish() {
+                    if (!done) {
+                        done = true
+                        try { wv.stopLoading() } catch (_: Exception) {}
+                        try { wv.destroy() } catch (_: Exception) {}
+                        cont.resume(results)
                     }
                 }
 
-                val timeoutRunnable = Runnable {
-                    android.util.Log.w("Anizle", "IFrame: timeout")
-                    finish(null)
-                }
-                handler.postDelayed(timeoutRunnable, timeoutMs)
+                val globalTimeout = Runnable { finish() }
+                handler.postDelayed(globalTimeout, 50_000L)
 
-                // JS bridge
-                class JsBridge {
+                @Volatile var currentTarget = ""
+                var currentIdx = -1
+                val perIdTimeout = arrayOfNulls<Runnable>(1)
+
+                fun resolveNext() {
+                    // Remove previous per-id timeout
+                    perIdTimeout[0]?.let { handler.removeCallbacks(it) }
+
+                    currentIdx++
+                    if (currentIdx >= numIds.size || done) {
+                        handler.removeCallbacks(globalTimeout)
+                        finish()
+                        return
+                    }
+                    currentTarget = numIds[currentIdx]
+                    val nid = numIds[currentIdx]
+
+                    // Per-numId timeout: skip after 8s
+                    val r = Runnable {
+                        if (currentTarget == nid && !done) resolveNext()
+                    }
+                    perIdTimeout[0] = r
+                    handler.postDelayed(r, 8_000L)
+
+                    // Remove old iframe, inject new one
+                    val js = """
+                    (function(){
+                        var old=document.getElementById('_pf');
+                        if(old)old.remove();
+                        var f=document.createElement('iframe');
+                        f.id='_pf';
+                        f.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+                        f.src='/player/$nid';
+                        document.body.appendChild(f);
+                    })();
+                    """.trimIndent()
+                    wv.evaluateJavascript(js, null)
+                }
+
+                wv.addJavascriptInterface(object {
                     @android.webkit.JavascriptInterface
-                    fun onResult(hash: String) {
-                        android.util.Log.d("Anizle", "IFrame: onResult hash='$hash'")
-                        handler.removeCallbacks(timeoutRunnable)
-                        handler.post { finish(hash.ifBlank { null }) }
+                    fun h(v: String) {
+                        val tgt = currentTarget
+                        if (v.isNotBlank() && tgt.isNotBlank()) results[tgt] = v
+                        handler.post { resolveNext() }
                     }
-                    @android.webkit.JavascriptInterface
-                    fun log(msg: String) {
-                        android.util.Log.d("Anizle", "JS: $msg")
-                    }
-                }
-                webView.addJavascriptInterface(JsBridge(), "AnizleBridge")
+                }, "_b")
 
-                var pageLoaded = false
+                var pageReady = false
 
-                webView.webViewClient = object : WebViewClient() {
-                    // Intercept anizmplayer.com requests from the iframe
+                wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(
-                        view: WebView?,
-                        request: WebResourceRequest?
+                        view: WebView?, request: WebResourceRequest?
                     ): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
-                        val match = hashPattern.find(url)
-                        if (match != null) {
-                            val hash = match.groupValues[1]
-                            android.util.Log.d("Anizle", "IFrame: intercepted hash=$hash from $url")
-                            handler.removeCallbacks(timeoutRunnable)
-                            handler.post { finish(hash) }
-                            // Block the actual load
-                            return WebResourceResponse(
-                                "text/plain", "utf-8",
-                                ByteArrayInputStream(ByteArray(0))
-                            )
+
+                        // Intercept anizmplayer → extract hash
+                        val m = hp.find(url)
+                        if (m != null) {
+                            val hash = m.groupValues[1]
+                            handler.post { wv.evaluateJavascript("_b.h('$hash')", null) }
+                            return WebResourceResponse("text/plain", "utf-8",
+                                ByteArrayInputStream(ByteArray(0)))
                         }
-                        // Block heavy resources (images, fonts) but allow CSS/JS
-                        // (the page JS needs to run to set up the iframe context)
-                        val lurl = url.lowercase()
-                        if (lurl.contains("statbest") || lurl.contains("analytics") ||
-                            lurl.endsWith(".png") || lurl.endsWith(".jpg") ||
-                            lurl.endsWith(".gif") || lurl.endsWith(".webp") ||
-                            lurl.endsWith(".svg") || lurl.endsWith(".woff2") ||
-                            lurl.endsWith(".woff") || lurl.endsWith(".ttf")) {
-                            return WebResourceResponse(
-                                "text/plain", "utf-8",
-                                ByteArrayInputStream(ByteArray(0))
-                            )
+
+                        // Block ALL /player/ EXCEPT current target
+                        if (url.contains("/player/")) {
+                            val tgt = currentTarget
+                            if (tgt.isBlank() || !url.endsWith("/player/$tgt")) {
+                                return WebResourceResponse("text/plain", "utf-8",
+                                    ByteArrayInputStream(ByteArray(0)))
+                            }
+                        }
+
+                        // Block heavy resources
+                        val l = url.lowercase()
+                        if (l.contains("statbest") || l.contains("analytics") ||
+                            l.endsWith(".png") || l.endsWith(".jpg") ||
+                            l.endsWith(".gif") || l.endsWith(".webp") ||
+                            l.endsWith(".svg") || l.endsWith(".woff2") ||
+                            l.endsWith(".woff") || l.endsWith(".ttf")) {
+                            return WebResourceResponse("text/plain", "utf-8",
+                                ByteArrayInputStream(ByteArray(0)))
                         }
                         return null
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        if (url == null || resumed) return
-                        android.util.Log.d("Anizle", "IFrame: pageFinished $url (pageLoaded=$pageLoaded)")
-
-                        if (!pageLoaded && url.contains("anizm.net")) {
-                            pageLoaded = true
-                            // Inject a hidden iframe pointing to /player/{numId}
-                            // This is an IFRAME navigation (Sec-Fetch-Dest: iframe)
-                            // from a same-origin page — CF may allow this
-                            val injectJs = """
-                            (function(){
-                                AnizleBridge.log('injecting iframe for /player/$numId');
-                                var f = document.createElement('iframe');
-                                f.style.width = '1px';
-                                f.style.height = '1px';
-                                f.style.position = 'absolute';
-                                f.style.left = '-9999px';
-                                f.src = '/player/$numId';
-                                document.body.appendChild(f);
-                                AnizleBridge.log('iframe injected');
-                            })();
-                            """.trimIndent()
-                            view?.evaluateJavascript(injectJs, null)
+                        if (!pageReady && url?.contains("anizm.net") == true) {
+                            pageReady = true
+                            resolveNext()
                         }
                     }
                 }
 
-                // Load the episode page — not CF-protected
-                // Allow JS/CSS to run (needed for same-origin iframe context)
-                webView.loadUrl(episodeUrl)
+                wv.loadUrl(episodeUrl)
             }
         }
     }
@@ -231,7 +220,7 @@ class AnizleProvider : MainAPI() {
             )
             csrfToken?.let { params["_token"] = it }
             app.get("$mainUrl/searchAnime", headers = xhrHeaders, params = params).text
-        } catch (e: Exception) { android.util.Log.e("Anizle", "search error: ${e.message}"); return emptyList() }
+        } catch (_: Exception) { return emptyList() }
 
         return try {
             val arr = JSONObject(responseText).optJSONArray("data") ?: JSONArray(responseText)
@@ -245,7 +234,7 @@ class AnizleProvider : MainAPI() {
                              else "$mainUrl/storage/pcovers/$thumb"
                 newAnimeSearchResponse(title, "$mainUrl/$slug", TvType.Anime) { posterUrl = poster }
             }
-        } catch (e: Exception) { emptyList() }
+        } catch (_: Exception) { emptyList() }
     }
 
     // ── Home page ─────────────────────────────────────────────────────────────
@@ -342,11 +331,9 @@ class AnizleProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         getSession()
-        android.util.Log.d("Anizle", "loadLinks: $data")
 
         val epHtml = try { app.get(data, headers = baseHeaders).text }
-            catch (e: Exception) { android.util.Log.e("Anizle", "Episode page error: ${e.message}"); return false }
-        android.util.Log.d("Anizle", "Episode page len=${epHtml.length}")
+            catch (_: Exception) { return false }
 
         // Step 1: translator buttons
         val translators = mutableListOf<Pair<String, String>>()
@@ -361,19 +348,16 @@ class AnizleProvider : MainAPI() {
                     val u = m.groupValues[2]; if (u.isBlank()) return@forEach
                     if (translators.none { it.first == u }) translators += u to m.groupValues[1].ifBlank { "Fansub" }
                 }
-        android.util.Log.d("Anizle", "Step1: ${translators.size} translators")
         if (translators.isEmpty()) return false
 
         var found = false
 
         for ((trUrl, fansubName) in translators) {
-            android.util.Log.d("Anizle", "Step2: $fansubName -> $trUrl")
             val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text }
-                catch (e: Exception) { android.util.Log.e("Anizle", "Translator fetch: ${e.message}"); continue }
-            android.util.Log.d("Anizle", "Step2 len=${trText.length}")
+                catch (_: Exception) { continue }
 
             val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
-            if (trHtml.isBlank()) { android.util.Log.w("Anizle", "Step2: no data field"); continue }
+            if (trHtml.isBlank()) continue
 
             val videos = mutableListOf<Pair<String, String>>()
             Regex("""video="([^"]+)"[^>]*data-video-name="([^"]*)"""")
@@ -381,101 +365,93 @@ class AnizleProvider : MainAPI() {
             if (videos.isEmpty())
                 Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)"""")
                     .findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
-            android.util.Log.d("Anizle", "Step2: ${videos.size} videos")
 
-            // Collect all numIds for this translator, resolve ONE via WebView
-            // (WebView is slow, so resolve per-translator not per-video)
-            val numIdToVideos = mutableMapOf<String, MutableList<Pair<String, String>>>()
+            // Filter: only Aincrad + GDrive
+            data class VidInfo(val numId: String, val name: String)
+            val wanted = mutableListOf<VidInfo>()
             for ((videoUrl, videoName) in videos) {
+                val vl = videoName.lowercase()
+                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google")) continue
                 val numId = Regex("""/video/(\d+)""").find(videoUrl)?.groupValues?.get(1) ?: continue
-                numIdToVideos.getOrPut(numId) { mutableListOf() }.add(videoName to videoUrl)
+                wanted.add(VidInfo(numId, videoName))
             }
+            if (wanted.isEmpty()) continue
 
-            for ((numId, videoList) in numIdToVideos) {
-                android.util.Log.d("Anizle", "Step3: resolving numId=$numId (${videoList.size} videos)")
+            // Batch resolve all hashes in one WebView
+            val uniqueIds = wanted.map { it.numId }.distinct()
+            val hashMap = try { resolveHashes(uniqueIds, data) } catch (_: Exception) { emptyMap() }
 
-                // ── Step 3: get hash via WebView JS fetch ─────────────────
-                val hash = try { resolvePlayerHash(numId, data) } catch (e: Exception) {
-                    android.util.Log.e("Anizle", "Step3 WebView error: ${e.message}"); null
-                }
-                if (hash == null) {
-                    android.util.Log.w("Anizle", "Step3: no hash for numId=$numId"); continue
-                }
-                android.util.Log.d("Anizle", "Step3: hash=$hash")
+            for (vi in wanted) {
+                val hash = hashMap[vi.numId] ?: continue
+                val vl = vi.name.lowercase()
+                val label = "$fansubName - ${vi.name.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
+                val playerRef = "$playerBase/player/$hash"
 
-                // Process each video source that shares this numId
-                for ((videoName, _) in videoList) {
-                    val vl = videoName.lowercase()
-                    val isAincrad = vl.contains("aincrad")
-                    val isGdrive  = vl.contains("gdrive") || vl.contains("google")
-                    val isKnown = isAincrad || isGdrive ||
-                        vl.contains("voe") || vl.contains("filemoon") || vl.contains("uqload") ||
-                        vl.contains("vidmoly") || vl.contains("sibnet") || vl.contains("sendvid") ||
-                        vl.contains("doodstream") || vl.contains("ok.ru") ||
-                        vl.contains("odnoklassniki") || vl.contains("sistenn") ||
-                        vl.contains("liiivideo") || vl.contains("liivideo")
-                    if (!isKnown) { android.util.Log.d("Anizle", "Skip unknown: $videoName"); continue }
+                // ── Aincrad ────────────────────────────────────────────
+                if (vl.contains("aincrad")) {
+                    val aHeaders = mapOf(
+                        "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Accept"           to "application/json, */*; q=0.01",
+                        "Referer"          to playerRef,
+                        "Origin"           to playerBase,
+                    )
+                    val streamText = try {
+                        app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text
+                    } catch (_: Exception) { continue }
 
-                    val label = "$fansubName - ${videoName.replace(Regex("""\([Rr]eklamsız\)"""), "").trim()}"
-                    val playerRef = "$playerBase/player/$hash"
+                    val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
+                    val securedLink = json.optString("securedLink", "")
+                    val videoSource = json.optString("videoSource", "")
 
-                    // ── Step 4a: Aincrad ──────────────────────────────────
-                    if (isAincrad) {
-                        val aHeaders = mapOf(
-                            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept"           to "application/json, */*; q=0.01",
-                            "Referer"          to playerRef,
-                            "Origin"           to playerBase,
-                        )
-                        val streamText = try {
-                            app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text
-                        } catch (e: Exception) { android.util.Log.e("Anizle", "getVideo: ${e.message}"); continue }
-                        android.util.Log.d("Anizle", "Step4a: ${streamText.take(300)}")
-
-                        val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
-                        val securedLink = json.optString("securedLink", "")
-                        val videoSource = json.optString("videoSource", "")
-
-                        if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                            callback(newExtractorLink(source = label, name = label, url = securedLink,
-                                type = ExtractorLinkType.M3U8) { quality = Qualities.P1080.value; referer = playerRef })
-                            found = true; continue
-                        }
-                        if (videoSource.isNotBlank()) {
-                            callback(newExtractorLink(source = label, name = label, url = videoSource,
-                                type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value })
-                            found = true
-                        }
-                        continue
-                    }
-
-                    // ── Step 4b/c: fetch anizmplayer.com/player/{hash} (no CF) ─
-                    val pageHtml = try {
-                        app.get(playerRef, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
-                    } catch (e: Exception) { android.util.Log.e("Anizle", "Step4 page: ${e.message}"); continue }
-                    android.util.Log.d("Anizle", "Step4 page len=${pageHtml.length}")
-
-                    // ── Step 4b: GDrive ──────────────────────────────────
-                    if (isGdrive) {
-                        val fileId = Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                            ?: Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
-                        if (fileId == null) { android.util.Log.w("Anizle", "Step4b: no fileId"); continue }
-                        callback(newExtractorLink(source = label, name = label,
-                            url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
-                            type = ExtractorLinkType.VIDEO) {
-                            quality = Qualities.Unknown.value; referer = "https://drive.google.com/"
+                    if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
+                        callback(newExtractorLink(
+                            source = label, name = label, url = securedLink,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            quality = Qualities.P1080.value
+                            referer = playerRef
+                            headers = mapOf("Origin" to playerBase, "Referer" to playerRef)
                         })
-                        found = true; continue
+                        found = true
+                    } else if (videoSource.isNotBlank()) {
+                        callback(newExtractorLink(
+                            source = label, name = label, url = videoSource,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            quality = Qualities.Unknown.value
+                            referer = playerRef
+                        })
+                        found = true
                     }
+                    continue
+                }
 
-                    // ── Step 4c: other hosts ─────────────────────────────
+                // ── GDrive ─────────────────────────────────────────────
+                val pageHtml = try {
+                    app.get(playerRef, headers = baseHeaders + mapOf("Referer" to "$mainUrl/")).text
+                } catch (_: Exception) { continue }
+
+                val fileId = Regex("""[?&]id=([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                    ?: Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,})""").find(pageHtml)?.groupValues?.get(1)
+                if (fileId != null) {
+                    callback(newExtractorLink(
+                        source = label, name = label,
+                        url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        quality = Qualities.Unknown.value
+                        referer = "https://drive.google.com/"
+                    })
+                    found = true
+                } else {
+                    // Fallback: iframe embed
                     val embedUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                         .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""<source[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
-                            .find(pageHtml)?.groupValues?.get(1)
-                    android.util.Log.d("Anizle", "Step4c: $videoName embedUrl=$embedUrl")
-                    if (embedUrl != null) { loadExtractor(embedUrl, mainUrl, subtitleCallback, callback); found = true }
+                    if (embedUrl != null) {
+                        loadExtractor(embedUrl, mainUrl, subtitleCallback, callback)
+                        found = true
+                    }
                 }
             }
         }
