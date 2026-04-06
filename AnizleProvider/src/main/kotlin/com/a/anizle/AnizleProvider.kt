@@ -65,13 +65,18 @@ class AnizleProvider : MainAPI() {
 
     private suspend fun resolveAll(episodeUrl: String): List<ResolvedLink> {
         val results = mutableListOf<ResolvedLink>()
+        log("resolveAll: starting for $episodeUrl")
 
         return suspendCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
             handler.post {
                 var done = false
-                val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (_: Exception) { null }
-                if (ctx == null) { cont.resume(emptyList()); return@post }
+                log("resolveAll: handler.post executing")
+                val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (e: Exception) {
+                    log("resolveAll: context exception: ${e.message}"); null
+                }
+                if (ctx == null) { log("resolveAll: NO CONTEXT - returning empty"); cont.resume(emptyList()); return@post }
+                log("resolveAll: creating WebView")
 
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true; settings.domStorageEnabled = true
@@ -148,6 +153,7 @@ class AnizleProvider : MainAPI() {
                     }
                     @android.webkit.JavascriptInterface
                     fun onVideos(json: String) {
+                        log("resolveAll: onVideos called, json len=${json.length}")
                         // Called from JS after fetching all translator data
                         try {
                             val arr = JSONArray(json)
@@ -168,6 +174,12 @@ class AnizleProvider : MainAPI() {
                 var pageReady = false
 
                 wv.webViewClient = object : WebViewClient() {
+                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                        val url = request?.url?.toString() ?: ""
+                        if (request?.isForMainFrame == true) {
+                            log("resolveAll: WebView ERROR for main frame: $url code=${error?.errorCode} ${error?.description}")
+                        }
+                    }
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
                         // Intercept anizmplayer.com → Aincrad hash
@@ -196,6 +208,7 @@ class AnizleProvider : MainAPI() {
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
+                        log("resolveAll: onPageFinished url=$url pageReady=$pageReady done=$done")
                         if (!pageReady && url?.contains("anizm.net") == true) {
                             pageReady = true
                             log("resolve: page loaded, extracting translators via JS")
@@ -262,7 +275,7 @@ class AnizleProvider : MainAPI() {
                     }
                 }
 
-                // Single page load — the ONLY request to anizm.net
+                log("resolveAll: loading $episodeUrl")
                 wv.loadUrl(episodeUrl)
             }
         }
