@@ -1,13 +1,14 @@
 package com.a.rezeroizle
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 
 /**
  * ReZero İzle CloudStream 3 Provider
  *
  * Season index HTML: <div class="hub-card"><ul><li><a href="...">
- * Episode GDrive:    JS array of file IDs indexed by window.EPISODE_INDEX
+ * Episode GDrive:    <a id="downloadBtn" href="...&id=FILE_ID">
  */
 class ReZeroIzleProvider : MainAPI() {
 
@@ -17,27 +18,28 @@ class ReZeroIzleProvider : MainAPI() {
     override val hasMainPage    = false
     override val supportedTypes = setOf(TvType.Anime, TvType.OVA)
 
-    // ── Pre-compiled regex — avoids re-creation on every loadLinks call ────────
+    // ── Pre-compiled regex ────────────────────────────────────────────────────
     companion object {
         private val SEASON_NUM_RE    = Regex("""/sezon/(\d+)/""")
-        private val EPISODE_HREF_RE = Regex("""/(bolum|arabolum|ozel)/""")
+        private val EPISODE_HREF_RE  = Regex("""/(bolum|arabolum|ozel)/""")
+        private val GDRIVE_URL_RE    = Regex("""drive\.google\.com/(?:uc|file/d|open)[?/][^\s"'<>]*?id[=/]([A-Za-z0-9_-]{25,45})""")
+        private val GDRIVE_PARAM_RE  = Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,45})""")
         private val EPISODE_INDEX_RE = Regex("""window\.EPISODE_INDEX\s*=\s*(\d+)""")
         private val GDRIVE_ID_RE    = Regex("""["'`]([A-Za-z0-9_-]{25,45})["'`]""")
-        private val GDRIVE_URL_RE   = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,45})""")
-        private val GDRIVE_PARAM_RE = Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,45})""")
 
-        // Rotating UA pool — avoids fingerprinting on a single static string
         private val USER_AGENTS = listOf(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
-
-        private const val PAGE_CACHE_TTL_MS = 300_000L  // 5 min
+        private const val PAGE_CACHE_TTL_MS = 300_000L
     }
 
-    // ── Stealth headers — mimics a real browser request ───────────────────────
+    // ── Cloudflare bypass interceptor ─────────────────────────────────────────
+    private val cfKiller = CloudflareKiller()
+
+    // ── Stealth headers ───────────────────────────────────────────────────────
     private fun pageHeaders(): Map<String, String> {
         return mapOf(
             "User-Agent"                to USER_AGENTS.random(),
@@ -56,8 +58,8 @@ class ReZeroIzleProvider : MainAPI() {
 
     private fun scriptHeaders(): Map<String, String> {
         return mapOf(
-            "User-Agent"      to USER_AGENTS.random(),
-            "Accept"          to "*/*",
+            "User-Agent"       to USER_AGENTS.random(),
+            "Accept"           to "*/*",
             "Accept-Language"  to "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.5",
             "Referer"          to "$mainUrl/",
             "Sec-Fetch-Dest"   to "script",
@@ -66,15 +68,15 @@ class ReZeroIzleProvider : MainAPI() {
         )
     }
 
-    // ── Simple in-memory page cache for season index pages ────────────────────
+    // ── Simple page cache ─────────────────────────────────────────────────────
     private val pageCache = mutableMapOf<String, Pair<Long, org.jsoup.nodes.Document>>()
 
-    private suspend fun fetchDocumentCached(url: String): org.jsoup.nodes.Document {
+    private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
         val now = System.currentTimeMillis()
         pageCache[url]?.let { (ts, doc) ->
             if (now - ts < PAGE_CACHE_TTL_MS) return doc
         }
-        val doc = app.get(url, headers = pageHeaders()).document
+        val doc = app.get(url, headers = pageHeaders(), interceptor = cfKiller).document
         pageCache[url] = now to doc
         return doc
     }
@@ -172,7 +174,7 @@ class ReZeroIzleProvider : MainAPI() {
         val seasonNum = SEASON_NUM_RE.find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 
         val doc = try {
-            fetchDocumentCached(url)
+            fetchDocument(url)
         } catch (e: Exception) {
             android.util.Log.e("ReZeroIzle", "Season $seasonNum fetch failed: ${e.message}")
             return newAnimeLoadResponse(title, url, type) {
@@ -181,14 +183,28 @@ class ReZeroIzleProvider : MainAPI() {
             }
         }
 
+        // Debug: log HTML size to detect CF challenges (real page ~8000+ chars)
+        val htmlLen = doc.html().length
+        android.util.Log.d("ReZeroIzle", "Season $seasonNum fetched: $htmlLen chars")
+        if (htmlLen < 1000) {
+            android.util.Log.w("ReZeroIzle", "HTML suspiciously short — possible CF challenge. First 300 chars: ${doc.text().take(300)}")
+        }
+
         val episodes = mutableListOf<Episode>()
         var counter = 0
         val pageBaseDir = url.substringBeforeLast("/") + "/"
-        val seen = mutableSetOf<String>()   // deduplicate (e.g. "İzlemeye Başla" repeats first ep)
+        val seen = mutableSetOf<String>()
 
-        // Use ALL <a> tags and filter by episode URL pattern — avoids reliance on
-        // a specific container class (hub-card) that may change or be absent.
-        doc.select("a[href]").forEach { el ->
+        // Primary selector — the site's known HTML structure
+        var elements = doc.select("div.hub-card ul li a[href]")
+
+        // Fallback — if hub-card is missing, try broader selector
+        if (elements.isEmpty()) {
+            android.util.Log.w("ReZeroIzle", "hub-card selector empty, trying a[href] fallback")
+            elements = doc.select("a[href]")
+        }
+
+        elements.forEach { el ->
             val rawHref = el.attr("href").ifBlank { return@forEach }
 
             val href = el.attr("abs:href").ifBlank {
@@ -199,9 +215,9 @@ class ReZeroIzleProvider : MainAPI() {
                 }
             }.ifBlank { return@forEach }
 
-            // Only keep links to episode / arabolum / ozel pages
+            // Only keep episode / arabolum / ozel links
             if (!EPISODE_HREF_RE.containsMatchIn(href)) return@forEach
-            if (!seen.add(href)) return@forEach   // skip duplicates
+            if (!seen.add(href)) return@forEach
 
             val label = el.text().trim().ifBlank { return@forEach }
 
@@ -210,12 +226,12 @@ class ReZeroIzleProvider : MainAPI() {
                 newEpisode(href) {
                     this.name    = label
                     this.season  = 1
-                    this.episode = counter   // pure sequential — preserves website order
+                    this.episode = counter
                 }
             )
         }
 
-        android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded (from ${doc.select("a[href]").size} total links)")
+        android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes parsed")
 
         return newAnimeLoadResponse(title, url, type) {
             posterUrl  = poster
@@ -235,70 +251,80 @@ class ReZeroIzleProvider : MainAPI() {
         android.util.Log.d("ReZeroIzle", "loadLinks url=$data")
 
         val html = try {
-            app.get(data, headers = pageHeaders()).text
+            app.get(data, headers = pageHeaders(), interceptor = cfKiller).text
         } catch (e: Exception) {
             android.util.Log.e("ReZeroIzle", "Episode fetch error: ${e.message}")
             return false
         }
+        android.util.Log.d("ReZeroIzle", "Episode html len=${html.length}")
 
-        // ── Step 1: parse page, extract EPISODE_INDEX and external script URLs ──
         val doc2 = org.jsoup.Jsoup.parse(html)
 
-        var episodeIndex = -1
-        doc2.select("script:not([src])").forEach { el ->
-            val m = EPISODE_INDEX_RE.find(el.html())
-            if (m != null) episodeIndex = m.groupValues[1].toInt()
-        }
-        android.util.Log.d("ReZeroIzle", "EPISODE_INDEX=$episodeIndex")
-
-        val extScripts = doc2.select("script[src]")
-            .map { it.attr("abs:src").ifBlank { it.attr("src") } }
-            .filter { it.isNotBlank() }
-
-        // ── Step 2: fetch external scripts, search for GDrive IDs ──
+        // ── Step 1: direct download button (most reliable) ──────────────────
         var fileId: String? = null
 
-        for (scriptUrl in extScripts) {
-            val absUrl = when {
-                scriptUrl.startsWith("http") -> scriptUrl
-                scriptUrl.startsWith("/")    -> "$mainUrl$scriptUrl"
-                else                         -> "$mainUrl/$scriptUrl"
-            }
-            val jsText = try {
-                app.get(absUrl, headers = scriptHeaders()).text
-            } catch (e: Exception) {
-                android.util.Log.w("ReZeroIzle", "Script fetch failed: $absUrl ${e.message}")
-                continue
-            }
+        val downloadBtn = doc2.selectFirst("a#downloadBtn[href]")
+        if (downloadBtn != null) {
+            val dlHref = downloadBtn.attr("href")
+            android.util.Log.d("ReZeroIzle", "downloadBtn href=$dlHref")
+            fileId = GDRIVE_PARAM_RE.find(dlHref)?.groupValues?.get(1)
+                ?: GDRIVE_URL_RE.find(dlHref)?.groupValues?.get(1)
+        }
 
-            val ids = GDRIVE_ID_RE.findAll(jsText)
-                .map { it.groupValues[1] }
-                .toList()
+        // ── Step 2: external scripts with EPISODE_INDEX (fallback) ──────────
+        if (fileId == null) {
+            var episodeIndex = -1
+            doc2.select("script:not([src])").forEach { el ->
+                val m = EPISODE_INDEX_RE.find(el.html())
+                if (m != null) episodeIndex = m.groupValues[1].toInt()
+            }
+            android.util.Log.d("ReZeroIzle", "EPISODE_INDEX=$episodeIndex")
 
-            if (ids.isNotEmpty()) {
-                fileId = if (episodeIndex in ids.indices) {
-                    android.util.Log.d("ReZeroIzle", "Using index $episodeIndex -> ${ids[episodeIndex]}")
-                    ids[episodeIndex]
-                } else {
-                    android.util.Log.d("ReZeroIzle", "Index $episodeIndex out of range (${ids.size}), using first")
-                    ids[0]
+            val extScripts = doc2.select("script[src]")
+                .map { it.attr("abs:src").ifBlank { it.attr("src") } }
+                .filter { it.isNotBlank() }
+
+            for (scriptUrl in extScripts) {
+                val absUrl = when {
+                    scriptUrl.startsWith("http") -> scriptUrl
+                    scriptUrl.startsWith("/")    -> "$mainUrl$scriptUrl"
+                    else                         -> "$mainUrl/$scriptUrl"
                 }
-                break
+                val jsText = try {
+                    app.get(absUrl, headers = scriptHeaders(), interceptor = cfKiller).text
+                } catch (e: Exception) {
+                    android.util.Log.w("ReZeroIzle", "Script fetch failed: $absUrl ${e.message}")
+                    continue
+                }
+
+                val ids = GDRIVE_ID_RE.findAll(jsText)
+                    .map { it.groupValues[1] }
+                    .toList()
+
+                if (ids.isNotEmpty()) {
+                    fileId = if (episodeIndex in ids.indices) {
+                        android.util.Log.d("ReZeroIzle", "Using index $episodeIndex -> ${ids[episodeIndex]}")
+                        ids[episodeIndex]
+                    } else {
+                        android.util.Log.d("ReZeroIzle", "Index $episodeIndex out of range (${ids.size}), using first")
+                        ids[0]
+                    }
+                    break
+                }
             }
         }
 
-        // ── Step 3: fallback — search inline HTML for any GDrive pattern ──
+        // ── Step 3: inline HTML GDrive patterns (last resort) ───────────────
         if (fileId == null) {
             fileId = GDRIVE_URL_RE.find(html)?.groupValues?.get(1)
                 ?: GDRIVE_PARAM_RE.find(html)?.groupValues?.get(1)
         }
 
         if (fileId == null) {
-            // Check if the episode is marked as not yet translated
             if (html.contains("henüz tamamlamadım") || html.contains("yakında")) {
-                android.util.Log.w("ReZeroIzle", "Episode not yet translated — no GDrive link expected")
+                android.util.Log.w("ReZeroIzle", "Episode not yet translated — no video link available")
             } else {
-                android.util.Log.w("ReZeroIzle", "No GDrive ID found. episodeIndex=$episodeIndex scripts=${extScripts.size}")
+                android.util.Log.w("ReZeroIzle", "No GDrive ID found. html=${html.length} chars")
             }
             return false
         }
