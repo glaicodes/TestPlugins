@@ -7,9 +7,10 @@ import com.lagradost.cloudstream3.utils.*
  * ReZero İzle CloudStream 3 Provider
  *
  * Site structure:
- *   Season index:  <div class="hub-card"><ul><li><a href="...">
- *   Episode page:  <a id="downloadBtn" href="...&amp;id=FILE_ID">
- *   JS data file:  seasons-data.js → SEASON_CONFIGS with driveIds[EPISODE_INDEX]
+ *   Homepage nav:   p.subtitle a[href] — lists all seasons and OVAs
+ *   Season index:   <div class="hub-card"><ul><li><a href="...">
+ *   Episode page:   <a id="downloadBtn" href="...&amp;id=FILE_ID">
+ *   JS data file:   seasons-data.js → SEASON_CONFIGS with driveIds[EPISODE_INDEX]
  */
 class ReZeroIzleProvider : MainAPI() {
 
@@ -57,9 +58,7 @@ class ReZeroIzleProvider : MainAPI() {
     )
 
     // ── Caches ────────────────────────────────────────────────────────────────
-    // Season index pages — avoids re-fetch when user browses back and forth
-    private val pageCache = mutableMapOf<String, Pair<Long, org.jsoup.nodes.Document>>()
-    // JS scripts (seasons-data.js, etc.) — avoids re-fetch on every episode click
+    private val pageCache   = mutableMapOf<String, Pair<Long, org.jsoup.nodes.Document>>()
     private val scriptCache = mutableMapOf<String, Pair<Long, String>>()
 
     private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
@@ -82,59 +81,118 @@ class ReZeroIzleProvider : MainAPI() {
         return text
     }
 
-    // ── Catalogue ─────────────────────────────────────────────────────────────
-    private data class Catalogue(
-        val title: String,
-        val url: String,
+    // ── Known metadata (fallback posters & plots for known entries) ───────────
+    private data class KnownMeta(
         val poster: String,
         val plot: String,
-        val type: TvType,
     )
 
-    private val catalogue = listOf(
-        Catalogue(
-            title  = "Re:Zero 1. Sezon",
-            url    = "$mainUrl/sezon/1/index.html",
+    // Keyed by URL path suffix so it matches regardless of domain changes
+    private val knownMeta = mapOf(
+        "/sezon/1/index.html" to KnownMeta(
             poster = "$mainUrl/images/s1.jpg",
             plot   = "Subaru Natsuki başka bir dünyaya ışınlanır ve 'Ölümden Dönüş' yeteneğiyle hayatta kalmaya çalışır. (1. Sezon – 25 bölüm)",
-            type   = TvType.Anime,
         ),
-        Catalogue(
-            title  = "Re:Zero 2. Sezon",
-            url    = "$mainUrl/sezon/2/index.html",
+        "/sezon/2/index.html" to KnownMeta(
             poster = "$mainUrl/images/s2.webp",
             plot   = "Subaru yeni tehditlerle yüzleşirken Rem gizemli bir uykuya dalar. (2. Sezon – 25 bölüm)",
-            type   = TvType.Anime,
         ),
-        Catalogue(
-            title  = "Re:Zero 3. Sezon",
-            url    = "$mainUrl/sezon/3/index.html",
+        "/sezon/3/index.html" to KnownMeta(
             poster = "$mainUrl/images/s3.webp",
             plot   = "Re:Zero 3. Sezon – Türkçe altyazılı.",
-            type   = TvType.Anime,
         ),
-        Catalogue(
-            title  = "Re:Zero 4. Sezon",
-            url    = "$mainUrl/sezon/4/index.html",
+        "/sezon/4/index.html" to KnownMeta(
             poster = "$mainUrl/images/s4.webp",
             plot   = "Re:Zero 4. Sezon – Türkçe altyazılı.",
-            type   = TvType.Anime,
         ),
-        Catalogue(
-            title  = "Re:Zero – Memory Snow (OVA)",
-            url    = "$mainUrl/sezon/1/ozel/memory-snow.html",
+        "/sezon/1/ozel/memory-snow.html" to KnownMeta(
             poster = "$mainUrl/images/s1.jpg",
             plot   = "Kış şenliği ve karlı bir gün. Subaru ile Emilia'nın tatlı kış macerası.",
-            type   = TvType.OVA,
         ),
-        Catalogue(
-            title  = "Re:Zero – Frozen Bond (OVA)",
-            url    = "$mainUrl/sezon/2/ozel/frozen-bond.html",
+        "/sezon/2/ozel/frozen-bond.html" to KnownMeta(
             poster = "$mainUrl/images/frozen-bond.webp",
             plot   = "Emilia'nın geçmişi ve Frozen Bond – Türkçe altyazılı OVA.",
-            type   = TvType.OVA,
         ),
     )
+
+    // Resolve poster for unknown future entries by guessing image path
+    private fun guessPoster(url: String): String {
+        val seasonNum = SEASON_NUM_RE.find(url)?.groupValues?.get(1)
+        return if (seasonNum != null) "$mainUrl/images/s$seasonNum.webp"
+        else "$mainUrl/images/s1.jpg"
+    }
+
+    // ── Dynamic catalogue from homepage ──────────────────────────────────────
+    // Cached list discovered from the homepage nav bar (p.subtitle a[href])
+    private var discoveredCatalogue: List<SearchResponse>? = null
+    private var catalogueTimestamp = 0L
+
+    private suspend fun getCatalogue(): List<SearchResponse> {
+        val now = System.currentTimeMillis()
+        discoveredCatalogue?.let {
+            if (now - catalogueTimestamp < CACHE_TTL_MS) return it
+        }
+
+        val results = mutableListOf<SearchResponse>()
+        val seen = mutableSetOf<String>()
+
+        try {
+            val doc = fetchDocument("$mainUrl/index.html")
+
+            // Homepage nav: p.subtitle contains links to all seasons & OVAs
+            doc.select("p.subtitle a[href]").forEach { el ->
+                val href = el.attr("abs:href").ifBlank { el.attr("href") }
+                if (!href.contains("/sezon/")) return@forEach
+                if (!seen.add(href)) return@forEach
+
+                val label = el.text().trim().ifBlank { return@forEach }
+                val isOva = href.contains("/ozel/")
+                val type = if (isOva) TvType.OVA else TvType.Anime
+
+                // Build title: "Re:Zero – Label" or "Re:Zero N. Sezon"
+                val title = if (isOva) "Re:Zero – $label (OVA)"
+                    else "Re:Zero $label"
+
+                val pathKey = href.removePrefix(mainUrl)
+                val meta = knownMeta[pathKey]
+                val poster = meta?.poster ?: guessPoster(href)
+
+                results.add(
+                    newAnimeSearchResponse(title, href, type) {
+                        posterUrl = poster
+                    }
+                )
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("ReZeroIzle", "Homepage fetch failed: ${e.message}")
+        }
+
+        // Fallback: if homepage failed or returned nothing, use hardcoded entries
+        if (results.isEmpty()) {
+            android.util.Log.w("ReZeroIzle", "Using hardcoded catalogue fallback")
+            val fallback = listOf(
+                Triple("Re:Zero 1. Sezon",           "$mainUrl/sezon/1/index.html",           TvType.Anime),
+                Triple("Re:Zero 2. Sezon",           "$mainUrl/sezon/2/index.html",           TvType.Anime),
+                Triple("Re:Zero 3. Sezon",           "$mainUrl/sezon/3/index.html",           TvType.Anime),
+                Triple("Re:Zero 4. Sezon",           "$mainUrl/sezon/4/index.html",           TvType.Anime),
+                Triple("Re:Zero – Memory Snow (OVA)", "$mainUrl/sezon/1/ozel/memory-snow.html", TvType.OVA),
+                Triple("Re:Zero – Frozen Bond (OVA)", "$mainUrl/sezon/2/ozel/frozen-bond.html", TvType.OVA),
+            )
+            fallback.forEach { (title, url, type) ->
+                val pathKey = url.removePrefix(mainUrl)
+                val poster = knownMeta[pathKey]?.poster ?: guessPoster(url)
+                results.add(
+                    newAnimeSearchResponse(title, url, type) {
+                        posterUrl = poster
+                    }
+                )
+            }
+        }
+
+        discoveredCatalogue = results
+        catalogueTimestamp = now
+        return results
+    }
 
     // ── Search ─────────────────────────────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse> {
@@ -145,22 +203,30 @@ class ReZeroIzleProvider : MainAPI() {
         )
         val isMatch = q.isBlank() || keywords.any { q.contains(it) }
         if (!isMatch) return emptyList()
-        return catalogue.map { entry ->
-            newAnimeSearchResponse(entry.title, entry.url, entry.type) {
-                posterUrl = entry.poster
-            }
-        }
+        return getCatalogue()
     }
 
     // ── Load ──────────────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        val entry  = catalogue.find { it.url == url }
-        val title  = entry?.title  ?: "Re:Zero"
-        val poster = entry?.poster ?: "$mainUrl/images/s1.jpg"
-        val plot   = entry?.plot
-        val type   = entry?.type   ?: TvType.Anime
+        val pathKey = url.removePrefix(mainUrl)
+        val meta    = knownMeta[pathKey]
+        val poster  = meta?.poster ?: guessPoster(url)
+        val plot    = meta?.plot
 
-        if (url.contains("/ozel/")) {
+        // Derive a title from the URL if we don't have one
+        val seasonNum = SEASON_NUM_RE.find(url)?.groupValues?.get(1)?.toIntOrNull()
+        val isOva = url.contains("/ozel/")
+        val type  = if (isOva) TvType.OVA else TvType.Anime
+        val title = if (isOva) {
+            val slug = url.substringAfterLast("/").removeSuffix(".html")
+                .replace("-", " ")
+                .replaceFirstChar { it.uppercase() }
+            "Re:Zero – $slug (OVA)"
+        } else {
+            "Re:Zero ${seasonNum ?: ""}. Sezon"
+        }
+
+        if (isOva) {
             return newAnimeLoadResponse(title, url, type) {
                 posterUrl = poster
                 this.plot = plot
@@ -170,8 +236,6 @@ class ReZeroIzleProvider : MainAPI() {
                 ))
             }
         }
-
-        val seasonNum = SEASON_NUM_RE.find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 
         val doc = try {
             fetchDocument(url)
