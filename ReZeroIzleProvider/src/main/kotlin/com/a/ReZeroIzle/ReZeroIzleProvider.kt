@@ -20,6 +20,7 @@ class ReZeroIzleProvider : MainAPI() {
     // ── Pre-compiled regex — avoids re-creation on every loadLinks call ────────
     companion object {
         private val SEASON_NUM_RE    = Regex("""/sezon/(\d+)/""")
+        private val EPISODE_HREF_RE = Regex("""/(bolum|arabolum|ozel)/""")
         private val EPISODE_INDEX_RE = Regex("""window\.EPISODE_INDEX\s*=\s*(\d+)""")
         private val GDRIVE_ID_RE    = Regex("""["'`]([A-Za-z0-9_-]{25,45})["'`]""")
         private val GDRIVE_URL_RE   = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,45})""")
@@ -183,10 +184,12 @@ class ReZeroIzleProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         var counter = 0
         val pageBaseDir = url.substringBeforeLast("/") + "/"
+        val seen = mutableSetOf<String>()   // deduplicate (e.g. "İzlemeye Başla" repeats first ep)
 
-        doc.select("div.hub-card ul li a[href]").forEach { el ->
+        // Use ALL <a> tags and filter by episode URL pattern — avoids reliance on
+        // a specific container class (hub-card) that may change or be absent.
+        doc.select("a[href]").forEach { el ->
             val rawHref = el.attr("href").ifBlank { return@forEach }
-            val label   = el.text().trim().ifBlank { return@forEach }
 
             val href = el.attr("abs:href").ifBlank {
                 when {
@@ -195,6 +198,12 @@ class ReZeroIzleProvider : MainAPI() {
                     else                       -> pageBaseDir + rawHref
                 }
             }.ifBlank { return@forEach }
+
+            // Only keep links to episode / arabolum / ozel pages
+            if (!EPISODE_HREF_RE.containsMatchIn(href)) return@forEach
+            if (!seen.add(href)) return@forEach   // skip duplicates
+
+            val label = el.text().trim().ifBlank { return@forEach }
 
             counter++
             episodes.add(
@@ -206,7 +215,7 @@ class ReZeroIzleProvider : MainAPI() {
             )
         }
 
-        android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded")
+        android.util.Log.d("ReZeroIzle", "Season $seasonNum: ${episodes.size} episodes loaded (from ${doc.select("a[href]").size} total links)")
 
         return newAnimeLoadResponse(title, url, type) {
             posterUrl  = poster
@@ -264,7 +273,6 @@ class ReZeroIzleProvider : MainAPI() {
 
             val ids = GDRIVE_ID_RE.findAll(jsText)
                 .map { it.groupValues[1] }
-                .filter { it.matches(Regex("[A-Za-z0-9_-]{25,45}")) }
                 .toList()
 
             if (ids.isNotEmpty()) {
@@ -286,7 +294,12 @@ class ReZeroIzleProvider : MainAPI() {
         }
 
         if (fileId == null) {
-            android.util.Log.w("ReZeroIzle", "No GDrive ID found. episodeIndex=$episodeIndex scripts=${extScripts.size}")
+            // Check if the episode is marked as not yet translated
+            if (html.contains("henüz tamamlamadım") || html.contains("yakında")) {
+                android.util.Log.w("ReZeroIzle", "Episode not yet translated — no GDrive link expected")
+            } else {
+                android.util.Log.w("ReZeroIzle", "No GDrive ID found. episodeIndex=$episodeIndex scripts=${extScripts.size}")
+            }
             return false
         }
         android.util.Log.d("ReZeroIzle", "GDrive fileId=$fileId")
