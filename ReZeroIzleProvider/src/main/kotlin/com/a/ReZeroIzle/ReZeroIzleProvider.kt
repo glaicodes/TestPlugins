@@ -2,9 +2,6 @@ package com.a.rezeroizle
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 
 /**
  * ReZero İzle CloudStream 3 Provider
@@ -20,7 +17,7 @@ class ReZeroIzleProvider : MainAPI() {
     override val hasMainPage    = false
     override val supportedTypes = setOf(TvType.Anime, TvType.OVA)
 
-    // ── Pre-compiled regex (avoids re-creation per call) ──────────────────────
+    // ── Pre-compiled regex — avoids re-creation on every loadLinks call ────────
     companion object {
         private val SEASON_NUM_RE    = Regex("""/sezon/(\d+)/""")
         private val EPISODE_INDEX_RE = Regex("""window\.EPISODE_INDEX\s*=\s*(\d+)""")
@@ -28,6 +25,7 @@ class ReZeroIzleProvider : MainAPI() {
         private val GDRIVE_URL_RE   = Regex("""drive\.google\.com/file/d/([A-Za-z0-9_-]{25,45})""")
         private val GDRIVE_PARAM_RE = Regex("""[?&](?:amp;)?id=([A-Za-z0-9_-]{25,45})""")
 
+        // Rotating UA pool — avoids fingerprinting on a single static string
         private val USER_AGENTS = listOf(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -35,32 +33,30 @@ class ReZeroIzleProvider : MainAPI() {
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
 
-        private const val PAGE_CACHE_TTL_MS = 300_000L  // 5 minutes
+        private const val PAGE_CACHE_TTL_MS = 300_000L  // 5 min
     }
 
-    // ── Stealth headers with rotating UA ──────────────────────────────────────
-    private fun stealthHeaders(): Map<String, String> {
-        val ua = USER_AGENTS.random()
+    // ── Stealth headers — mimics a real browser request ───────────────────────
+    private fun pageHeaders(): Map<String, String> {
         return mapOf(
-            "User-Agent"       to ua,
-            "Accept"           to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language"  to "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.5",
-            "Accept-Encoding"  to "gzip, deflate, br",
-            "Referer"          to "$mainUrl/",
-            "Sec-Fetch-Dest"   to "document",
-            "Sec-Fetch-Mode"   to "navigate",
-            "Sec-Fetch-Site"   to "same-origin",
-            "Sec-Fetch-User"   to "?1",
+            "User-Agent"                to USER_AGENTS.random(),
+            "Accept"                    to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language"           to "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.5",
+            "Accept-Encoding"           to "gzip, deflate, br",
+            "Referer"                   to "$mainUrl/",
+            "DNT"                       to "1",
+            "Sec-Fetch-Dest"            to "document",
+            "Sec-Fetch-Mode"            to "navigate",
+            "Sec-Fetch-Site"            to "same-origin",
+            "Sec-Fetch-User"            to "?1",
             "Upgrade-Insecure-Requests" to "1",
-            "DNT"              to "1",
         )
     }
 
     private fun scriptHeaders(): Map<String, String> {
-        val ua = USER_AGENTS.random()
         return mapOf(
-            "User-Agent"       to ua,
-            "Accept"           to "*/*",
+            "User-Agent"      to USER_AGENTS.random(),
+            "Accept"          to "*/*",
             "Accept-Language"  to "tr-TR,tr;q=0.9,en-US;q=0.7,en;q=0.5",
             "Referer"          to "$mainUrl/",
             "Sec-Fetch-Dest"   to "script",
@@ -69,15 +65,15 @@ class ReZeroIzleProvider : MainAPI() {
         )
     }
 
-    // ── Simple in-memory page cache ───────────────────────────────────────────
+    // ── Simple in-memory page cache for season index pages ────────────────────
     private val pageCache = mutableMapOf<String, Pair<Long, org.jsoup.nodes.Document>>()
 
-    private suspend fun fetchDocument(url: String): org.jsoup.nodes.Document {
+    private suspend fun fetchDocumentCached(url: String): org.jsoup.nodes.Document {
         val now = System.currentTimeMillis()
         pageCache[url]?.let { (ts, doc) ->
             if (now - ts < PAGE_CACHE_TTL_MS) return doc
         }
-        val doc = app.get(url, headers = stealthHeaders()).document
+        val doc = app.get(url, headers = pageHeaders()).document
         pageCache[url] = now to doc
         return doc
     }
@@ -175,7 +171,7 @@ class ReZeroIzleProvider : MainAPI() {
         val seasonNum = SEASON_NUM_RE.find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 
         val doc = try {
-            fetchDocument(url)
+            fetchDocumentCached(url)
         } catch (e: Exception) {
             android.util.Log.e("ReZeroIzle", "Season $seasonNum fetch failed: ${e.message}")
             return newAnimeLoadResponse(title, url, type) {
@@ -205,7 +201,7 @@ class ReZeroIzleProvider : MainAPI() {
                 newEpisode(href) {
                     this.name    = label
                     this.season  = 1
-                    this.episode = counter
+                    this.episode = counter   // pure sequential — preserves website order
                 }
             )
         }
@@ -230,7 +226,7 @@ class ReZeroIzleProvider : MainAPI() {
         android.util.Log.d("ReZeroIzle", "loadLinks url=$data")
 
         val html = try {
-            app.get(data, headers = stealthHeaders()).text
+            app.get(data, headers = pageHeaders()).text
         } catch (e: Exception) {
             android.util.Log.e("ReZeroIzle", "Episode fetch error: ${e.message}")
             return false
@@ -250,30 +246,21 @@ class ReZeroIzleProvider : MainAPI() {
             .map { it.attr("abs:src").ifBlank { it.attr("src") } }
             .filter { it.isNotBlank() }
 
-        // ── Step 2: fetch external scripts in parallel, search for GDrive IDs ──
+        // ── Step 2: fetch external scripts, search for GDrive IDs ──
         var fileId: String? = null
 
-        val scriptTexts = coroutineScope {
-            extScripts.map { scriptUrl ->
-                async {
-                    val absUrl = when {
-                        scriptUrl.startsWith("http") -> scriptUrl
-                        scriptUrl.startsWith("/")    -> "$mainUrl$scriptUrl"
-                        else                         -> "$mainUrl/$scriptUrl"
-                    }
-                    try {
-                        delay((50L..200L).random())  // small jitter
-                        app.get(absUrl, headers = scriptHeaders()).text
-                    } catch (e: Exception) {
-                        android.util.Log.w("ReZeroIzle", "Script fetch failed: $absUrl ${e.message}")
-                        null
-                    }
-                }
-            }.map { it.await() }
-        }
-
-        for (jsText in scriptTexts) {
-            if (jsText == null) continue
+        for (scriptUrl in extScripts) {
+            val absUrl = when {
+                scriptUrl.startsWith("http") -> scriptUrl
+                scriptUrl.startsWith("/")    -> "$mainUrl$scriptUrl"
+                else                         -> "$mainUrl/$scriptUrl"
+            }
+            val jsText = try {
+                app.get(absUrl, headers = scriptHeaders()).text
+            } catch (e: Exception) {
+                android.util.Log.w("ReZeroIzle", "Script fetch failed: $absUrl ${e.message}")
+                continue
+            }
 
             val ids = GDRIVE_ID_RE.findAll(jsText)
                 .map { it.groupValues[1] }
@@ -282,7 +269,7 @@ class ReZeroIzleProvider : MainAPI() {
 
             if (ids.isNotEmpty()) {
                 fileId = if (episodeIndex in ids.indices) {
-                    android.util.Log.d("ReZeroIzle", "Using index $episodeIndex → ${ids[episodeIndex]}")
+                    android.util.Log.d("ReZeroIzle", "Using index $episodeIndex -> ${ids[episodeIndex]}")
                     ids[episodeIndex]
                 } else {
                     android.util.Log.d("ReZeroIzle", "Index $episodeIndex out of range (${ids.size}), using first")
