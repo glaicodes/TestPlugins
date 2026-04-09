@@ -130,7 +130,7 @@ class AnizleProvider : MainAPI() {
                     currentIdx++
                     if (currentIdx == 1 && results.isEmpty() && !usedFallback) {
                         log("resolve: first failed, falling back to loadUrl")
-                        usedFallback = true; currentIdx = -1
+                        usedFallback = true; currentIdx = -1; pageReady = false
                         wv.loadUrl(episodeUrl)
                         return
                     }
