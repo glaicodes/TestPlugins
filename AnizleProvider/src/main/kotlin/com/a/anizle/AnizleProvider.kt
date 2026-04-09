@@ -124,6 +124,7 @@ class AnizleProvider : MainAPI() {
                 var currentTarget = ""; var currentIdx = -1
                 val perIdTimeout = arrayOfNulls<Runnable>(1)
                 var usedFallback = false
+                var pageReady = false
 
                 fun resolveNext() {
                     perIdTimeout[0]?.let { handler.removeCallbacks(it) }
@@ -165,7 +166,6 @@ class AnizleProvider : MainAPI() {
                     }
                 }, "_b")
 
-                var pageReady = false
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
