@@ -141,7 +141,7 @@ class AnizleProvider : MainAPI() {
                     log("resolve: [${currentIdx}/${numIds.size}] numId=$nid")
 
                     perIdTimeout[0] = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
-                    handler.postDelayed(perIdTimeout[0]!!, 5_000L)
+                    handler.postDelayed(perIdTimeout[0]!!, 3_000L)
 
                     // Stealth: 200-600ms random delay between iframes (fast but still human-like)
                     val delay = if (currentIdx == 0) 0L else (200L + (Math.random() * 400).toLong())
@@ -171,9 +171,10 @@ class AnizleProvider : MainAPI() {
                         val url = request?.url?.toString() ?: return null
                         val host = request.url?.host ?: ""
 
-                        // Fast path: skip processing for anizm.net sub-resources
+                        // Fast path: skip regex processing for anizm.net sub-resources
                         // (CSS, JS, fonts etc.) — we only care about cross-domain embeds
-                        if (host.contains("anizm")) {
+                        // Note: must NOT match anizmplayer.com (which also contains "anizm")
+                        if (host.endsWith("anizm.net")) {
                             // Only process /player/ paths
                             if (url.contains("/player/")) {
                                 val tgt = currentTarget
