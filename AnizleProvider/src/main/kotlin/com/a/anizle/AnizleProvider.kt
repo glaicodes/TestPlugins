@@ -369,7 +369,7 @@ class AnizleProvider : MainAPI() {
         log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size} aliases=${nameAliases?.size ?: 0}")
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
-            this.nameAliases = nameAliases
+            // nameAliases not available in this CS3 version — logged above for debug
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
