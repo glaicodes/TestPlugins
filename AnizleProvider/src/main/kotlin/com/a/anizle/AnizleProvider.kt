@@ -303,6 +303,38 @@ class AnizleProvider : MainAPI() {
         val title = doc.selectFirst("h2.anizm_pageTitle, h2.page-title, h1, .anime-title")?.text()?.trim()
             ?: url.substringAfterLast("/").replace("-", " ")
 
+        // Extract alternative names for AniList/MAL sync matching
+        val aliases = mutableListOf<String>()
+        // Method 1: data rows with labels (Japonca, İngilizce, Diğer Adları, etc.)
+        doc.select("span.dataTitle, .info-label, .data-title, dt").forEach { labelEl ->
+            val label = labelEl.text().lowercase().trim().trimEnd(':')
+            if (label.contains("japonca") || label.contains("japanese") ||
+                label.contains("ingilizce") || label.contains("english") ||
+                label.contains("diğer ad") || label.contains("other name") ||
+                label.contains("romaji") || label.contains("orijinal")) {
+                // Get the value — usually the next sibling or next element
+                val valueEl = labelEl.nextElementSibling()
+                    ?: labelEl.parent()?.selectFirst("span.dataValue, .info-value, dd")
+                val value = valueEl?.text()?.trim() ?: ""
+                if (value.isNotBlank() && value != title) {
+                    // Split on comma — "Name1, Name2" → ["Name1", "Name2"]
+                    value.split(",", "،", "/").map { it.trim() }.filter { it.isNotBlank() && it != title }
+                        .forEach { aliases.add(it) }
+                }
+            }
+        }
+        // Method 2: og:title might have a different name
+        doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
+            ?.replace(Regex("""\s*[-|–]\s*Anizm.*$""", RegexOption.IGNORE_CASE), "")?.trim()
+            ?.let { if (it.isNotBlank() && it != title && it !in aliases) aliases.add(it) }
+        // Method 3: any h1/h2 with different text than title
+        doc.select("h1, h2").map { it.text().trim() }
+            .filter { it.isNotBlank() && it != title && it.length > 3 && !it.contains("Bölüm", true) && it !in aliases }
+            .forEach { aliases.add(it) }
+        // Deduplicate and limit
+        val nameAliases = aliases.distinct().take(10).ifEmpty { null }
+        log("load: aliases=${nameAliases?.size ?: 0}: ${nameAliases?.joinToString(" | ") ?: "none"}")
+
         // Poster: try multiple selectors + fallback to og:image
         val poster = sequenceOf(
             doc.selectFirst("div.infoPosterImg img"),
@@ -334,8 +366,12 @@ class AnizleProvider : MainAPI() {
             if (href.contains("-pv-") || ll == "pv" || ll.endsWith(" pv")) return@mapNotNull null
             newEpisode(href) { name = label }
         }.mapIndexed { i, ep -> ep.apply { episode = i + 1 } }
-        log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size}")
-        return newAnimeLoadResponse(title, url, TvType.Anime) { posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags; addEpisodes(DubStatus.Subbed, episodes) }
+        log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size} aliases=${nameAliases?.size ?: 0}")
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
+            this.nameAliases = nameAliases
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
     }
 
     // ── Load links ────────────────────────────────────────────────────────────
