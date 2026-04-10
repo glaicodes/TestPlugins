@@ -85,10 +85,10 @@ class AnizleProvider : MainAPI() {
     private fun isCf(html: String) = html.contains("Just a moment", true) || html.contains("cf-browser-verification", true)
 
     private val baseHeaders get() = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Referer" to "$mainUrl/")
     private val xhrHeaders get() = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Origin" to mainUrl, "Referer" to "$mainUrl/",
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
 
@@ -107,7 +107,7 @@ class AnizleProvider : MainAPI() {
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true; settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+                    settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
@@ -350,7 +350,7 @@ class AnizleProvider : MainAPI() {
             ?: doc.selectFirst("meta[name=description], meta[property=og:description]")?.attr("content")?.trim()?.ifBlank { null }
 
         val year = doc.select("span.dataValue, .info-value, li, td").map { it.text().trim() }
-            .firstOrNull { it.matches(Regex("""\d{4}""")) && it.toInt() in 1950..2030 }?.toIntOrNull()
+            .firstOrNull { it.matches(Regex("""\d{4}""")) && it.toInt() in 1950..2040 }?.toIntOrNull()
         val tags = doc.select("span.dataValue > span.tag > span.label, a[href*=/kategoriler/], .genre a")
             .map { it.text().trim() }.filter { it.isNotBlank() && it.length < 30 }.take(6).ifEmpty { null }
 
@@ -366,10 +366,17 @@ class AnizleProvider : MainAPI() {
             if (href.contains("-pv-") || ll == "pv" || ll.endsWith(" pv")) return@mapNotNull null
             newEpisode(href) { name = label }
         }.mapIndexed { i, ep -> ep.apply { episode = i + 1 } }
-        log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size} aliases=${nameAliases?.size ?: 0}")
+        // Split aliases into eng/jap + synonyms for AniList/MAL sync matching
+        val asciiRe = Regex("^[\\x20-\\x7E]+$")
+        val eng = nameAliases?.firstOrNull { asciiRe.matches(it) }
+        val jap = nameAliases?.firstOrNull { !asciiRe.matches(it) }
+        val syns = nameAliases?.filter { it != eng && it != jap }?.ifEmpty { null }
+        log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster; this.plot = plot; this.year = year; this.tags = tags
-            // nameAliases not available in this CS3 version — logged above for debug
+            this.engName = eng
+            this.japName = jap
+            this.synonyms = syns
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
@@ -439,7 +446,7 @@ class AnizleProvider : MainAPI() {
             if (embed.startsWith("ap:")) {
                 val hash = embed.removePrefix("ap:")
                 val playerRef = "$playerBase/player/$hash"
-                val aHeaders = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+                val aHeaders = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
                     "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, */*; q=0.01", "Referer" to playerRef, "Origin" to playerBase)
                 val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
                     catch (e: Exception) { log("aincrad error: ${e.message}"); continue }
