@@ -326,11 +326,11 @@ class AnizleProvider : MainAPI() {
         // Method 2: og:title might have a different name
         doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
             ?.replace(Regex("""\s*[-|–]\s*Anizm.*$""", RegexOption.IGNORE_CASE), "")
-            ?.replace(Regex("""\s+[iİ]zle\b.*$""", RegexOption.IGNORE_CASE), "")?.trim()
+            ?.replace(Regex("""\s+[iİ]zl[e.].*$""", RegexOption.IGNORE_CASE), "")?.trim()
             ?.let { if (it.isNotBlank() && it != title && it !in aliases) aliases.add(it) }
         // Method 3 removed — h1/h2 scan grabs footer/nav junk ("Biz Kimiz?", "Hızlı Erişim" etc.)
-        // Clean Turkish "izle/İzle" and trailing junk from all aliases
-        val izleRe = Regex("""\s+[iİ]zle\b.*$""", RegexOption.IGNORE_CASE)
+        // Clean Turkish "izle/İzle" and truncated forms (anizm truncates to "izl...")
+        val izleRe = Regex("""\s+[iİ]zl[e.].*$""", RegexOption.IGNORE_CASE)
         val cleanedAliases = aliases.map { it.replace(izleRe, "").trim() }
             .filter { it.isNotBlank() && it != title && it.length > 3 }
         // Deduplicate and limit
