@@ -487,53 +487,68 @@ class AnizleProvider : MainAPI() {
                 val securedLink = json.optString("securedLink", "")
                 val videoSource = json.optString("videoSource", "")
                 log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()}")
-                // Single entry per source. Prefer the plain MP4: it both plays and downloads.
-                // The HLS securedLink is a short-TTL token URL — playback starts instantly so it
-                // works, but the downloader fetches segments over minutes and dies when the token
-                // expires. HLS kept only as fallback when no MP4 exists, with full header set so
-                // the downloader presents the same fingerprint the token was issued for.
-                if (videoSource.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = label, url = videoSource, type = ExtractorLinkType.VIDEO) {
-                        quality = Qualities.Unknown.value; referer = playerRef
-                        headers = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef) })
-                    found = true
-                } else if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    // Playback (ExoPlayer) is lenient; CloudStream's downloader parses the HLS
-                    // master playlist strictly (requireAudio variant filter) and can throw
-                    // "M3u8 contains no video with audio" on streams that play fine.
-                    // Fix: resolve master -> best-bandwidth media playlist here and give the
-                    // downloader that directly, skipping master parsing entirely.
-                    val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
-                    var finalUrl = securedLink
-                    try {
-                        val body = app.get(securedLink, headers = hlsHeaders).text
-                        if (body.contains("#EXT-X-STREAM-INF")) {
-                            // BANDWIDTH is spec-required on every STREAM-INF (RFC 8216 §4.3.4.2).
-                            // [^#\s] guard: never capture a comment line as the variant URI.
-                            val varRe = Regex("""#EXT-X-STREAM-INF:[^\n]*?BANDWIDTH=(\d+)[^\n]*\n\s*([^#\s]\S*)""")
-                            val best = varRe.findAll(body)
-                                .maxByOrNull { it.groupValues[1].toLongOrNull() ?: 0L }?.groupValues?.get(2)
-                            if (!best.isNullOrBlank()) {
-                                // Candidate 1: normal resolution. NOTE: URI.resolve drops the base
-                                // URL's query string — kills token-in-query streams (ExoPlayer 3003).
-                                // Candidate 2: same but with the master's query re-attached.
-                                val c1 = try { java.net.URI(securedLink).resolve(best).toString() } catch (_: Exception) { null }
-                                val baseQuery = securedLink.substringAfter('?', "")
-                                val c2 = if (c1 != null && !c1.contains('?') && baseQuery.isNotBlank()) "$c1?$baseQuery" else null
-                                // Probe candidates: only trust a URL that actually serves an m3u8.
-                                // Anything else (HTML error page etc.) => keep original securedLink.
-                                for (cand in listOfNotNull(c1, c2)) {
-                                    val probe = try { app.get(cand, headers = hlsHeaders).text } catch (_: Exception) { continue }
-                                    if (probe.trimStart().startsWith("#EXTM3U")) {
-                                        finalUrl = cand; log("aincrad: master->variant $cand"); break
-                                    } else log("aincrad: variant probe rejected (not m3u8): $cand")
-                                }
-                            }
+                // Single entry per source, chosen by CONTENT, not by JSON field name.
+                // The API is inconsistent: videoSource is sometimes a direct file, sometimes
+                // an HLS playlist. Emitting a playlist as VIDEO type = ExoPlayer error 3003
+                // ("container unsupported") for both playback and download. So: probe each
+                // candidate URL and emit whatever it actually is.
+                val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
+
+                // "m3u8" / "video" / null (unusable, e.g. HTML error page)
+                suspend fun classify(u: String): String? {
+                    val head = try {
+                        // Range keeps this cheap if the server honors it; harmless if ignored
+                        app.get(u, headers = hlsHeaders + mapOf("Range" to "bytes=0-2047")).text
+                    } catch (e: Exception) { log("aincrad: classify failed: ${e.message}"); return null }
+                    val t = head.trimStart()
+                    return when {
+                        t.startsWith("#EXTM3U") -> "m3u8"
+                        t.startsWith("<") || t.contains("<html", ignoreCase = true) -> null
+                        t.isBlank() -> null
+                        else -> "video"
+                    }
+                }
+
+                for (cand in listOf(videoSource, securedLink)) {
+                    if (cand.isBlank() || found) continue
+                    when (classify(cand)) {
+                        "video" -> {
+                            callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.VIDEO) {
+                                quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                            found = true
                         }
-                    } catch (e: Exception) { log("aincrad: master probe failed: ${e.message}") }
-                    callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.M3U8) {
-                        quality = Qualities.P1080.value; referer = playerRef; headers = hlsHeaders })
-                    found = true
+                        "m3u8" -> {
+                            // Downloader parses HLS masters strictly (requireAudio filter can throw
+                            // "M3u8 contains no video with audio" on streams that play fine), so
+                            // resolve master -> best-bandwidth media playlist and emit that.
+                            var finalUrl = cand
+                            try {
+                                val body = app.get(cand, headers = hlsHeaders).text
+                                if (body.contains("#EXT-X-STREAM-INF")) {
+                                    // BANDWIDTH is spec-required on STREAM-INF (RFC 8216 §4.3.4.2).
+                                    // [^#\s] guard: never capture a comment line as the variant URI.
+                                    val varRe = Regex("""#EXT-X-STREAM-INF:[^\n]*?BANDWIDTH=(\d+)[^\n]*\n\s*([^#\s]\S*)""")
+                                    val best = varRe.findAll(body)
+                                        .maxByOrNull { it.groupValues[1].toLongOrNull() ?: 0L }?.groupValues?.get(2)
+                                    if (!best.isNullOrBlank()) {
+                                        // URI.resolve drops the base query string (token loss = 3003),
+                                        // so also try re-attaching it; probe before trusting either.
+                                        val c1 = try { java.net.URI(cand).resolve(best).toString() } catch (_: Exception) { null }
+                                        val baseQuery = cand.substringAfter('?', "")
+                                        val c2 = if (c1 != null && !c1.contains('?') && baseQuery.isNotBlank()) "$c1?$baseQuery" else null
+                                        for (v in listOfNotNull(c1, c2)) {
+                                            if (classify(v) == "m3u8") { finalUrl = v; log("aincrad: master->variant $v"); break }
+                                            else log("aincrad: variant rejected: $v")
+                                        }
+                                    }
+                                }
+                            } catch (e: Exception) { log("aincrad: master probe failed: ${e.message}") }
+                            callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.M3U8) {
+                                quality = Qualities.P1080.value; referer = playerRef; headers = hlsHeaders })
+                            found = true
+                        }
+                        else -> log("aincrad: candidate unusable, trying next")
+                    }
                 }
                 continue
             }
