@@ -514,8 +514,20 @@ class AnizleProvider : MainAPI() {
                             val best = varRe.findAll(body)
                                 .maxByOrNull { it.groupValues[1].toLongOrNull() ?: 0L }?.groupValues?.get(2)
                             if (!best.isNullOrBlank()) {
-                                finalUrl = try { java.net.URI(securedLink).resolve(best).toString() } catch (_: Exception) { best }
-                                log("aincrad: master->variant $finalUrl")
+                                // Candidate 1: normal resolution. NOTE: URI.resolve drops the base
+                                // URL's query string — kills token-in-query streams (ExoPlayer 3003).
+                                // Candidate 2: same but with the master's query re-attached.
+                                val c1 = try { java.net.URI(securedLink).resolve(best).toString() } catch (_: Exception) { null }
+                                val baseQuery = securedLink.substringAfter('?', "")
+                                val c2 = if (c1 != null && !c1.contains('?') && baseQuery.isNotBlank()) "$c1?$baseQuery" else null
+                                // Probe candidates: only trust a URL that actually serves an m3u8.
+                                // Anything else (HTML error page etc.) => keep original securedLink.
+                                for (cand in listOfNotNull(c1, c2)) {
+                                    val probe = try { app.get(cand, headers = hlsHeaders).text } catch (_: Exception) { continue }
+                                    if (probe.trimStart().startsWith("#EXTM3U")) {
+                                        finalUrl = cand; log("aincrad: master->variant $cand"); break
+                                    } else log("aincrad: variant probe rejected (not m3u8): $cand")
+                                }
                             }
                         }
                     } catch (e: Exception) { log("aincrad: master probe failed: ${e.message}") }
