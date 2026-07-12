@@ -487,17 +487,40 @@ class AnizleProvider : MainAPI() {
                 val securedLink = json.optString("securedLink", "")
                 val videoSource = json.optString("videoSource", "")
                 log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()}")
-                if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = label, url = securedLink, type = ExtractorLinkType.M3U8) {
-                        quality = Qualities.P1080.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
-                    found = true
-                }
-                // ALWAYS also emit the MP4 when present (previously only in the else
-                // branch). The HLS securedLink token expires quickly, so queued/slow
-                // downloads die mid-way; the plain MP4 downloads reliably.
+                // Single entry per source. Prefer the plain MP4: it both plays and downloads.
+                // The HLS securedLink is a short-TTL token URL — playback starts instantly so it
+                // works, but the downloader fetches segments over minutes and dies when the token
+                // expires. HLS kept only as fallback when no MP4 exists, with full header set so
+                // the downloader presents the same fingerprint the token was issued for.
                 if (videoSource.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = "$label (MP4)", url = videoSource, type = ExtractorLinkType.VIDEO) {
-                        quality = Qualities.Unknown.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
+                    callback(newExtractorLink(source = label, name = label, url = videoSource, type = ExtractorLinkType.VIDEO) {
+                        quality = Qualities.Unknown.value; referer = playerRef
+                        headers = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef) })
+                    found = true
+                } else if (json.optBoolean("hls", false) && securedLink.isNotBlank()) {
+                    // Playback (ExoPlayer) is lenient; CloudStream's downloader parses the HLS
+                    // master playlist strictly (requireAudio variant filter) and can throw
+                    // "M3u8 contains no video with audio" on streams that play fine.
+                    // Fix: resolve master -> best-bandwidth media playlist here and give the
+                    // downloader that directly, skipping master parsing entirely.
+                    val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
+                    var finalUrl = securedLink
+                    try {
+                        val body = app.get(securedLink, headers = hlsHeaders).text
+                        if (body.contains("#EXT-X-STREAM-INF")) {
+                            // BANDWIDTH is spec-required on every STREAM-INF (RFC 8216 §4.3.4.2).
+                            // [^#\s] guard: never capture a comment line as the variant URI.
+                            val varRe = Regex("""#EXT-X-STREAM-INF:[^\n]*?BANDWIDTH=(\d+)[^\n]*\n\s*([^#\s]\S*)""")
+                            val best = varRe.findAll(body)
+                                .maxByOrNull { it.groupValues[1].toLongOrNull() ?: 0L }?.groupValues?.get(2)
+                            if (!best.isNullOrBlank()) {
+                                finalUrl = try { java.net.URI(securedLink).resolve(best).toString() } catch (_: Exception) { best }
+                                log("aincrad: master->variant $finalUrl")
+                            }
+                        }
+                    } catch (e: Exception) { log("aincrad: master probe failed: ${e.message}") }
+                    callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.M3U8) {
+                        quality = Qualities.P1080.value; referer = playerRef; headers = hlsHeaders })
                     found = true
                 }
                 continue
