@@ -67,6 +67,11 @@ class AnizleProvider : MainAPI() {
     // Pre-compiled regexes — avoid recompilation in hot paths
     private val apRe = Regex("""(https?://[a-z0-9]*player[a-z0-9]*\.[a-z.]+)/(?:video|player)/([a-f0-9]{24,40})""", RegexOption.IGNORE_CASE)
     private val gdRe = Regex("""drive\.google\.com/(?:file/d/|uc\?[^"]*id=|open\?[^"]*id=)([A-Za-z0-9_-]{20,})""")
+    // Hosts CloudStream ships extractors for. Anything matching gets forwarded to
+    // loadExtractor(), so upstream maintains them — new host on anizm = add one keyword.
+    private val extractorHostKeywords = listOf(
+        "voe", "sibnet", "dood", "vidmoly", "ok.ru", "okru", "odnoklassniki",
+        "sendvid", "mp4upload", "uqload", "hdvid", "abyss")
     private val csrfRe1 = Regex("""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']""")
     private val csrfRe2 = Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""")
     private val numIdRe = Regex("""/video/(\d+)""")
@@ -109,6 +114,32 @@ class AnizleProvider : MainAPI() {
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
 
     // ── Batch embed resolver ────────────────────────────────────────────────
+    // WebView-less fallback: plain GET of /player/{numId} and regex for the embed the
+    // page would have loaded. Works only if the site serves the embed URL server-side
+    // (no JS assembly). Used when WebView is unavailable (no Context on some TV builds)
+    // or for ids the WebView run failed to resolve (timeout/cancel). Fail = empty, never worse.
+    private suspend fun httpResolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
+        val out = mutableMapOf<String, String>()
+        for (nid in numIds) {
+            val html = try {
+                app.get("$mainUrl/player/$nid", headers = baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8).text
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("httpResolve: $nid failed: ${e.message}"); continue }
+            apRe.find(html)?.let { m ->
+                val domain = m.groupValues[1]
+                if (!playerBase.contains(domain.substringAfter("://"))) { playerBase = domain; log("httpResolve: player domain updated to $domain") }
+                out[nid] = "ap:${m.groupValues[2]}"; log("httpResolve: ap for $nid")
+            } ?: gdRe.find(html)?.let { m ->
+                out[nid] = "gd:${m.groupValues[1]}"; log("httpResolve: gd for $nid")
+            } ?: Regex("""https?://[^\s"'<>\\]+""").findAll(html)
+                .map { it.value }
+                .firstOrNull { u -> extractorHostKeywords.any { u.contains(it, ignoreCase = true) } }
+                ?.let { out[nid] = "ex:$it"; log("httpResolve: ex for $nid") }
+            ?: log("httpResolve: no embed found in /player/$nid (likely JS-assembled)")
+        }
+        return out
+    }
+
     private suspend fun resolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
         if (numIds.isEmpty()) return emptyMap()
         val results = mutableMapOf<String, String>()
@@ -220,6 +251,13 @@ class AnizleProvider : MainAPI() {
                                 handler.post { wv.evaluateJavascript("_b.h('ap:${m.groupValues[2]}')", null) }
                                 return emptyResponse()
                             }
+                        }
+                        if (extractorHostKeywords.any { host.contains(it) }) {
+                            // First cross-domain hit for this numId that matches a known
+                            // video host = the embed itself (each /player/nid loads one host)
+                            val esc = url.replace("\\", "\\\\").replace("'", "\\'")
+                            handler.post { wv.evaluateJavascript("_b.h('ex:$esc')", null) }
+                            return emptyResponse()
                         }
                         if (host.contains("google")) {
                             gdRe.find(url)?.let { m ->
@@ -440,7 +478,8 @@ class AnizleProvider : MainAPI() {
             log("loadLinks: $fansubName: ${videos.map { it.second }}")
             for ((videoUrl, videoName) in videos) {
                 val vl = videoName.lowercase()
-                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive")) continue
+                val isExtractorHost = extractorHostKeywords.any { vl.contains(it) }
+                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive") && !isExtractorHost) continue
                 val numId = numIdRe.find(videoUrl)?.groupValues?.get(1) ?: continue
                 allWanted.add(VidInfo(numId, videoName, fansubName))
             }
@@ -463,6 +502,13 @@ class AnizleProvider : MainAPI() {
         if (uncachedIds.isNotEmpty()) {
             val resolved = try { resolveEmbeds(uncachedIds, data) } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}"); emptyMap() }
             for ((id, embed) in resolved) { embedMap[id] = embed; putCache(id, embed) }
+            // Anything WebView couldn't deliver (no Context, timeout, cancel of a numId):
+            // one cheap HTTP attempt each before giving up on the source.
+            val missing = uncachedIds.filter { it !in embedMap }
+            if (missing.isNotEmpty()) {
+                log("loadLinks: ${missing.size} unresolved, trying HTTP fallback")
+                for ((id, embed) in httpResolveEmbeds(missing, data)) { embedMap[id] = embed; putCache(id, embed) }
+            }
         }
         log("loadLinks: total ${embedMap.size}/${uniqueIds.size}: $embedMap")
 
@@ -473,6 +519,16 @@ class AnizleProvider : MainAPI() {
             val label = "${vi.fansub} - ${vi.name.replace(adsRe, "").trim()}"
             log("step4: $label embed=$embed")
 
+            if (embed.startsWith("ex:")) {
+                val exUrl = embed.removePrefix("ex:")
+                log("step4: $label -> loadExtractor $exUrl")
+                try {
+                    if (loadExtractor(exUrl, data, subtitleCallback, callback)) found = true
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
+                continue
+            }
+
             if (embed.startsWith("ap:")) {
                 val hash = embed.removePrefix("ap:")
                 val playerRef = "$playerBase/player/$hash"
@@ -482,6 +538,7 @@ class AnizleProvider : MainAPI() {
                 // validates against, and mirrors real browser order (page → XHR).
                 try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")) } catch (_: Exception) {}
                 val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
                     catch (e: Exception) { log("aincrad error: ${e.message}"); continue }
                 val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
                 val securedLink = json.optString("securedLink", "")
@@ -489,65 +546,41 @@ class AnizleProvider : MainAPI() {
                 log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()}")
                 // Single entry per source, chosen by CONTENT, not by JSON field name.
                 // The API is inconsistent: videoSource is sometimes a direct file, sometimes
-                // an HLS playlist. Emitting a playlist as VIDEO type = ExoPlayer error 3003
-                // ("container unsupported") for both playback and download. So: probe each
-                // candidate URL and emit whatever it actually is.
+                // an HLS playlist. Emitting a playlist as VIDEO type = ExoPlayer error 3003.
+                // One probe per candidate decides the real type.
+                //
+                // NOTE ON DOWNLOADS: masters are emitted AS-IS (no variant bypass). CloudStream's
+                // downloader refuses HLS with separate audio renditions by design ("muxing is
+                // required" — M3u8Helper.hslLazy/requireAudio); bypassing to a video-only variant
+                // "fixes" the download but produces silent video. Muxed masters download fine
+                // untouched. Split-audio masters: streaming works (with sound), download errors —
+                // an app-level limitation no extension can work around with a single link.
                 val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
-
-                // "m3u8" / "video" / null (unusable, e.g. HTML error page)
-                suspend fun classify(u: String): String? {
-                    val head = try {
-                        // Range keeps this cheap if the server honors it; harmless if ignored
-                        app.get(u, headers = hlsHeaders + mapOf("Range" to "bytes=0-2047")).text
-                    } catch (e: Exception) { log("aincrad: classify failed: ${e.message}"); return null }
-                    val t = head.trimStart()
-                    return when {
-                        t.startsWith("#EXTM3U") -> "m3u8"
-                        t.startsWith("<") || t.contains("<html", ignoreCase = true) -> null
-                        t.isBlank() -> null
-                        else -> "video"
-                    }
-                }
 
                 for (cand in listOf(videoSource, securedLink)) {
                     if (cand.isBlank() || found) continue
-                    when (classify(cand)) {
-                        "video" -> {
+                    val head = try {
+                        // Range keeps this cheap if honored; playlists are small anyway
+                        app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8).text
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e // never swallow cancellation: dropped sources otherwise (Seicode bug)
+                    } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
+                    val t = head.trimStart()
+                    when {
+                        t.startsWith("#EXTM3U") -> {
+                            if (t.contains("TYPE=AUDIO"))
+                                log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
+                            callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.M3U8) {
+                                quality = Qualities.P1080.value; referer = playerRef; headers = hlsHeaders })
+                            found = true
+                        }
+                        t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
+                            log("aincrad: candidate unusable, trying next")
+                        else -> {
                             callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.VIDEO) {
                                 quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                             found = true
                         }
-                        "m3u8" -> {
-                            // Downloader parses HLS masters strictly (requireAudio filter can throw
-                            // "M3u8 contains no video with audio" on streams that play fine), so
-                            // resolve master -> best-bandwidth media playlist and emit that.
-                            var finalUrl = cand
-                            try {
-                                val body = app.get(cand, headers = hlsHeaders).text
-                                if (body.contains("#EXT-X-STREAM-INF")) {
-                                    // BANDWIDTH is spec-required on STREAM-INF (RFC 8216 §4.3.4.2).
-                                    // [^#\s] guard: never capture a comment line as the variant URI.
-                                    val varRe = Regex("""#EXT-X-STREAM-INF:[^\n]*?BANDWIDTH=(\d+)[^\n]*\n\s*([^#\s]\S*)""")
-                                    val best = varRe.findAll(body)
-                                        .maxByOrNull { it.groupValues[1].toLongOrNull() ?: 0L }?.groupValues?.get(2)
-                                    if (!best.isNullOrBlank()) {
-                                        // URI.resolve drops the base query string (token loss = 3003),
-                                        // so also try re-attaching it; probe before trusting either.
-                                        val c1 = try { java.net.URI(cand).resolve(best).toString() } catch (_: Exception) { null }
-                                        val baseQuery = cand.substringAfter('?', "")
-                                        val c2 = if (c1 != null && !c1.contains('?') && baseQuery.isNotBlank()) "$c1?$baseQuery" else null
-                                        for (v in listOfNotNull(c1, c2)) {
-                                            if (classify(v) == "m3u8") { finalUrl = v; log("aincrad: master->variant $v"); break }
-                                            else log("aincrad: variant rejected: $v")
-                                        }
-                                    }
-                                }
-                            } catch (e: Exception) { log("aincrad: master probe failed: ${e.message}") }
-                            callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.M3U8) {
-                                quality = Qualities.P1080.value; referer = playerRef; headers = hlsHeaders })
-                            found = true
-                        }
-                        else -> log("aincrad: candidate unusable, trying next")
                     }
                 }
                 continue
