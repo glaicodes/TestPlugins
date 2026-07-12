@@ -523,7 +523,16 @@ class AnizleProvider : MainAPI() {
                 val exUrl = embed.removePrefix("ex:")
                 log("step4: $label -> loadExtractor $exUrl")
                 try {
-                    if (loadExtractor(exUrl, data, subtitleCallback, callback)) found = true
+                    // Collect, then re-emit with the fansub in the name — otherwise these
+                    // links show only the extractor name ("Voe") with no fansub attribution
+                    val collected = mutableListOf<ExtractorLink>()
+                    loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
+                    for (l in collected) {
+                        val q = if (l.quality > 0) " ${l.quality}p" else ""
+                        callback(newExtractorLink(source = "${vi.fansub} - ${l.name}", name = "${vi.fansub} - ${l.name}$q", url = l.url, type = l.type) {
+                            referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
+                        found = true
+                    }
                 } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
                 continue
@@ -570,8 +579,12 @@ class AnizleProvider : MainAPI() {
                         t.startsWith("#EXTM3U") -> {
                             if (t.contains("TYPE=AUDIO"))
                                 log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
-                            callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.M3U8) {
-                                quality = Qualities.P1080.value; referer = playerRef; headers = hlsHeaders })
+                            // Real resolution from the master (RESOLUTION=WxH on STREAM-INF lines)
+                            val h = Regex("""RESOLUTION=\d+x(\d+)""").findAll(t)
+                                .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
+                            val disp = if (h != null) "$label ${h}p" else label
+                            callback(newExtractorLink(source = label, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
+                                quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                             found = true
                         }
                         t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
