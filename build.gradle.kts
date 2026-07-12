@@ -68,11 +68,17 @@ subprojects {
     }
 
     dependencies {
-        val cloudstream by configurations
         val implementation by configurations
+        val compileOnly by configurations
 
-        // Stubs for all cloudstream classes
-        cloudstream("com.lagradost:cloudstream3:pre-release")
+        // NEW dependency system (replaces old `cloudstream("com.lagradost:cloudstream3:pre-release")`).
+        // Old system (ApkConfigurationProvider) downloaded + unpacked the whole prerelease APK
+        // every build; removed upstream 2026-04. This is a plain prebuilt maven artifact — much faster.
+        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+
+        // Coroutines: app ships 1.11.0 at runtime; compileOnly = compile against it
+        // without bundling duplicate classes into the .cs3
+        compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
