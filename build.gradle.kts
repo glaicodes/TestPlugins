@@ -61,7 +61,9 @@ subprojects {
                 freeCompilerArgs.addAll(
                     "-Xno-call-assertions",
                     "-Xno-param-assertions",
-                    "-Xno-receiver-assertions"
+                    "-Xno-receiver-assertions",
+                    // From upstream PR #37: correct annotation defaults on Kotlin 2.x
+                    "-Xannotation-default-target=param-property"
                 )
             }
         }
