@@ -13,8 +13,8 @@ import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
 
 class AnizleProvider : MainAPI() {
 
@@ -25,6 +25,9 @@ class AnizleProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private var playerBase = "https://anizmplayer.com"
+    // Single UA everywhere (OkHttp + WebView). Cookies are shared via CookieManager,
+    // so presenting two different UAs on the same session is an easy fingerprint.
+    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     private val cfKiller   = CloudflareKiller()
     private var csrfToken: String? = null
     private var sessionFetchedAt: Long = 0L
@@ -33,7 +36,8 @@ class AnizleProvider : MainAPI() {
     // Hash cache — numId → embed string, with timestamps for TTL
     // Hashes are content-based (not session-based) so safe to cache
     private data class CachedEmbed(val embed: String, val time: Long)
-    private val embedCache = mutableMapOf<String, CachedEmbed>()
+    // ConcurrentHashMap: loadLinks can run concurrently (prefetch + user click)
+    private val embedCache = java.util.concurrent.ConcurrentHashMap<String, CachedEmbed>()
     private val cacheTtlMs = 30 * 60 * 1000L // 30 minutes
 
     private fun getCached(numId: String): String? {
@@ -43,11 +47,14 @@ class AnizleProvider : MainAPI() {
     }
     private fun putCache(numId: String, embed: String) {
         embedCache[numId] = CachedEmbed(embed, System.currentTimeMillis())
-        // Evict old entries if cache grows too large
         if (embedCache.size > 200) {
             val now = System.currentTimeMillis()
-            val iter = embedCache.iterator()
-            while (iter.hasNext()) { if (now - iter.next().value.time > cacheTtlMs) iter.remove() }
+            embedCache.entries.removeAll { now - it.value.time > cacheTtlMs } // Kotlin stdlib, safe on minSdk 21
+            // Hard cap even if everything is fresh: drop oldest down to 150
+            if (embedCache.size > 200) {
+                embedCache.entries.sortedBy { it.value.time }.take(embedCache.size - 150)
+                    .forEach { embedCache.remove(it.key) }
+            }
         }
     }
 
@@ -85,10 +92,10 @@ class AnizleProvider : MainAPI() {
     private fun isCf(html: String) = html.contains("Just a moment", true) || html.contains("cf-browser-verification", true)
 
     private val baseHeaders get() = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent" to ua,
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Referer" to "$mainUrl/")
     private val xhrHeaders get() = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent" to ua,
         "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Origin" to mainUrl, "Referer" to "$mainUrl/",
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
 
@@ -97,17 +104,17 @@ class AnizleProvider : MainAPI() {
         if (numIds.isEmpty()) return emptyMap()
         val results = mutableMapOf<String, String>()
 
-        return suspendCoroutine { cont ->
+        return suspendCancellableCoroutine { cont ->
             val handler = android.os.Handler(Looper.getMainLooper())
             handler.post {
                 var done = false
                 val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (_: Exception) { null }
-                if (ctx == null) { log("resolve: no context"); cont.resume(emptyMap()); return@post }
+                if (ctx == null) { log("resolve: no context"); if (cont.isActive) cont.resume(emptyMap()); return@post }
 
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true; settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    settings.userAgentString = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                    settings.userAgentString = ua // match OkHttp UA — same cookies, same fingerprint
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
@@ -115,8 +122,16 @@ class AnizleProvider : MainAPI() {
                 // automatically within the same app process — no manual sync needed
 
                 fun finish() {
-                    if (!done) { done = true; try { wv.stopLoading(); wv.destroy() } catch (_: Exception) {}; cont.resume(results) }
+                    if (!done) {
+                        done = true
+                        handler.removeCallbacksAndMessages(null) // clear all pending timeouts/delays
+                        try { wv.stopLoading(); wv.destroy() } catch (_: Exception) {}
+                        if (cont.isActive) cont.resume(results)
+                    }
                 }
+                // If the caller's coroutine is cancelled (user leaves screen), tear the
+                // WebView down instead of leaking it until the 35s global timeout.
+                cont.invokeOnCancellation { handler.post { finish() } }
 
                 val globalTimeout = Runnable { log("resolve: global timeout (${results.size}/${numIds.size})"); finish() }
                 handler.postDelayed(globalTimeout, 35_000L)
@@ -450,8 +465,11 @@ class AnizleProvider : MainAPI() {
             if (embed.startsWith("ap:")) {
                 val hash = embed.removePrefix("ap:")
                 val playerRef = "$playerBase/player/$hash"
-                val aHeaders = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+                val aHeaders = mapOf("User-Agent" to ua,
                     "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, */*; q=0.01", "Referer" to playerRef, "Origin" to playerBase)
+                // Warm the player page first: establishes PHPSESSID the token endpoint
+                // validates against, and mirrors real browser order (page → XHR).
+                try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")) } catch (_: Exception) {}
                 val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
                     catch (e: Exception) { log("aincrad error: ${e.message}"); continue }
                 val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
@@ -462,8 +480,13 @@ class AnizleProvider : MainAPI() {
                     callback(newExtractorLink(source = label, name = label, url = securedLink, type = ExtractorLinkType.M3U8) {
                         quality = Qualities.P1080.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
                     found = true
-                } else if (videoSource.isNotBlank()) {
-                    callback(newExtractorLink(source = label, name = label, url = videoSource, type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value; referer = playerRef })
+                }
+                // ALWAYS also emit the MP4 when present (previously only in the else
+                // branch). The HLS securedLink token expires quickly, so queued/slow
+                // downloads die mid-way; the plain MP4 downloads reliably.
+                if (videoSource.isNotBlank()) {
+                    callback(newExtractorLink(source = label, name = "$label (MP4)", url = videoSource, type = ExtractorLinkType.VIDEO) {
+                        quality = Qualities.Unknown.value; referer = playerRef; headers = mapOf("Origin" to playerBase, "Referer" to playerRef) })
                     found = true
                 }
                 continue
