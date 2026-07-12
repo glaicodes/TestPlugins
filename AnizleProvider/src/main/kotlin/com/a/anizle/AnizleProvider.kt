@@ -108,7 +108,7 @@ class AnizleProvider : MainAPI() {
             val handler = android.os.Handler(Looper.getMainLooper())
             handler.post {
                 var done = false
-                val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (_: Exception) { null }
+                val ctx = try { com.lagradost.cloudstream3.CloudStreamApp.context } catch (_: Throwable) { null }
                 if (ctx == null) { log("resolve: no context"); if (cont.isActive) cont.resume(emptyMap()); return@post }
 
                 val wv = WebView(ctx).apply {
