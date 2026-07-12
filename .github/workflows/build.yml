@@ -46,6 +46,11 @@ jobs:
       # Caches gradle wrapper, dependencies and build cache between CI runs
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          # From upstream PR #37: lets CI cache the Gradle configuration cache.
+          # Create the secret with: openssl rand -base64 16
+          # (repo Settings -> Secrets and variables -> Actions -> GRADLE_ENCRYPTION_KEY)
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
       - name: Build Plugins
         run: |
@@ -63,5 +68,9 @@ jobs:
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
           git add .
-          git commit --amend -m "Build $GITHUB_SHA" || exit 0   # do not error if nothing to commit
-          git push --force
+          # Plain append commit — NOT --amend/--force. Force-pushing rewrote the same
+          # commit, which raw.githubusercontent's CDN never reliably invalidated
+          # (source of the multi-hour stale plugins.json / hash mismatch).
+          # A new commit = new object = clean cache bust.
+          git commit -m "Build $GITHUB_SHA" || exit 0   # do not error if nothing to commit
+          git push
