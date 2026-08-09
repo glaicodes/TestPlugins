@@ -14,7 +14,13 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         // Cloudstream gradle plugin which makes everything work and builds plugins
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
+        // Pinned (was ":-SNAPSHOT"). Floating on SNAPSHOT is what broke the build twice
+        // before (Plugin->BasePlugin, AcraApplication removal) — upstream pushed, our
+        // build silently picked up the new commit mid-flight. Pinned = only changes when
+        // WE bump it. This is the commit :-SNAPSHOT currently resolves to (2026-07-02,
+        // "Update dependencies and enable build and configuration cache #15"), so this is
+        // a no-op today and a deliberate choice tomorrow.
+        classpath("com.github.recloudstream:gradle:32895aedb6")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
@@ -76,7 +82,11 @@ subprojects {
         // NEW dependency system (replaces old `cloudstream("com.lagradost:cloudstream3:pre-release")`).
         // Old system (ApkConfigurationProvider) downloaded + unpacked the whole prerelease APK
         // every build; removed upstream 2026-04. This is a plain prebuilt maven artifact — much faster.
-        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+        // Pinned for the same reason as the plugin above — this is what let BasePlugin/
+        // getContext/CloudflareKiller's shape change under us without warning. Pinned to
+        // recloudstream/cloudstream master as of 2026-08-05; bump deliberately when you
+        // want a newer library, not automatically on every CI run.
+        implementation("com.github.recloudstream.cloudstream:library:a72f9e6c3f")
 
         // Coroutines: app ships 1.11.0 at runtime; compileOnly = compile against it
         // without bundling duplicate classes into the .cs3
