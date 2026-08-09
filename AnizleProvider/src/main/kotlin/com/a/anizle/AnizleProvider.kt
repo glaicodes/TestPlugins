@@ -582,7 +582,15 @@ class AnizleProvider : MainAPI() {
                             // Real resolution from the master (RESOLUTION=WxH on STREAM-INF lines)
                             val h = Regex("""RESOLUTION=\d+x(\d+)""").findAll(t)
                                 .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
-                            val disp = if (h != null) "$label ${h}p" else label
+                            // label already carries the site's own quality tag (from vi.name,
+                            // e.g. "Aincrad - 1080p") — strip it before adding the one we just
+                            // verified from the playlist, so exactly one is shown, and it's
+                            // always the real one rather than whatever the site claims.
+                            val cleanLabel = label.replace(Regex("""\b\d{3,4}[pP]\b"""), "")
+                                .replace(Regex("""\(\s*\)"""), "")
+                                .replace(Regex("""\s{2,}"""), " ")
+                                .trim().trimEnd('-', ' ').trim()
+                            val disp = if (h != null) "$cleanLabel ${h}p" else label
                             callback(newExtractorLink(source = label, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
                                 quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                             found = true
@@ -602,14 +610,54 @@ class AnizleProvider : MainAPI() {
             if (embed.startsWith("gd:")) {
                 val fileId = embed.removePrefix("gd:")
                 log("gdrive: fileId=$fileId for $label")
-                callback(newExtractorLink(source = label, name = label,
-                    url = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t",
-                    type = ExtractorLinkType.VIDEO) { quality = Qualities.Unknown.value; referer = "https://drive.google.com/" })
-                found = true
+                val resolved = try { resolveGDrive(fileId) }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
+                if (resolved != null) {
+                    val (finalUrl, dlHeaders) = resolved
+                    callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.VIDEO) {
+                        quality = Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = dlHeaders })
+                    found = true
+                } else log("gdrive: could not resolve a playable link for $fileId")
                 continue
             }
         }
         log("loadLinks: done, found=$found")
         return found
+    }
+
+    // GDrive's `confirm=t` is not a real token — it only happens to work when Google skips
+    // the virus-scan interstitial (small/short files). Anything past that threshold serves
+    // an HTML confirmation page instead of video, which the player then fails to open
+    // ("setDataSource failed"). Real fix: fetch that page, scrape the actual `confirm` +
+    // `uuid` values Google issues, and replay them — this is Google's own two-step flow,
+    // not a workaround. Every request uses a small Range so a multi-GB file is never
+    // pulled through just to read its headers.
+    private suspend fun resolveGDrive(fileId: String): Pair<String, Map<String, String>>? {
+        val h = mapOf("User-Agent" to ua, "Range" to "bytes=0-2047")
+        val base = "https://drive.usercontent.google.com/download?id=$fileId&export=download"
+        val r1 = app.get(base, headers = h, timeout = 15)
+        val ct1 = r1.headers["Content-Type"] ?: ""
+        if (!ct1.contains("text/html", ignoreCase = true)) {
+            // No interstitial for this file — first response IS the video.
+            val cookie = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            val headers = mapOf("User-Agent" to ua) + (if (cookie.isNotBlank()) mapOf("Cookie" to cookie) else emptyMap())
+            log("gdrive: no interstitial, direct link")
+            return r1.url to headers
+        }
+        val html = r1.text
+        val confirm = Regex("""name="confirm"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
+        val uuid = Regex("""name="uuid"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
+        if (confirm == null) { log("gdrive: no confirm field in interstitial (page structure changed?)"); return null }
+        val cookie1 = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val h2 = h + (if (cookie1.isNotBlank()) mapOf("Cookie" to cookie1) else emptyMap())
+        val confirmUrl = "$base&confirm=$confirm" + (uuid?.let { "&uuid=$it" } ?: "")
+        val r2 = app.get(confirmUrl, headers = h2, timeout = 15)
+        val ct2 = r2.headers["Content-Type"] ?: ""
+        if (ct2.contains("text/html", ignoreCase = true)) { log("gdrive: still HTML after confirm+uuid"); return null }
+        val allCookies = (r1.cookies + r2.cookies).entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val headersFinal = mapOf("User-Agent" to ua) + (if (allCookies.isNotBlank()) mapOf("Cookie" to allCookies) else emptyMap())
+        log("gdrive: resolved via confirm+uuid")
+        return r2.url to headersFinal
     }
 }
