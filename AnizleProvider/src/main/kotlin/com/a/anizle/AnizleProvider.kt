@@ -634,7 +634,13 @@ class AnizleProvider : MainAPI() {
     // not a workaround. Every request uses a small Range so a multi-GB file is never
     // pulled through just to read its headers.
     private suspend fun resolveGDrive(fileId: String): Pair<String, Map<String, String>>? {
-        val h = mapOf("User-Agent" to ua, "Range" to "bytes=0-2047")
+        // Wide range for THIS request specifically: we don't yet know if it's an HTML
+        // interstitial or real media. Google's confirm/uuid form fields sit well past 2KB
+        // (after head/style boilerplate) — a small range was truncating the page before
+        // the regex ever saw them, causing every single GDrive link to fail identically.
+        // 64KB comfortably covers the full interstitial and is still negligible against
+        // an actual multi-MB/GB video response.
+        val h = mapOf("User-Agent" to ua, "Range" to "bytes=0-65535")
         val base = "https://drive.usercontent.google.com/download?id=$fileId&export=download"
         val r1 = app.get(base, headers = h, timeout = 15)
         val ct1 = r1.headers["Content-Type"] ?: ""
@@ -650,7 +656,11 @@ class AnizleProvider : MainAPI() {
         val uuid = Regex("""name="uuid"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
         if (confirm == null) { log("gdrive: no confirm field in interstitial (page structure changed?)"); return null }
         val cookie1 = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        val h2 = h + (if (cookie1.isNotBlank()) mapOf("Cookie" to cookie1) else emptyMap())
+        // Small range here on purpose: r2 is only checked for its Content-Type header and
+        // final redirect URL below, never its body. Reusing h's 64KB range would ask Google
+        // to serve 64KB of real video on every successful resolve for no benefit.
+        val h2 = mapOf("User-Agent" to ua, "Range" to "bytes=0-4095") +
+            (if (cookie1.isNotBlank()) mapOf("Cookie" to cookie1) else emptyMap())
         val confirmUrl = "$base&confirm=$confirm" + (uuid?.let { "&uuid=$it" } ?: "")
         val r2 = app.get(confirmUrl, headers = h2, timeout = 15)
         val ct2 = r2.headers["Content-Type"] ?: ""
