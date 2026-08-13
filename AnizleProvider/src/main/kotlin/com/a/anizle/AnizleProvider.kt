@@ -582,7 +582,7 @@ class AnizleProvider : MainAPI() {
 
                 // Anything WebView couldn't deliver (no Context, timeout, cancel of a
                 // numId): one cheap HTTP attempt each before giving up on the source.
-                val missing = uncachedIds.filter { it !in embedMap }
+                val missing = uncachedIds.filter { !embedMap.containsKey(it) }
                 if (missing.isNotEmpty()) {
                     log("loadLinks: ${missing.size} unresolved, trying HTTP fallback")
                     for ((id, embed) in httpResolveEmbeds(missing, data)) {
@@ -594,7 +594,7 @@ class AnizleProvider : MainAPI() {
             }
         } // suspends here until every dispatched source has actually finished
 
-        for (vi in allWanted) if (vi.numId !in embedMap) log("step4: ${vi.fansub}/${vi.name} MISSING")
+        for (vi in allWanted) if (!embedMap.containsKey(vi.numId)) log("step4: ${vi.fansub}/${vi.name} MISSING")
         log("loadLinks: total ${embedMap.size}/${uniqueIds.size}, found=${found.get()}")
         return found.get()
     }
