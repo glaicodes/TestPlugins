@@ -182,6 +182,14 @@ class AnizleProvider : MainAPI() {
                 val perIdTimeout = arrayOfNulls<Runnable>(1)
                 var usedFallback = false
                 var pageReady = false
+                // Some numIds' pages fire their matching request a second time (retry/
+                // prefetch/duplicate redirect) shortly after the first. If that echo
+                // arrives after resolveNext() has already moved currentTarget on to the
+                // next numId, it gets misattributed there — same hash filed under two
+                // numIds, which shows up as the same stream listed twice under different
+                // labels (e.g. "Aincrad 1080p" and "GDrive 1080p" both playing the same
+                // Aincrad source). Fix: only ever act on a given matched value once.
+                val seenEmbeds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
                 fun resolveNext() {
                     perIdTimeout[0]?.let { handler.removeCallbacks(it) }
@@ -198,10 +206,18 @@ class AnizleProvider : MainAPI() {
                     log("resolve: [${currentIdx}/${numIds.size}] numId=$nid")
 
                     perIdTimeout[0] = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
-                    handler.postDelayed(perIdTimeout[0]!!, 3_000L)
+                    // 1.5s, not 3s: across 89 successful resolves in the user's own log, the
+                    // slowest was 0.91s (p90 0.81s). A numId still unresolved past ~1.5s is
+                    // dead, not slow — the old 3s just doubled the wasted wait on broken ones.
+                    handler.postDelayed(perIdTimeout[0]!!, 1_500L)
 
-                    // Stealth: 200-600ms random delay between iframes (fast but still human-like)
-                    val delay = if (currentIdx == 0) 0L else (200L + (Math.random() * 400).toLong())
+                    // Stealth: random delay between iframes. Trimmed from the original
+                    // 200-600ms — that alone cost ~20s on a 53-source episode. Lower risk
+                    // than it looks: this delay is between *our own sequential requests*,
+                    // not a CF challenge-response, so it mainly needs to avoid a suspiciously
+                    // uniform/instant firing pattern, not hit a specific human-speed target.
+                    // If CF blocks return, widen this back first before touching anything else.
+                    val delay = if (currentIdx == 0) 0L else (90L + (Math.random() * 140).toLong())
                     handler.postDelayed({
                         if (done) return@postDelayed
                         wv.evaluateJavascript(
@@ -248,21 +264,25 @@ class AnizleProvider : MainAPI() {
                                 if (!playerBase.contains(domain.substringAfter("://"))) {
                                     playerBase = domain; log("resolve: player domain updated to $domain")
                                 }
-                                handler.post { wv.evaluateJavascript("_b.h('ap:${m.groupValues[2]}')", null) }
+                                if (seenEmbeds.add(m.groupValues[2]))
+                                    handler.post { wv.evaluateJavascript("_b.h('ap:${m.groupValues[2]}')", null) }
                                 return emptyResponse()
                             }
                         }
                         if (extractorHostKeywords.any { host.contains(it) }) {
                             // First cross-domain hit for this numId that matches a known
                             // video host = the embed itself (each /player/nid loads one host)
-                            val esc = url.replace("\\", "\\\\").replace("'", "\\'")
-                            handler.post { wv.evaluateJavascript("_b.h('ex:$esc')", null) }
+                            if (seenEmbeds.add(url)) {
+                                val esc = url.replace("\\", "\\\\").replace("'", "\\'")
+                                handler.post { wv.evaluateJavascript("_b.h('ex:$esc')", null) }
+                            }
                             return emptyResponse()
                         }
                         if (host.contains("google")) {
                             gdRe.find(url)?.let { m ->
                                 log("resolve: GDrive: ${m.groupValues[1]}")
-                                handler.post { wv.evaluateJavascript("_b.h('gd:${m.groupValues[1]}')", null) }
+                                if (seenEmbeds.add(m.groupValues[1]))
+                                    handler.post { wv.evaluateJavascript("_b.h('gd:${m.groupValues[1]}')", null) }
                                 return emptyResponse()
                             }
                         }
@@ -566,8 +586,14 @@ class AnizleProvider : MainAPI() {
                 // an app-level limitation no extension can work around with a single link.
                 val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
 
+                // Local to THIS source only. Using the outer `found` here was a bug: once
+                // any source anywhere in the function succeeded, `found` was permanently
+                // true, so every later Aincrad candidate loop skipped on its first check
+                // (line below) — silently dropping that fansub's Aincrad option entirely
+                // rather than just picking one candidate the way this loop intends to.
+                var resolved = false
                 for (cand in listOf(videoSource, securedLink)) {
-                    if (cand.isBlank() || found) continue
+                    if (cand.isBlank() || resolved) continue
                     val head = try {
                         // Range keeps this cheap if honored; playlists are small anyway
                         app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8).text
@@ -593,17 +619,18 @@ class AnizleProvider : MainAPI() {
                             val disp = if (h != null) "$cleanLabel ${h}p" else label
                             callback(newExtractorLink(source = label, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
                                 quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                            found = true
+                            resolved = true
                         }
                         t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
                             log("aincrad: candidate unusable, trying next")
                         else -> {
                             callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.VIDEO) {
                                 quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                            found = true
+                            resolved = true
                         }
                     }
                 }
+                if (resolved) found = true
                 continue
             }
 
