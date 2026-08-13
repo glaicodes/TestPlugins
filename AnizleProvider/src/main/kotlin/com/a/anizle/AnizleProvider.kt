@@ -13,6 +13,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlin.coroutines.resume
 
 class AnizleProvider : MainAPI() {
@@ -42,6 +46,10 @@ class AnizleProvider : MainAPI() {
     // Hash cache — numId → embed string, with timestamps for TTL
     // Hashes are content-based (not session-based) so safe to cache
     private data class CachedEmbed(val embed: String, val time: Long)
+    // Was local to loadLinks; now needed at class level so processSource() can take it
+    // as a parameter — loadLinks dispatches each source to it as soon as that source's
+    // numId resolves, instead of waiting for every source in the episode to resolve first.
+    private data class VidInfo(val numId: String, val name: String, val fansub: String)
     // ConcurrentHashMap: loadLinks can run concurrently (prefetch + user click)
     private val embedCache = java.util.concurrent.ConcurrentHashMap<String, CachedEmbed>()
     private val cacheTtlMs = 30 * 60 * 1000L // 30 minutes
@@ -140,7 +148,14 @@ class AnizleProvider : MainAPI() {
         return out
     }
 
-    private suspend fun resolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
+    private suspend fun resolveEmbeds(
+        numIds: List<String>,
+        episodeUrl: String,
+        // Fires the instant each numId resolves, from whatever thread the WebView's JS
+        // bridge calls back on (not necessarily the caller's thread — CoroutineScope.launch
+        // is safe to call from any thread, so the caller can dispatch straight from here).
+        onResolved: (numId: String, embed: String) -> Unit = { _, _ -> },
+    ): Map<String, String> {
         if (numIds.isEmpty()) return emptyMap()
         val results = mutableMapOf<String, String>()
 
@@ -234,6 +249,7 @@ class AnizleProvider : MainAPI() {
                         val tgt = currentTarget
                         if (v.isNotBlank() && tgt.isNotBlank() && !results.containsKey(tgt)) {
                             log("resolve: $v for numId=$tgt"); results[tgt] = v
+                            onResolved(tgt, v)
                         }
                         handler.post { resolveNext() }
                     }
@@ -486,7 +502,6 @@ class AnizleProvider : MainAPI() {
         log("loadLinks: ${translators.size} translators: ${translators.map { it.second }}")
         if (translators.isEmpty()) return false
 
-        data class VidInfo(val numId: String, val name: String, val fansub: String)
         val allWanted = mutableListOf<VidInfo>()
         for ((trUrl, fansubName) in translators) {
             val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text } catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); continue }
@@ -508,149 +523,202 @@ class AnizleProvider : MainAPI() {
         if (allWanted.isEmpty()) return false
 
         val uniqueIds = allWanted.map { it.numId }.distinct()
+        val byNumId = allWanted.groupBy { it.numId } // never mutated after this — safe to read from any thread
 
-        // Check cache first — skip WebView entirely if all cached
-        val embedMap = mutableMapOf<String, String>()
+        // ConcurrentHashMap: written from this function's own thread (cache hits, HTTP
+        // fallback) and from the WebView's JS-bridge thread (via onResolved below) as
+        // sources resolve throughout the function, not just at one point in time.
+        val embedMap = java.util.concurrent.ConcurrentHashMap<String, String>()
         val uncachedIds = mutableListOf<String>()
         for (id in uniqueIds) {
             val cached = getCached(id)
-            if (cached != null) { embedMap[id] = cached } else { uncachedIds.add(id) }
+            if (cached != null) embedMap[id] = cached else uncachedIds.add(id)
         }
         log("loadLinks: ${uniqueIds.size} unique, ${embedMap.size} cached, ${uncachedIds.size} to resolve")
 
-        // Only spin up WebView for uncached numIds
-        if (uncachedIds.isNotEmpty()) {
-            val resolved = try { resolveEmbeds(uncachedIds, data) } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}"); emptyMap() }
-            for ((id, embed) in resolved) { embedMap[id] = embed; putCache(id, embed) }
-            // Anything WebView couldn't deliver (no Context, timeout, cancel of a numId):
-            // one cheap HTTP attempt each before giving up on the source.
-            val missing = uncachedIds.filter { it !in embedMap }
-            if (missing.isNotEmpty()) {
-                log("loadLinks: ${missing.size} unresolved, trying HTTP fallback")
-                for ((id, embed) in httpResolveEmbeds(missing, data)) { embedMap[id] = embed; putCache(id, embed) }
-            }
-        }
-        log("loadLinks: total ${embedMap.size}/${uniqueIds.size}: $embedMap")
+        // Old shape: resolve every numId via WebView (up to 35s), THEN fetch every
+        // source's actual stream one at a time (another ~20-30s) — nothing reached the
+        // player until both phases fully finished, ~55-70s on a full episode.
+        //
+        // New shape: the moment a numId resolves — cache hit, WebView match, or HTTP
+        // fallback — immediately start that source's network work, concurrently with the
+        // WebView still resolving everything else. First playable source now shows up
+        // within a couple seconds instead of after the whole batch completes.
+        val found = java.util.concurrent.atomic.AtomicBoolean(false)
+        // Cap concurrent step4 work so a 50-source episode doesn't fire 50 simultaneous
+        // requests at the same handful of hosts — that reads as a burst, not a browser,
+        // and risks the exact CF/rate-limit walls the rest of this file works around.
+        val stepGate = Semaphore(5)
 
-        var found = false
-        for (vi in allWanted) {
-            val embed = embedMap[vi.numId]
-            if (embed == null) { log("step4: ${vi.fansub}/${vi.name} MISSING"); continue }
-            val label = "${vi.fansub} - ${vi.name.replace(adsRe, "").trim()}"
-            log("step4: $label embed=$embed")
-
-            if (embed.startsWith("ex:")) {
-                val exUrl = embed.removePrefix("ex:")
-                log("step4: $label -> loadExtractor $exUrl")
-                try {
-                    // Collect, then re-emit with the fansub in the name — otherwise these
-                    // links show only the extractor name ("Voe") with no fansub attribution
-                    val collected = mutableListOf<ExtractorLink>()
-                    loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
-                    for (l in collected) {
-                        val q = if (l.quality > 0) " ${l.quality}p" else ""
-                        callback(newExtractorLink(source = "${vi.fansub} - ${l.name}", name = "${vi.fansub} - ${l.name}$q", url = l.url, type = l.type) {
-                            referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
-                        found = true
-                    }
-                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
-                continue
-            }
-
-            if (embed.startsWith("ap:")) {
-                val hash = embed.removePrefix("ap:")
-                val playerRef = "$playerBase/player/$hash"
-                val aHeaders = mapOf("User-Agent" to ua,
-                    "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, */*; q=0.01", "Referer" to playerRef, "Origin" to playerBase)
-                // Warm the player page first: establishes PHPSESSID the token endpoint
-                // validates against, and mirrors real browser order (page → XHR).
-                try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")) } catch (_: Exception) {}
-                val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
-                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (e: Exception) { log("aincrad error: ${e.message}"); continue }
-                val json = try { JSONObject(streamText) } catch (_: Exception) { continue }
-                val securedLink = json.optString("securedLink", "")
-                val videoSource = json.optString("videoSource", "")
-                log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()}")
-                // Single entry per source, chosen by CONTENT, not by JSON field name.
-                // The API is inconsistent: videoSource is sometimes a direct file, sometimes
-                // an HLS playlist. Emitting a playlist as VIDEO type = ExoPlayer error 3003.
-                // One probe per candidate decides the real type.
-                //
-                // NOTE ON DOWNLOADS: masters are emitted AS-IS (no variant bypass). CloudStream's
-                // downloader refuses HLS with separate audio renditions by design ("muxing is
-                // required" — M3u8Helper.hslLazy/requireAudio); bypassing to a video-only variant
-                // "fixes" the download but produces silent video. Muxed masters download fine
-                // untouched. Split-audio masters: streaming works (with sound), download errors —
-                // an app-level limitation no extension can work around with a single link.
-                val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
-
-                // Local to THIS source only. Using the outer `found` here was a bug: once
-                // any source anywhere in the function succeeded, `found` was permanently
-                // true, so every later Aincrad candidate loop skipped on its first check
-                // (line below) — silently dropping that fansub's Aincrad option entirely
-                // rather than just picking one candidate the way this loop intends to.
-                var resolved = false
-                for (cand in listOf(videoSource, securedLink)) {
-                    if (cand.isBlank() || resolved) continue
-                    val head = try {
-                        // Range keeps this cheap if honored; playlists are small anyway
-                        app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8).text
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e // never swallow cancellation: dropped sources otherwise (Seicode bug)
-                    } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
-                    val t = head.trimStart()
-                    when {
-                        t.startsWith("#EXTM3U") -> {
-                            if (t.contains("TYPE=AUDIO"))
-                                log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
-                            // Real resolution from the master (RESOLUTION=WxH on STREAM-INF lines)
-                            val h = Regex("""RESOLUTION=\d+x(\d+)""").findAll(t)
-                                .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
-                            // label already carries the site's own quality tag (from vi.name,
-                            // e.g. "Aincrad - 1080p") — strip it before adding the one we just
-                            // verified from the playlist, so exactly one is shown, and it's
-                            // always the real one rather than whatever the site claims.
-                            val cleanLabel = label.replace(Regex("""\b\d{3,4}[pP]\b"""), "")
-                                .replace(Regex("""\(\s*\)"""), "")
-                                .replace(Regex("""\s{2,}"""), " ")
-                                .trim().trimEnd('-', ' ').trim()
-                            val disp = if (h != null) "$cleanLabel ${h}p" else label
-                            callback(newExtractorLink(source = label, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
-                                quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                            resolved = true
-                        }
-                        t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
-                            log("aincrad: candidate unusable, trying next")
-                        else -> {
-                            callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.VIDEO) {
-                                quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                            resolved = true
+        coroutineScope {
+            fun dispatch(id: String, embed: String) {
+                for (vi in byNumId[id].orEmpty()) {
+                    launch {
+                        stepGate.withPermit {
+                            try {
+                                if (processSource(vi, embed, data, callback, subtitleCallback)) found.set(true)
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e // never swallow cancellation: dropped sources otherwise
+                            } catch (e: Exception) {
+                                log("step4: ${vi.fansub}/${vi.name} error: ${e.message}")
+                            }
                         }
                     }
                 }
-                if (resolved) found = true
-                continue
             }
 
-            if (embed.startsWith("gd:")) {
-                val fileId = embed.removePrefix("gd:")
-                log("gdrive: fileId=$fileId for $label")
-                val resolved = try { resolveGDrive(fileId) }
-                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
-                if (resolved != null) {
-                    val (finalUrl, dlHeaders) = resolved
-                    callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.VIDEO) {
-                        quality = Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = dlHeaders })
-                    found = true
-                } else log("gdrive: could not resolve a playable link for $fileId")
-                continue
+            // Cached sources need no WebView — start these right away rather than waiting
+            // on the (potentially much slower) uncached ones resolving below.
+            for ((id, embed) in embedMap) dispatch(id, embed)
+
+            if (uncachedIds.isNotEmpty()) {
+                try {
+                    resolveEmbeds(uncachedIds, data) { id, embed ->
+                        embedMap[id] = embed
+                        putCache(id, embed)
+                        dispatch(id, embed)
+                    }
+                } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}") }
+
+                // Anything WebView couldn't deliver (no Context, timeout, cancel of a
+                // numId): one cheap HTTP attempt each before giving up on the source.
+                val missing = uncachedIds.filter { it !in embedMap }
+                if (missing.isNotEmpty()) {
+                    log("loadLinks: ${missing.size} unresolved, trying HTTP fallback")
+                    for ((id, embed) in httpResolveEmbeds(missing, data)) {
+                        embedMap[id] = embed
+                        putCache(id, embed)
+                        dispatch(id, embed)
+                    }
+                }
             }
+        } // suspends here until every dispatched source has actually finished
+
+        for (vi in allWanted) if (vi.numId !in embedMap) log("step4: ${vi.fansub}/${vi.name} MISSING")
+        log("loadLinks: total ${embedMap.size}/${uniqueIds.size}, found=${found.get()}")
+        return found.get()
+    }
+
+    // One source's worth of step4 work: ex:/ap:/gd: embed -> an actual playable link via
+    // callback(). Pulled out of loadLinks so it can be launched concurrently per-source as
+    // each numId resolves, instead of running sequentially after every numId is done.
+    private suspend fun processSource(
+        vi: VidInfo,
+        embed: String,
+        data: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit,
+    ): Boolean {
+        val label = "${vi.fansub} - ${vi.name.replace(adsRe, "").trim()}"
+        log("step4: $label embed=$embed")
+
+        if (embed.startsWith("ex:")) {
+            val exUrl = embed.removePrefix("ex:")
+            log("step4: $label -> loadExtractor $exUrl")
+            var found = false
+            try {
+                // Collect, then re-emit with the fansub in the name — otherwise these
+                // links show only the extractor name ("Voe") with no fansub attribution
+                val collected = mutableListOf<ExtractorLink>()
+                loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
+                for (l in collected) {
+                    val q = if (l.quality > 0) " ${l.quality}p" else ""
+                    callback(newExtractorLink(source = "${vi.fansub} - ${l.name}", name = "${vi.fansub} - ${l.name}$q", url = l.url, type = l.type) {
+                        referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
+                    found = true
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("step4: loadExtractor failed: ${e.message}") }
+            return found
         }
-        log("loadLinks: done, found=$found")
-        return found
+
+        if (embed.startsWith("ap:")) {
+            val hash = embed.removePrefix("ap:")
+            val playerRef = "$playerBase/player/$hash"
+            val aHeaders = mapOf("User-Agent" to ua,
+                "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, */*; q=0.01", "Referer" to playerRef, "Origin" to playerBase)
+            // Warm the player page first: establishes PHPSESSID the token endpoint
+            // validates against, and mirrors real browser order (page → XHR).
+            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")) } catch (_: Exception) {}
+            val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("aincrad error: ${e.message}"); return false }
+            val json = try { JSONObject(streamText) } catch (_: Exception) { return false }
+            val securedLink = json.optString("securedLink", "")
+            val videoSource = json.optString("videoSource", "")
+            log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()}")
+            // Single entry per source, chosen by CONTENT, not by JSON field name.
+            // The API is inconsistent: videoSource is sometimes a direct file, sometimes
+            // an HLS playlist. Emitting a playlist as VIDEO type = ExoPlayer error 3003.
+            // One probe per candidate decides the real type.
+            //
+            // NOTE ON DOWNLOADS: masters are emitted AS-IS (no variant bypass). CloudStream's
+            // downloader refuses HLS with separate audio renditions by design ("muxing is
+            // required" — M3u8Helper.hslLazy/requireAudio); bypassing to a video-only variant
+            // "fixes" the download but produces silent video. Muxed masters download fine
+            // untouched. Split-audio masters: streaming works (with sound), download errors —
+            // an app-level limitation no extension can work around with a single link.
+            val hlsHeaders = mapOf("User-Agent" to ua, "Origin" to playerBase, "Referer" to playerRef)
+
+            var resolved = false
+            for (cand in listOf(videoSource, securedLink)) {
+                if (cand.isBlank() || resolved) continue
+                val head = try {
+                    // Range keeps this cheap if honored; playlists are small anyway
+                    app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8).text
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // never swallow cancellation: dropped sources otherwise (Seicode bug)
+                } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
+                val t = head.trimStart()
+                when {
+                    t.startsWith("#EXTM3U") -> {
+                        if (t.contains("TYPE=AUDIO"))
+                            log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
+                        // Real resolution from the master (RESOLUTION=WxH on STREAM-INF lines)
+                        val h = Regex("""RESOLUTION=\d+x(\d+)""").findAll(t)
+                            .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
+                        // label already carries the site's own quality tag (from vi.name,
+                        // e.g. "Aincrad - 1080p") — strip it before adding the one we just
+                        // verified from the playlist, so exactly one is shown, and it's
+                        // always the real one rather than whatever the site claims.
+                        val cleanLabel = label.replace(Regex("""\b\d{3,4}[pP]\b"""), "")
+                            .replace(Regex("""\(\s*\)"""), "")
+                            .replace(Regex("""\s{2,}"""), " ")
+                            .trim().trimEnd('-', ' ').trim()
+                        val disp = if (h != null) "$cleanLabel ${h}p" else label
+                        callback(newExtractorLink(source = label, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
+                            quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                        resolved = true
+                    }
+                    t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
+                        log("aincrad: candidate unusable, trying next")
+                    else -> {
+                        callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.VIDEO) {
+                            quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                        resolved = true
+                    }
+                }
+            }
+            return resolved
+        }
+
+        if (embed.startsWith("gd:")) {
+            val fileId = embed.removePrefix("gd:")
+            log("gdrive: fileId=$fileId for $label")
+            val resolved = try { resolveGDrive(fileId) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
+            if (resolved != null) {
+                val (finalUrl, dlHeaders) = resolved
+                callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.VIDEO) {
+                    quality = Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = dlHeaders })
+                return true
+            }
+            log("gdrive: could not resolve a playable link for $fileId")
+            return false
+        }
+
+        return false
     }
 
     // GDrive's `confirm=t` is not a real token — it only happens to work when Google skips
