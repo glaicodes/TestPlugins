@@ -28,6 +28,14 @@ class AnizleProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private var playerBase = "https://anizmplayer.com"
+    // Class-level, not per-loadLinks: every fansub group's GDrive source hits the same
+    // Google endpoint regardless of episode, so two overlapping loadLinks calls (prefetch
+    // + manual click) sharing this matters here in a way it doesn't for the other host
+    // types below, each of which is spread across many different, unrelated domains.
+    // Google's abuse detection is known to be sensitive to bursty interstitial requests —
+    // it's the entire reason resolveGDrive()'s multi-step dance exists — so this stays at
+    // 1, not the 5 used for general step4 work.
+    private val gdriveGate = Semaphore(1)
     // Single UA everywhere (OkHttp + WebView). Cookies are shared via CookieManager,
     // so presenting two different UAs on the same session is an easy fingerprint.
     private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -622,8 +630,12 @@ class AnizleProvider : MainAPI() {
                 val collected = mutableListOf<ExtractorLink>()
                 loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
                 for (l in collected) {
+                    // Some built-in extractors (StreamLare, Voe, etc.) already bake a
+                    // quality tag onto the end of their own .name — e.g. "Voe 1080p".
+                    // Strip it before appending ours below, or it shows as "Voe 1080p 1080p".
+                    val cleanName = l.name.replace(Regex("""\s+\d{3,4}[pP]$"""), "").trim()
                     val q = if (l.quality > 0) " ${l.quality}p" else ""
-                    callback(newExtractorLink(source = "${vi.fansub} - ${l.name}", name = "${vi.fansub} - ${l.name}$q", url = l.url, type = l.type) {
+                    callback(newExtractorLink(source = "${vi.fansub} - $cleanName", name = "${vi.fansub} - $cleanName$q", url = l.url, type = l.type) {
                         referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
                     found = true
                 }
@@ -705,9 +717,10 @@ class AnizleProvider : MainAPI() {
         if (embed.startsWith("gd:")) {
             val fileId = embed.removePrefix("gd:")
             log("gdrive: fileId=$fileId for $label")
-            val resolved = try { resolveGDrive(fileId) }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
+            val resolved = try {
+                gdriveGate.withPermit { resolveGDrive(fileId) }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+              catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
             if (resolved != null) {
                 val (finalUrl, dlHeaders) = resolved
                 callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.VIDEO) {
