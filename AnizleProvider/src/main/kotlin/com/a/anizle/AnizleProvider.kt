@@ -38,7 +38,7 @@ class AnizleProvider : MainAPI() {
     private val gdriveGate = Semaphore(1)
     // Single UA everywhere (OkHttp + WebView). Cookies are shared via CookieManager,
     // so presenting two different UAs on the same session is an easy fingerprint.
-    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
     // CloudflareKiller lives in the app, not the library artifact — can't reference it at
     // compile time anymore. App still ships it, so instantiate via reflection at runtime.
     private val cfKiller: okhttp3.Interceptor? by lazy {
@@ -74,8 +74,11 @@ class AnizleProvider : MainAPI() {
             embedCache.entries.removeAll { now - it.value.time > cacheTtlMs } // Kotlin stdlib, safe on minSdk 21
             // Hard cap even if everything is fresh: drop oldest down to 150
             if (embedCache.size > 200) {
-                embedCache.entries.sortedBy { it.value.time }.take(embedCache.size - 150)
-                    .forEach { embedCache.remove(it.key) }
+                repeat((embedCache.size - 150).coerceAtLeast(0)) {
+                    embedCache.entries.minByOrNull { it.value.time }?.let { oldest ->
+                        embedCache.remove(oldest.key)
+                    }
+                }
             }
         }
     }
@@ -97,6 +100,9 @@ class AnizleProvider : MainAPI() {
     private val vidRe2 = Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)""")
     private val cleanRe = Regex("""\s*[-–]\s*Anizm[.\w]*$""", RegexOption.IGNORE_CASE)
     private val adsRe = Regex("""\([Rr]eklamsız\)""")
+    private val qualitySuffixRe = Regex("""\s+\d{3,4}[pP]$""")
+    private val qualityTagRe = Regex("""\b\d{3,4}[pP]\b""")
+    private val urlRe = Regex("""https?://[^\s"'<>\\]+""")
 
     // Reusable empty response — avoid allocations in shouldInterceptRequest (called 100s of times)
     private fun emptyResponse() = WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
@@ -123,10 +129,10 @@ class AnizleProvider : MainAPI() {
 
     private val baseHeaders get() = mapOf(
         "User-Agent" to ua,
-        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Referer" to "$mainUrl/")
+        "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", "Referer" to "$mainUrl/")
     private val xhrHeaders get() = mapOf(
         "User-Agent" to ua,
-        "Accept-Language" to "tr-TR,tr;q=0.9,en;q=0.7", "Origin" to mainUrl, "Referer" to "$mainUrl/",
+        "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", "Origin" to mainUrl, "Referer" to "$mainUrl/",
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
 
     // ── Batch embed resolver ────────────────────────────────────────────────
@@ -147,7 +153,7 @@ class AnizleProvider : MainAPI() {
                 out[nid] = "ap:${m.groupValues[2]}"; log("httpResolve: ap for $nid")
             } ?: gdRe.find(html)?.let { m ->
                 out[nid] = "gd:${m.groupValues[1]}"; log("httpResolve: gd for $nid")
-            } ?: Regex("""https?://[^\s"'<>\\]+""").findAll(html)
+            } ?: urlRe.findAll(html)
                 .map { it.value }
                 .firstOrNull { u -> extractorHostKeywords.any { u.contains(it, ignoreCase = true) } }
                 ?.let { out[nid] = "ex:$it"; log("httpResolve: ex for $nid") }
@@ -199,7 +205,7 @@ class AnizleProvider : MainAPI() {
                 cont.invokeOnCancellation { handler.post { finish() } }
 
                 val globalTimeout = Runnable { log("resolve: global timeout (${results.size}/${numIds.size})"); finish() }
-                handler.postDelayed(globalTimeout, 35_000L)
+                handler.postDelayed(globalTimeout, 25_000L)
 
                 var currentTarget = ""; var currentIdx = -1
                 val perIdTimeout = arrayOfNulls<Runnable>(1)
@@ -633,9 +639,8 @@ class AnizleProvider : MainAPI() {
                     // Some built-in extractors (StreamLare, Voe, etc.) already bake a
                     // quality tag onto the end of their own .name — e.g. "Voe 1080p".
                     // Strip it before appending ours below, or it shows as "Voe 1080p 1080p".
-                    val cleanName = l.name.replace(Regex("""\s+\d{3,4}[pP]$"""), "").trim()
-                    val q = if (l.quality > 0) " ${l.quality}p" else ""
-                    callback(newExtractorLink(source = "${vi.fansub} - $cleanName", name = "${vi.fansub} - $cleanName$q", url = l.url, type = l.type) {
+                    val cleanName = l.name.replace(qualitySuffixRe, "").trim()
+                    callback(newExtractorLink(source = "${vi.fansub} - $cleanName", name = "${vi.fansub} - $cleanName", url = l.url, type = l.type) {
                         referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
                     found = true
                 }
@@ -693,12 +698,12 @@ class AnizleProvider : MainAPI() {
                         // e.g. "Aincrad - 1080p") — strip it before adding the one we just
                         // verified from the playlist, so exactly one is shown, and it's
                         // always the real one rather than whatever the site claims.
-                        val cleanLabel = label.replace(Regex("""\b\d{3,4}[pP]\b"""), "")
+                        val cleanLabel = label.replace(qualityTagRe, "")
                             .replace(Regex("""\(\s*\)"""), "")
                             .replace(Regex("""\s{2,}"""), " ")
                             .trim().trimEnd('-', ' ').trim()
-                        val disp = if (h != null) "$cleanLabel ${h}p" else label
-                        callback(newExtractorLink(source = label, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
+                        val disp = cleanLabel
+                        callback(newExtractorLink(source = cleanLabel, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
                             quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                         resolved = true
                     }
