@@ -20,7 +20,7 @@ buildscript {
         // WE bump it. This is the commit :-SNAPSHOT currently resolves to (2026-07-02,
         // "Update dependencies and enable build and configuration cache #15"), so this is
         // a no-op today and a deliberate choice tomorrow.
-        classpath("com.github.recloudstream:gradle:32895aedb6")
+        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
