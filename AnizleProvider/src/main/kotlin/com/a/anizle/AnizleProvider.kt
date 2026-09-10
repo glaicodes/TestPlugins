@@ -8,6 +8,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -39,14 +40,9 @@ class AnizleProvider : MainAPI() {
     // Single UA everywhere (OkHttp + WebView). Cookies are shared via CookieManager,
     // so presenting two different UAs on the same session is an easy fingerprint.
     private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-    // CloudflareKiller lives in the app, not the library artifact — can't reference it at
-    // compile time anymore. App still ships it, so instantiate via reflection at runtime.
-    private val cfKiller: okhttp3.Interceptor? by lazy {
-        try {
-            Class.forName("com.lagradost.cloudstream3.network.CloudflareKiller")
-                .getDeclaredConstructor().newInstance() as? okhttp3.Interceptor
-        } catch (_: Throwable) { null }
-    }
+    // Old stub system: CloudflareKiller is directly on the compile classpath again
+    // (it's part of the full pre-release APK), no reflection needed.
+    private val cfKiller = CloudflareKiller()
     private var csrfToken: String? = null
     private var sessionFetchedAt: Long = 0L
     private val sessionTtlMs = 5 * 60 * 1000L
@@ -115,10 +111,7 @@ class AnizleProvider : MainAPI() {
         try {
             var resp = app.get(mainUrl, headers = baseHeaders)
             var html = resp.text
-            if (isCf(html)) {
-                val killer = cfKiller
-                if (killer != null) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = killer); html = resp.text }
-            }
+            if (isCf(html)) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller); html = resp.text }
             csrfToken = csrfRe1.find(html)?.groupValues?.get(1)
                 ?: csrfRe2.find(html)?.groupValues?.get(1)
             sessionFetchedAt = System.currentTimeMillis()
@@ -179,7 +172,7 @@ class AnizleProvider : MainAPI() {
                 var done = false
                 // Library-artifact way to get the Android context (CloudStreamApp/AcraApplication
                 // are app classes, not visible at compile time anymore)
-                val ctx = try { com.lagradost.api.getContext() as? android.content.Context } catch (_: Throwable) { null }
+                val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (_: Throwable) { null }
                 if (ctx == null) { log("resolve: no context"); if (cont.isActive) cont.resume(emptyMap()); return@post }
 
                 val wv = WebView(ctx).apply {
