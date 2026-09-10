@@ -14,12 +14,15 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.7.3")
         // Cloudstream gradle plugin which makes everything work and builds plugins
-        // Pinned (was ":-SNAPSHOT"). Floating on SNAPSHOT is what broke the build twice
-        // before (Plugin->BasePlugin, AcraApplication removal) — upstream pushed, our
-        // build silently picked up the new commit mid-flight. Pinned = only changes when
-        // WE bump it. This is the commit :-SNAPSHOT currently resolves to (2026-07-02,
-        // "Update dependencies and enable build and configuration cache #15"), so this is
-        // a no-op today and a deliberate choice tomorrow.
+        // POSTMORTEM: this was pinned to a specific commit (32895aedb6) to survive
+        // upstream API breaks (Plugin->BasePlugin, AcraApplication removal did exactly
+        // that, twice). The pin itself broke instead — after ~1 month, JitPack could no
+        // longer resolve that commit at all ("Could not find ...:gradle:32895aedb6"),
+        // most likely artifact eviction for a rarely-requested raw-commit build (JitPack
+        // treats these very differently from tagged releases, which recloudstream/gradle
+        // doesn't publish). Floating SNAPSHOT it is — the weekly Monday cron build below
+        // exists specifically to catch upstream breaks on our own schedule instead of
+        // silently, so this is the more durable choice of two imperfect options.
         classpath("com.github.recloudstream:gradle:-SNAPSHOT")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
@@ -82,15 +85,18 @@ subprojects {
         // NEW dependency system (replaces old `cloudstream("com.lagradost:cloudstream3:pre-release")`).
         // Old system (ApkConfigurationProvider) downloaded + unpacked the whole prerelease APK
         // every build; removed upstream 2026-04. This is a plain prebuilt maven artifact — much faster.
-        // Pinned for the same reason as the plugin above — this is what let BasePlugin/
-        // getContext/CloudflareKiller's shape change under us without warning. Pinned to
-        // recloudstream/cloudstream master as of 2026-08-05; bump deliberately when you
-        // want a newer library, not automatically on every CI run.
-        implementation("com.github.recloudstream.cloudstream:library:a72f9e6c3f")
+        // Was pinned to a72f9e6c3f for the same anti-breakage reason as the plugin above —
+        // same failure mode hit it too ("Could not find ...:library:a72f9e6c3f", ~1 month
+        // later). Back to SNAPSHOT; see the plugin comment above for the full postmortem.
+        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
 
-        // Coroutines: app ships 1.11.0 at runtime; compileOnly = compile against it
-        // without bundling duplicate classes into the .cs3
-        compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+        // No hard version: whatever -SNAPSHOT resolves to right now brings its own
+        // "strictly 1.7.1" constraint on this exact artifact (confirmed via a real build
+        // failure: our old hardcoded 1.11.0 directly conflicted with it and broke the
+        // build). Let the library's own constraint govern instead of fighting it — we
+        // only use basic suspendCancellableCoroutine/CancellationException here, nothing
+        // version-specific enough to need pinning ourselves.
+        compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
