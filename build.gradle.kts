@@ -80,23 +80,24 @@ subprojects {
 
     dependencies {
         val implementation by configurations
-        val compileOnly by configurations
+        val cloudstream by configurations
 
-        // NEW dependency system (replaces old `cloudstream("com.lagradost:cloudstream3:pre-release")`).
-        // Old system (ApkConfigurationProvider) downloaded + unpacked the whole prerelease APK
-        // every build; removed upstream 2026-04. This is a plain prebuilt maven artifact — much faster.
-        // Was pinned to a72f9e6c3f for the same anti-breakage reason as the plugin above —
-        // same failure mode hit it too ("Could not find ...:library:a72f9e6c3f", ~1 month
-        // later). Back to SNAPSHOT; see the plugin comment above for the full postmortem.
-        implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
-
-        // No hard version: whatever -SNAPSHOT resolves to right now brings its own
-        // "strictly 1.7.1" constraint on this exact artifact (confirmed via a real build
-        // failure: our old hardcoded 1.11.0 directly conflicted with it and broke the
-        // build). Let the library's own constraint govern instead of fighting it — we
-        // only use basic suspendCancellableCoroutine/CancellationException here, nothing
-        // version-specific enough to need pinning ourselves.
-        compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core")
+        // REVERTED from the new library:-SNAPSHOT system (2026-09-10). That coordinate
+        // started failing to resolve at all — not a caching issue (confirmed:
+        // --refresh-dependencies made no difference) and not just our old pin expiring
+        // (bare -SNAPSHOT failed identically). recloudstream/cloudstream's own app module
+        // now references a "library-jvm.jar" build output, consistent with an in-progress
+        // KMP/multiplatform restructuring of that module — plausible structural cause.
+        // The official recloudstream/extensions template still uses the same (currently
+        // broken) coordinate as of this writing, so this is a deliberate divergence for
+        // reliability, not a step backward: this exact stub approach is what CSX
+        // (SaurabhKaperwan/CSX), a large actively-maintained real-world extension
+        // collection, uses successfully today. Revisit if/when upstream's library
+        // artifact resolves cleanly again.
+        // Stubs for all cloudstream classes (full pre-release APK — slower to resolve
+        // than the library artifact was, but it works, and it already bundles coroutines/
+        // CloudflareKiller/etc. directly, so no separate compileOnly declarations needed.)
+        cloudstream("com.lagradost:cloudstream3:pre-release")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
