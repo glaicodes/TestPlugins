@@ -172,7 +172,11 @@ class AnizleProvider : MainAPI() {
                 var done = false
                 // Library-artifact way to get the Android context (CloudStreamApp/AcraApplication
                 // are app classes, not visible at compile time anymore)
-                val ctx = try { com.lagradost.cloudstream3.AcraApplication.context } catch (_: Throwable) { null }
+                // AcraApplication is deprecated-as-ERROR in the current pre-release stub too
+                // (confirmed via a real compile failure, not just a warning) — it's not
+                // specific to the library system. CloudStreamApp.context is defined directly
+                // in the app module itself (verified in source), so it's available here.
+                val ctx = try { com.lagradost.cloudstream3.CloudStreamApp.context } catch (_: Throwable) { null }
                 if (ctx == null) { log("resolve: no context"); if (cont.isActive) cont.resume(emptyMap()); return@post }
 
                 val wv = WebView(ctx).apply {
