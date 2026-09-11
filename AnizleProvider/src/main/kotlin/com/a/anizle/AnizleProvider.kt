@@ -18,6 +18,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
 
 class AnizleProvider : MainAPI() {
@@ -29,6 +31,9 @@ class AnizleProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private var playerBase = "https://anizmplayer.com"
+    // Derived, not hardcoded — if the site ever moves domains, only mainUrl needs updating;
+    // this and every check that uses it follow automatically instead of silently going stale.
+    private val mainHost by lazy { android.net.Uri.parse(mainUrl).host ?: "anizm.net" }
     // Class-level, not per-loadLinks: every fansub group's GDrive source hits the same
     // Google endpoint regardless of episode, so two overlapping loadLinks calls (prefetch
     // + manual click) sharing this matters here in a way it doesn't for the other host
@@ -63,16 +68,19 @@ class AnizleProvider : MainAPI() {
         if (System.currentTimeMillis() - c.time > cacheTtlMs) { embedCache.remove(numId); return null }
         return c.embed
     }
+    private val cacheEvictionLock = Any()
     private fun putCache(numId: String, embed: String) {
         embedCache[numId] = CachedEmbed(embed, System.currentTimeMillis())
         if (embedCache.size > 200) {
-            val now = System.currentTimeMillis()
-            embedCache.entries.removeAll { now - it.value.time > cacheTtlMs } // Kotlin stdlib, safe on minSdk 21
-            // Hard cap even if everything is fresh: drop oldest down to 150
-            if (embedCache.size > 200) {
-                repeat((embedCache.size - 150).coerceAtLeast(0)) {
-                    embedCache.entries.minByOrNull { it.value.time }?.let { oldest ->
-                        embedCache.remove(oldest.key)
+            synchronized(cacheEvictionLock) {
+                val now = System.currentTimeMillis()
+                embedCache.entries.removeAll { now - it.value.time > cacheTtlMs } // Kotlin stdlib, safe on minSdk 21
+                // Hard cap even if everything is fresh: drop oldest down to 150
+                if (embedCache.size > 200) {
+                    repeat((embedCache.size - 150).coerceAtLeast(0)) {
+                        embedCache.entries.minByOrNull { it.value.time }?.let { oldest ->
+                            embedCache.remove(oldest.key)
+                        }
                     }
                 }
             }
@@ -96,26 +104,62 @@ class AnizleProvider : MainAPI() {
     private val vidRe2 = Regex("""data-video-name="([^"]*)"[^>]*video="([^"]+)""")
     private val cleanRe = Regex("""\s*[-–]\s*Anizm[.\w]*$""", RegexOption.IGNORE_CASE)
     private val adsRe = Regex("""\([Rr]eklamsız\)""")
-    private val qualitySuffixRe = Regex("""\s+\d{3,4}[pP]$""")
     private val qualityTagRe = Regex("""\b\d{3,4}[pP]\b""")
     private val urlRe = Regex("""https?://[^\s"'<>\\]+""")
+    // 1.9: remaining inline regexes, hoisted with the plan's requested names
+    private val hlsResolutionRe = Regex("""RESOLUTION=\d+x(\d+)""")
+    private val emptyParenRe = Regex("""\(\s*\)""")
+    private val multiSpaceRe = Regex("""\s{2,}""")
+    private val mainPosterCommentRe = Regex("""<!--src="([^"]+)"""")
+    private val episodeLabelCleanupRe = Regex("""\s*\d+\.?\s*[Bb][oöô]l[uüû]m.*$""")
+    private val episodeUrlCleanupRe = Regex("""-\d+[-.]?bolum[^/?#]*""")
+    private val ogAnizmCleanupRe = Regex("""\s*[-|–]\s*Anizm.*$""", RegexOption.IGNORE_CASE)
+    private val ogIzleCleanupRe = Regex("""\s+[iİ]zle\b.*$""", RegexOption.IGNORE_CASE)
+    private val ogIzleTruncRe = Regex("""\s+[iİ]z?l?e?\.{2,}.*$""", RegexOption.IGNORE_CASE)
+    private val asciiOnlyRe = Regex("^[\\x20-\\x7E]+$")
+    private val yearRe = Regex("""\d{4}""")
+    private val gdriveConfirmRe = Regex("""name="confirm"\s+value="([^"]+)"""")
+    private val gdriveUuidRe = Regex("""name="uuid"\s+value="([^"]+)"""")
+
+    // 1.5: single shared cleaner for every path that displays a source name, so quality
+    // text can never appear twice (the original "1080p 1080p" bug) or leak through
+    // unstripped in whichever path nobody's tested most recently. Intentionally dumb:
+    // strips quality tokens and formatting debris only, never touches fansub/title text.
+    private fun cleanDisplayName(raw: String): String = raw
+        .replace(qualityTagRe, "")
+        .replace(emptyParenRe, "")
+        .replace(multiSpaceRe, " ")
+        .trim().trimEnd('-', ' ').trim()
 
     // Reusable empty response — avoid allocations in shouldInterceptRequest (called 100s of times)
-    private fun emptyResponse() = WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+    private val emptyBytes = ByteArray(0)
+    private fun emptyResponse() = WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(emptyBytes))
 
     private fun log(msg: String) { android.util.Log.d("Anizle", msg) }
+    private fun logW(msg: String) { android.util.Log.w("Anizle", msg) }
 
-    private suspend fun getSession() {
-        val now = System.currentTimeMillis()
-        if (csrfToken != null && (now - sessionFetchedAt) < sessionTtlMs) return
-        try {
-            var resp = app.get(mainUrl, headers = baseHeaders)
-            var html = resp.text
-            if (isCf(html)) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller); html = resp.text }
-            csrfToken = csrfRe1.find(html)?.groupValues?.get(1)
-                ?: csrfRe2.find(html)?.groupValues?.get(1)
-            sessionFetchedAt = System.currentTimeMillis()
-        } catch (_: Exception) {}
+    private val sessionMutex = Mutex()
+    private suspend fun getSession(force: Boolean = false) {
+        // Mutex, not just a time check: with concurrent per-source dispatch, several
+        // sources can all see an expired session at once and each try to refresh it
+        // simultaneously without this — wasted requests racing each other for no reason.
+        sessionMutex.withLock {
+            val now = System.currentTimeMillis()
+            if (!force && csrfToken != null && (now - sessionFetchedAt) < sessionTtlMs) return
+            try {
+                var resp = app.get(mainUrl, headers = baseHeaders)
+                var html = resp.text
+                if (isCf(html)) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller); html = resp.text }
+                csrfToken = csrfRe1.find(html)?.groupValues?.get(1)
+                    ?: csrfRe2.find(html)?.groupValues?.get(1)
+                sessionFetchedAt = System.currentTimeMillis()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Deliberately not logging html/cookies/csrfToken here — session material only
+                logW("getSession failed: ${e.message}")
+            }
+        }
     }
 
     private fun isCf(html: String) = html.contains("Just a moment", true) || html.contains("cf-browser-verification", true)
@@ -158,9 +202,10 @@ class AnizleProvider : MainAPI() {
     private suspend fun resolveEmbeds(
         numIds: List<String>,
         episodeUrl: String,
-        // Fires the instant each numId resolves, from whatever thread the WebView's JS
-        // bridge calls back on (not necessarily the caller's thread — CoroutineScope.launch
-        // is safe to call from any thread, so the caller can dispatch straight from here).
+        // Fires the instant each numId resolves. Always on the main thread now (called
+        // exclusively from handleDetectedEmbed, itself always reached via handler.post) —
+        // before the 1.1 threading fix this fired from whatever thread the JS bridge
+        // happened to call back on, which was the actual root cause of a real race.
         onResolved: (numId: String, embed: String) -> Unit = { _, _ -> },
     ): Map<String, String> {
         if (numIds.isEmpty()) return emptyMap()
@@ -205,7 +250,7 @@ class AnizleProvider : MainAPI() {
                 handler.postDelayed(globalTimeout, 25_000L)
 
                 var currentTarget = ""; var currentIdx = -1
-                val perIdTimeout = arrayOfNulls<Runnable>(1)
+                var perIdTimeout: Runnable? = null
                 var usedFallback = false
                 var pageReady = false
                 // Some numIds' pages fire their matching request a second time (retry/
@@ -218,7 +263,7 @@ class AnizleProvider : MainAPI() {
                 val seenEmbeds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
                 fun resolveNext() {
-                    perIdTimeout[0]?.let { handler.removeCallbacks(it) }
+                    perIdTimeout?.let { handler.removeCallbacks(it) }
                     currentIdx++
                     if (currentIdx == 1 && results.isEmpty() && !usedFallback) {
                         log("resolve: first failed, falling back to loadUrl")
@@ -231,11 +276,11 @@ class AnizleProvider : MainAPI() {
                     val nid = numIds[currentIdx]
                     log("resolve: [${currentIdx}/${numIds.size}] numId=$nid")
 
-                    perIdTimeout[0] = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
+                    perIdTimeout = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
                     // 1.5s, not 3s: across 89 successful resolves in the user's own log, the
                     // slowest was 0.91s (p90 0.81s). A numId still unresolved past ~1.5s is
                     // dead, not slow — the old 3s just doubled the wasted wait on broken ones.
-                    handler.postDelayed(perIdTimeout[0]!!, 1_500L)
+                    handler.postDelayed(perIdTimeout!!, 1_500L)
 
                     // Stealth: random delay between iframes. Trimmed from the original
                     // 200-600ms — that alone cost ~20s on a 53-source episode. Lower risk
@@ -254,17 +299,23 @@ class AnizleProvider : MainAPI() {
                     }, delay)
                 }
 
-                wv.addJavascriptInterface(object {
-                    @android.webkit.JavascriptInterface
-                    fun h(v: String) {
-                        val tgt = currentTarget
-                        if (v.isNotBlank() && tgt.isNotBlank() && !results.containsKey(tgt)) {
-                            log("resolve: $v for numId=$tgt"); results[tgt] = v
-                            onResolved(tgt, v)
-                        }
-                        handler.post { resolveNext() }
+                // JS bridge removed (was addJavascriptInterface(..., "_b")). Nothing calls
+                // into JS and back anymore — shouldInterceptRequest already extracts the
+                // embed value on the Kotlin side, so evaluateJavascript("_b.h(...)") was a
+                // pointless round-trip: post straight to handleDetectedEmbed() below instead.
+                // This is also what fixed a real bug, not just a simplification: the JS
+                // bridge callback ran on a WebView-internal thread and mutated
+                // currentTarget/results with no synchronization, racing against
+                // shouldInterceptRequest's own (different) thread.
+                fun handleDetectedEmbed(v: String) {
+                    if (done) return
+                    val tgt = currentTarget
+                    if (v.isNotBlank() && tgt.isNotBlank() && !results.containsKey(tgt)) {
+                        log("resolve: $v for numId=$tgt"); results[tgt] = v
+                        onResolved(tgt, v)
                     }
-                }, "_b")
+                    resolveNext()
+                }
 
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
@@ -274,7 +325,7 @@ class AnizleProvider : MainAPI() {
                         // Fast path: skip regex processing for anizm.net sub-resources
                         // (CSS, JS, fonts etc.) — we only care about cross-domain embeds
                         // Note: must NOT match anizmplayer.com (which also contains "anizm")
-                        if (host.endsWith("anizm.net")) {
+                        if (host.endsWith(mainHost)) {
                             // Only process /player/ paths
                             if (url.contains("/player/")) {
                                 val tgt = currentTarget
@@ -292,7 +343,7 @@ class AnizleProvider : MainAPI() {
                                     playerBase = domain; log("resolve: player domain updated to $domain")
                                 }
                                 if (seenEmbeds.add(m.groupValues[2]))
-                                    handler.post { wv.evaluateJavascript("_b.h('ap:${m.groupValues[2]}')", null) }
+                                    handler.post { handleDetectedEmbed("ap:${m.groupValues[2]}") }
                                 return emptyResponse()
                             }
                         }
@@ -300,8 +351,7 @@ class AnizleProvider : MainAPI() {
                             // First cross-domain hit for this numId that matches a known
                             // video host = the embed itself (each /player/nid loads one host)
                             if (seenEmbeds.add(url)) {
-                                val esc = url.replace("\\", "\\\\").replace("'", "\\'")
-                                handler.post { wv.evaluateJavascript("_b.h('ex:$esc')", null) }
+                                handler.post { handleDetectedEmbed("ex:$url") }
                             }
                             return emptyResponse()
                         }
@@ -309,7 +359,7 @@ class AnizleProvider : MainAPI() {
                             gdRe.find(url)?.let { m ->
                                 log("resolve: GDrive: ${m.groupValues[1]}")
                                 if (seenEmbeds.add(m.groupValues[1]))
-                                    handler.post { wv.evaluateJavascript("_b.h('gd:${m.groupValues[1]}')", null) }
+                                    handler.post { handleDetectedEmbed("gd:${m.groupValues[1]}") }
                                 return emptyResponse()
                             }
                         }
@@ -347,7 +397,8 @@ class AnizleProvider : MainAPI() {
                 "priorityField" to "info_title", "orderBy" to "info_year", "orderDirection" to "ASC")
             csrfToken?.let { params["_token"] = it }
             app.get("$mainUrl/searchAnime", headers = xhrHeaders, params = params).text
-        } catch (_: Exception) { return emptyList() }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (_: Exception) { return emptyList() }
         return try {
             val arr = JSONObject(responseText).optJSONArray("data") ?: JSONArray(responseText)
             (0 until arr.length()).mapNotNull { i ->
@@ -378,17 +429,17 @@ class AnizleProvider : MainAPI() {
                 val href = el.attr("abs:href").ifBlank { return@mapNotNull null }; val isEp = href.contains("-bolum")
                 val img = el.selectFirst("img")
                 val poster = img?.let { toAbs(it.attr("src")) ?: toAbs(it.attr("data-src")) ?: toAbs(it.attr("data-original")) }
-                    ?: el.selectFirst("div.poster")?.let { Regex("""<!--src="([^"]+)"""").find(it.html())?.groupValues?.get(1)?.let { s -> toAbs(s) } }
+                    ?: el.selectFirst("div.poster")?.let { mainPosterCommentRe.find(it.html())?.groupValues?.get(1)?.let { s -> toAbs(s) } }
                 val title = if (isEp) {
                     el.parent()?.select("a[href]:not([href*=-bolum])")?.firstOrNull { it.attr("abs:href") != href }
                         ?.text()?.trim()?.let { clean(it) }?.ifBlank { null }
-                        ?: img?.attr("alt")?.replace(Regex("""\s*\d+\.?\s*[Bb][oöô]l[uüû]m.*$"""), "")?.let { clean(it) }?.ifBlank { null }
+                        ?: img?.attr("alt")?.replace(episodeLabelCleanupRe, "")?.let { clean(it) }?.ifBlank { null }
                 } else {
                     el.selectFirst("div.title, .truncateText, h4, h5, h3, strong, b")
                         ?.clone()?.also { it.select("span.tag, span.label, .tag, .genres").remove() }
                         ?.text()?.trim()?.let { clean(it) }?.ifBlank { img?.attr("alt")?.let { clean(it) } }?.ifBlank { null }
                 } ?: return@mapNotNull null
-                val animeUrl = if (isEp) href.replace(Regex("""-\d+[-.]?bolum[^/?#]*"""), "").trimEnd('-', '/') else href
+                val animeUrl = if (isEp) href.replace(episodeUrlCleanupRe, "").trimEnd('-', '/') else href
                 newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
             }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -436,15 +487,13 @@ class AnizleProvider : MainAPI() {
         }
         // Method 2: og:title might have a different name
         doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?.replace(Regex("""\s*[-|–]\s*Anizm.*$""", RegexOption.IGNORE_CASE), "")
-            ?.replace(Regex("""\s+[iİ]zle\b.*$""", RegexOption.IGNORE_CASE), "")
-            ?.replace(Regex("""\s+[iİ]z?l?e?\.{2,}.*$""", RegexOption.IGNORE_CASE), "")?.trim()
+            ?.replace(ogAnizmCleanupRe, "")
+            ?.replace(ogIzleCleanupRe, "")
+            ?.replace(ogIzleTruncRe, "")?.trim()
             ?.let { if (it.isNotBlank() && it != title && it !in aliases) aliases.add(it) }
         // Method 3 removed — h1/h2 scan grabs footer/nav junk ("Biz Kimiz?", "Hızlı Erişim" etc.)
         // Clean Turkish "izle/İzle" and truncated forms (anizm truncates long titles to "izl...", "iz...", etc.)
-        val izleRe = Regex("""\s+[iİ]zle\b.*$""", RegexOption.IGNORE_CASE)
-        val izleTruncRe = Regex("""\s+[iİ]z?l?e?\.{2,}.*$""", RegexOption.IGNORE_CASE)
-        val cleanedAliases = aliases.map { it.replace(izleRe, "").replace(izleTruncRe, "").trim() }
+        val cleanedAliases = aliases.map { it.replace(ogIzleCleanupRe, "").replace(ogIzleTruncRe, "").trim() }
             .filter { it.isNotBlank() && it != title && it.length > 3 }
         // Deduplicate and limit
         val nameAliases = cleanedAliases.distinct().take(10).ifEmpty { null }
@@ -465,7 +514,7 @@ class AnizleProvider : MainAPI() {
             ?: doc.selectFirst("meta[name=description], meta[property=og:description]")?.attr("content")?.trim()?.ifBlank { null }
 
         val year = doc.select("span.dataValue, .info-value, li, td").map { it.text().trim() }
-            .firstOrNull { it.matches(Regex("""\d{4}""")) && it.toInt() in 1950..2040 }?.toIntOrNull()
+            .firstOrNull { it.matches(yearRe) && it.toInt() in 1950..2040 }?.toIntOrNull()
         val tags = doc.select("span.dataValue > span.tag > span.label, a[href*=/kategoriler/], .genre a")
             .map { it.text().trim() }.filter { it.isNotBlank() && it.length < 30 }.take(6).ifEmpty { null }
 
@@ -473,18 +522,46 @@ class AnizleProvider : MainAPI() {
             .ifEmpty { doc.select("div.episodeListTabContent a[href]") }
             .ifEmpty { doc.select(".episode-list a[href], a[href*=-bolum]") }
             .distinctBy { it.attr("abs:href") }
-        val episodes = allLinks.mapNotNull { el ->
+        // Preview/teaser entries (e.g. "1-2. Bölüm (Ön Gösterim)") sit before "1. Bölüm" in
+        // the list. Naive position-based numbering (i+1) shifts every real episode after it
+        // by one — confirmed on a real page. Naive number-parsing doesn't fix this either:
+        // "1-2. Bölüm" parses to "2" from either the label or the URL, colliding with the
+        // real episode 2. So: detect range-style/preview entries first and give them
+        // episode=0 (visible, watchable, never collides with or shifts real numbers);
+        // parse real episodes' numbers directly from label or URL instead of trusting
+        // position at all, so a missing/reordered entry elsewhere can't shift anything.
+        data class EpEntry(val href: String, val label: String, val isSpecial: Boolean)
+        val rangeLabelRe = Regex("""\d+\s*-\s*\d+\.?\s*[Bb][oöô]l[uüû]m""")
+        val singleEpLabelRe = Regex("""^(\d+)\.?\s*[Bb][oöô]l[uüû]m""")
+        val singleEpUrlRe = Regex("""-(\d+)-bolum(?:-|$)""")
+        val entries = allLinks.mapNotNull { el ->
             val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
             val label = el.text().trim().ifBlank { return@mapNotNull null }
             val ll = label.lowercase()
             if (href.contains("fragman") || ll.contains("fragman")) return@mapNotNull null
             if (href.contains("-pv-") || ll == "pv" || ll.endsWith(" pv")) return@mapNotNull null
-            newEpisode(href) { name = label }
-        }.mapIndexed { i, ep -> ep.apply { episode = i + 1 } }
+            val isSpecial = rangeLabelRe.containsMatchIn(label) ||
+                ll.contains("önizleme") || ll.contains("ön gösterim") ||
+                href.contains("onizleme") || href.contains("on-gosterim")
+            EpEntry(href, label, isSpecial)
+        }
+        var regularCount = 0
+        val episodes = entries.map { e ->
+            newEpisode(e.href) { name = e.label }.apply {
+                episode = if (e.isSpecial) {
+                    0
+                } else {
+                    regularCount++
+                    singleEpLabelRe.find(e.label)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: singleEpUrlRe.find(e.href)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: regularCount // fall back to a count of regular episodes only,
+                                        // never raw list position — specials don't skew this
+                }
+            }
+        }
         // Split aliases into eng/jap + synonyms for AniList/MAL sync matching
-        val asciiRe = Regex("^[\\x20-\\x7E]+$")
-        val eng = nameAliases?.firstOrNull { asciiRe.matches(it) }
-        val jap = nameAliases?.firstOrNull { !asciiRe.matches(it) }
+        val eng = nameAliases?.firstOrNull { asciiOnlyRe.matches(it) }
+        val jap = nameAliases?.firstOrNull { !asciiOnlyRe.matches(it) }
         val syns = nameAliases?.filter { it != eng && it != jap }?.ifEmpty { null }
         log("load: '$title' poster=${poster != null} plot=${(plot?.length ?: 0) > 0} eps=${episodes.size} eng=$eng jap=$jap syns=${syns?.size ?: 0}")
         return newAnimeLoadResponse(title, url, TvType.Anime) {
@@ -500,7 +577,9 @@ class AnizleProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         getSession(); log("loadLinks: $data")
 
-        val epHtml = try { app.get(data, headers = baseHeaders).text } catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return false }
+        val epHtml = try { app.get(data, headers = baseHeaders).text }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return false }
         log("loadLinks: page len=${epHtml.length}")
 
         val translators = mutableListOf<Pair<String, String>>()
@@ -515,7 +594,9 @@ class AnizleProvider : MainAPI() {
 
         val allWanted = mutableListOf<VidInfo>()
         for ((trUrl, fansubName) in translators) {
-            val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text } catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); continue }
+            val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); continue }
             val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
             if (trHtml.isBlank()) continue
             val videos = mutableListOf<Pair<String, String>>()
@@ -556,6 +637,16 @@ class AnizleProvider : MainAPI() {
         // WebView still resolving everything else. First playable source now shows up
         // within a couple seconds instead of after the whole batch completes.
         val found = java.util.concurrent.atomic.AtomicBoolean(false)
+        // Concurrent dispatch means the same underlying stream could in principle reach
+        // callback() twice (e.g. two sources happen to resolve to the same host URL) —
+        // this guards the UI-visible symptom directly, on top of (not instead of) the
+        // real fixes upstream (seenEmbeds, the 1.1 threading fix, putIfAbsent above).
+        val seenLinks = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val safeCallback: (ExtractorLink) -> Unit = { link ->
+            val normalizedUrl = link.url.trim().substringBefore('#')
+            val key = "$normalizedUrl|${link.quality}|${link.type}"
+            if (seenLinks.add(key)) callback(link)
+        }
         // Cap concurrent step4 work so a 50-source episode doesn't fire 50 simultaneous
         // requests at the same handful of hosts — that reads as a burst, not a browser,
         // and risks the exact CF/rate-limit walls the rest of this file works around.
@@ -563,15 +654,17 @@ class AnizleProvider : MainAPI() {
 
         coroutineScope {
             fun dispatch(id: String, embed: String) {
-                for (vi in byNumId[id].orEmpty()) {
-                    launch {
-                        stepGate.withPermit {
-                            try {
-                                if (processSource(vi, embed, data, callback, subtitleCallback)) found.set(true)
-                            } catch (e: kotlinx.coroutines.CancellationException) {
-                                throw e // never swallow cancellation: dropped sources otherwise
-                            } catch (e: Exception) {
-                                log("step4: ${vi.fansub}/${vi.name} error: ${e.message}")
+                byNumId[id]?.let { list ->
+                    for (vi in list) {
+                        launch {
+                            stepGate.withPermit {
+                                try {
+                                    if (processSource(vi, embed, data, safeCallback, subtitleCallback)) found.set(true)
+                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                    throw e // never swallow cancellation: dropped sources otherwise
+                                } catch (e: Exception) {
+                                    log("step4: ${vi.fansub}/${vi.name} error: ${e.message}")
+                                }
                             }
                         }
                     }
@@ -585,11 +678,16 @@ class AnizleProvider : MainAPI() {
             if (uncachedIds.isNotEmpty()) {
                 try {
                     resolveEmbeds(uncachedIds, data) { id, embed ->
-                        embedMap[id] = embed
-                        putCache(id, embed)
-                        dispatch(id, embed)
+                        val existing = embedMap.putIfAbsent(id, embed)
+                        if (existing != null && existing != embed) {
+                            log("loadLinks: duplicate resolution for $id, keeping first")
+                        } else {
+                            putCache(id, embed)
+                            dispatch(id, embed)
+                        }
                     }
-                } catch (e: Exception) { log("loadLinks: resolve error: ${e.message}") }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (e: Exception) { log("loadLinks: resolve error: ${e.message}") }
 
                 // Anything WebView couldn't deliver (no Context, timeout, cancel of a
                 // numId): one cheap HTTP attempt each before giving up on the source.
@@ -597,9 +695,13 @@ class AnizleProvider : MainAPI() {
                 if (missing.isNotEmpty()) {
                     log("loadLinks: ${missing.size} unresolved, trying HTTP fallback")
                     for ((id, embed) in httpResolveEmbeds(missing, data)) {
-                        embedMap[id] = embed
-                        putCache(id, embed)
-                        dispatch(id, embed)
+                        val existing = embedMap.putIfAbsent(id, embed)
+                        if (existing != null && existing != embed) {
+                            log("loadLinks: duplicate resolution for $id, keeping first")
+                        } else {
+                            putCache(id, embed)
+                            dispatch(id, embed)
+                        }
                     }
                 }
             }
@@ -631,12 +733,14 @@ class AnizleProvider : MainAPI() {
                 // Collect, then re-emit with the fansub in the name — otherwise these
                 // links show only the extractor name ("Voe") with no fansub attribution
                 val collected = mutableListOf<ExtractorLink>()
-                loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
+                kotlinx.coroutines.withTimeoutOrNull(15_000) {
+                    loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
+                }
                 for (l in collected) {
                     // Some built-in extractors (StreamLare, Voe, etc.) already bake a
                     // quality tag onto the end of their own .name — e.g. "Voe 1080p".
                     // Strip it before appending ours below, or it shows as "Voe 1080p 1080p".
-                    val cleanName = l.name.replace(qualitySuffixRe, "").trim()
+                    val cleanName = cleanDisplayName(l.name)
                     callback(newExtractorLink(source = "${vi.fansub} - $cleanName", name = "${vi.fansub} - $cleanName", url = l.url, type = l.type) {
                         referer = l.referer; quality = l.quality; headers = l.headers; extractorData = l.extractorData })
                     found = true
@@ -653,8 +757,10 @@ class AnizleProvider : MainAPI() {
                 "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, */*; q=0.01", "Referer" to playerRef, "Origin" to playerBase)
             // Warm the player page first: establishes PHPSESSID the token endpoint
             // validates against, and mirrors real browser order (page → XHR).
-            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")) } catch (_: Exception) {}
-            val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders).text }
+            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8) }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) {}
+            val streamText = try { app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders, timeout = 10).text }
                 catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (e: Exception) { log("aincrad error: ${e.message}"); return false }
             val json = try { JSONObject(streamText) } catch (_: Exception) { return false }
@@ -689,25 +795,18 @@ class AnizleProvider : MainAPI() {
                         if (t.contains("TYPE=AUDIO"))
                             log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
                         // Real resolution from the master (RESOLUTION=WxH on STREAM-INF lines)
-                        val h = Regex("""RESOLUTION=\d+x(\d+)""").findAll(t)
+                        val h = hlsResolutionRe.findAll(t)
                             .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
-                        // label already carries the site's own quality tag (from vi.name,
-                        // e.g. "Aincrad - 1080p") — strip it before adding the one we just
-                        // verified from the playlist, so exactly one is shown, and it's
-                        // always the real one rather than whatever the site claims.
-                        val cleanLabel = label.replace(qualityTagRe, "")
-                            .replace(Regex("""\(\s*\)"""), "")
-                            .replace(Regex("""\s{2,}"""), " ")
-                            .trim().trimEnd('-', ' ').trim()
-                        val disp = cleanLabel
-                        callback(newExtractorLink(source = cleanLabel, name = disp, url = cand, type = ExtractorLinkType.M3U8) {
+                        val cleanLabel = cleanDisplayName(label)
+                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = cand, type = ExtractorLinkType.M3U8) {
                             quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                         resolved = true
                     }
                     t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
                         log("aincrad: candidate unusable, trying next")
                     else -> {
-                        callback(newExtractorLink(source = label, name = label, url = cand, type = ExtractorLinkType.VIDEO) {
+                        val cleanLabel = cleanDisplayName(label)
+                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = cand, type = ExtractorLinkType.VIDEO) {
                             quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                         resolved = true
                     }
@@ -725,7 +824,8 @@ class AnizleProvider : MainAPI() {
               catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
             if (resolved != null) {
                 val (finalUrl, dlHeaders) = resolved
-                callback(newExtractorLink(source = label, name = label, url = finalUrl, type = ExtractorLinkType.VIDEO) {
+                val cleanLabel = cleanDisplayName(label)
+                callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = finalUrl, type = ExtractorLinkType.VIDEO) {
                     quality = Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = dlHeaders })
                 return true
             }
@@ -762,8 +862,8 @@ class AnizleProvider : MainAPI() {
             return r1.url to headers
         }
         val html = r1.text
-        val confirm = Regex("""name="confirm"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
-        val uuid = Regex("""name="uuid"\s+value="([^"]+)"""").find(html)?.groupValues?.get(1)
+        val confirm = gdriveConfirmRe.find(html)?.groupValues?.get(1)
+        val uuid = gdriveUuidRe.find(html)?.groupValues?.get(1)
         if (confirm == null) { log("gdrive: no confirm field in interstitial (page structure changed?)"); return null }
         val cookie1 = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         // Small range here on purpose: r2 is only checked for its Content-Type header and
