@@ -95,9 +95,16 @@ subprojects {
         // collection, uses successfully today. Revisit if/when upstream's library
         // artifact resolves cleanly again.
         // Stubs for all cloudstream classes (full pre-release APK — slower to resolve
-        // than the library artifact was, but it works, and it already bundles coroutines/
-        // CloudflareKiller/etc. directly, so no separate compileOnly declarations needed.)
+        // than the library artifact was, but it works).
         cloudstream("com.lagradost:cloudstream3:pre-release")
+
+        // CORRECTION: the stub does NOT transitively expose kotlinx.coroutines on the
+        // compile classpath (confirmed via a real build failure: every kotlinx.coroutines
+        // import, Semaphore, coroutineScope, launch all came back "Unresolved reference").
+        // My earlier assumption that the stub "already bundles coroutines directly" was
+        // wrong. CSX (SaurabhKaperwan/CSX) — proof this stub system works — declares this
+        // exact dependency itself; matching it exactly rather than guessing again.
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
