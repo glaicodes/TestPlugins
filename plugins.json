@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://anizm.pro/favicon.ico",
-        "fileHash": "sha256-654b09adfd55a6b91eecb8f14b7f35b3ecab26e529eec0fe43a8ed3b55f02269",
+        "fileHash": "sha256-06a623bd7a9ca0798c2a990d8b3953fc0d71c1543ceaa01baf08c09fc08f954b",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
-        "fileSize": 56601,
+        "fileSize": 56144,
         "status": 1,
         "language": "tr",
         "authors": [
@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://rezeroizle.com/images/icon.png",
-        "fileHash": "sha256-d45f23b1861fe78527192fd2898018a7800b17ef3ed3599ccd792e99595d8b6f",
+        "fileHash": "sha256-bc61370d097fd0be679468f25f4a3ae672ba76cc1830b464a993b0c08bdeb768",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
-        "fileSize": 21862,
+        "fileSize": 21920,
         "status": 1,
         "language": "tr",
         "authors": [
