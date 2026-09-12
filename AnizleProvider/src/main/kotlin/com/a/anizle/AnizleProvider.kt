@@ -63,6 +63,12 @@ class AnizleProvider : MainAPI() {
     private val embedCache = java.util.concurrent.ConcurrentHashMap<String, CachedEmbed>()
     private val cacheTtlMs = 30 * 60 * 1000L // 30 minutes
 
+    // 2.12: short cache for getMainPage — the home/list rows don't change second to
+    // second, and CloudStream re-calls getMainPage on things like tab switches and
+    // pull-to-refresh far more often than the underlying page content actually changes.
+    private val mainPageCache = java.util.concurrent.ConcurrentHashMap<String, Pair<HomePageResponse, Long>>()
+    private val mainPageCacheTtlMs = 3 * 60 * 1000L // 3 minutes — short on purpose, this is a burst-of-taps guard, not a real cache
+
     private fun getCached(numId: String): String? {
         val c = embedCache[numId] ?: return null
         if (System.currentTimeMillis() - c.time > cacheTtlMs) { embedCache.remove(numId); return null }
@@ -95,8 +101,10 @@ class AnizleProvider : MainAPI() {
     private val extractorHostKeywords = listOf(
         "voe", "sibnet", "dood", "vidmoly", "ok.ru", "okru", "odnoklassniki",
         "sendvid", "mp4upload", "uqload", "hdvid", "abyss")
-    private val csrfRe1 = Regex("""<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']""")
-    private val csrfRe2 = Regex("""<meta[^>]+content=["']([^"']+)["'][^>]+name=["']csrf-token["']""")
+    // csrfRe1/csrfRe2 removed (3.1) — was two regexes to handle attribute-order variation
+    // (name-then-content vs content-then-name). Jsoup's selector doesn't care about
+    // attribute order at all, so one query replaces both, and can't break the same way
+    // if the site ever reorders these attributes again.
     private val numIdRe = Regex("""/video/(\d+)""")
     private val trRe1 = Regex("""translator="([^"]+)"[^>]*data-fansub-name="([^"]*)""")
     private val trRe2 = Regex("""data-fansub-name="([^"]*)"[^>]*translator="([^"]+)""")
@@ -118,8 +126,9 @@ class AnizleProvider : MainAPI() {
     private val ogIzleTruncRe = Regex("""\s+[iİ]z?l?e?\.{2,}.*$""", RegexOption.IGNORE_CASE)
     private val asciiOnlyRe = Regex("^[\\x20-\\x7E]+$")
     private val yearRe = Regex("""\d{4}""")
-    private val gdriveConfirmRe = Regex("""name="confirm"\s+value="([^"]+)"""")
-    private val gdriveUuidRe = Regex("""name="uuid"\s+value="([^"]+)"""")
+    // gdriveConfirmRe/gdriveUuidRe removed (3.1) — same reasoning as the CSRF regexes:
+    // Jsoup's input[name=...] selector doesn't care about attribute order, and is also
+    // more tolerant of the deliberately-truncated HTML this fetch produces (Range-limited).
 
     // 1.5: single shared cleaner for every path that displays a source name, so quality
     // text can never appear twice (the original "1080p 1080p" bug) or leak through
@@ -150,8 +159,7 @@ class AnizleProvider : MainAPI() {
                 var resp = app.get(mainUrl, headers = baseHeaders)
                 var html = resp.text
                 if (isCf(html)) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller); html = resp.text }
-                csrfToken = csrfRe1.find(html)?.groupValues?.get(1)
-                    ?: csrfRe2.find(html)?.groupValues?.get(1)
+                csrfToken = resp.document.selectFirst("meta[name=csrf-token]")?.attr("content")?.ifBlank { null }
                 sessionFetchedAt = System.currentTimeMillis()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -162,7 +170,32 @@ class AnizleProvider : MainAPI() {
         }
     }
 
-    private fun isCf(html: String) = html.contains("Just a moment", true) || html.contains("cf-browser-verification", true)
+    private fun isCf(html: String) = html.contains("Just a moment", true) ||
+        html.contains("cf-browser-verification", true) ||
+        html.contains("challenge-platform", true) ||
+        html.contains("cf-turnstile", true)
+        // Deliberately NOT matching bare "turnstile" — that word alone can appear in
+        // unrelated contexts and would cause false positives.
+
+    // 2.14: check the actual response code instead of relying on an exception being
+    // thrown — a 403/419 comes back as a normal (non-throwing) response, so the plain
+    // try/catch pattern used elsewhere in this file would never have caught this at all.
+    // One retry only, never a loop: if refreshing the session doesn't fix it, it's a
+    // real failure and should surface as one, not spin.
+    private suspend fun getWithSessionRetry(url: String, headers: Map<String, String>): String? {
+        var resp = app.get(url, headers = headers)
+        if (resp.code == 403 || resp.code == 419) {
+            log("session: got ${resp.code} for $url, refreshing session and retrying once")
+            csrfToken = null
+            getSession(force = true)
+            resp = app.get(url, headers = headers)
+            if (resp.code == 403 || resp.code == 419) {
+                log("session: retry also got ${resp.code}, giving up")
+                return null
+            }
+        }
+        return resp.text
+    }
 
     private val baseHeaders get() = mapOf(
         "User-Agent" to ua,
@@ -177,24 +210,36 @@ class AnizleProvider : MainAPI() {
     // page would have loaded. Works only if the site serves the embed URL server-side
     // (no JS assembly). Used when WebView is unavailable (no Context on some TV builds)
     // or for ids the WebView run failed to resolve (timeout/cancel). Fail = empty, never worse.
+    private val playerBaseLock = Any()
     private suspend fun httpResolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
-        val out = mutableMapOf<String, String>()
-        for (nid in numIds) {
-            val html = try {
-                app.get("$mainUrl/player/$nid", headers = baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8).text
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { log("httpResolve: $nid failed: ${e.message}"); continue }
-            apRe.find(html)?.let { m ->
-                val domain = m.groupValues[1]
-                if (!playerBase.contains(domain.substringAfter("://"))) { playerBase = domain; log("httpResolve: player domain updated to $domain") }
-                out[nid] = "ap:${m.groupValues[2]}"; log("httpResolve: ap for $nid")
-            } ?: gdRe.find(html)?.let { m ->
-                out[nid] = "gd:${m.groupValues[1]}"; log("httpResolve: gd for $nid")
-            } ?: urlRe.findAll(html)
-                .map { it.value }
-                .firstOrNull { u -> extractorHostKeywords.any { u.contains(it, ignoreCase = true) } }
-                ?.let { out[nid] = "ex:$it"; log("httpResolve: ex for $nid") }
-            ?: log("httpResolve: no embed found in /player/$nid (likely JS-assembled)")
+        val out = java.util.concurrent.ConcurrentHashMap<String, String>()
+        val gate = Semaphore(3)
+        coroutineScope {
+            for (nid in numIds) {
+                launch {
+                    gate.withPermit {
+                        val html = try {
+                            app.get("$mainUrl/player/$nid", headers = baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8).text
+                        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Exception) { log("httpResolve: $nid failed: ${e.message}"); return@withPermit }
+                        apRe.find(html)?.let { m ->
+                            val domain = m.groupValues[1]
+                            // playerBase is shared provider state, written from here concurrently now —
+                            // lock the read-then-maybe-write so two coroutines can't race on it.
+                            synchronized(playerBaseLock) {
+                                if (!playerBase.contains(domain.substringAfter("://"))) { playerBase = domain; log("httpResolve: player domain updated to $domain") }
+                            }
+                            out[nid] = "ap:${m.groupValues[2]}"; log("httpResolve: ap for $nid")
+                        } ?: gdRe.find(html)?.let { m ->
+                            out[nid] = "gd:${m.groupValues[1]}"; log("httpResolve: gd for $nid")
+                        } ?: urlRe.findAll(html)
+                            .map { it.value }
+                            .firstOrNull { u -> extractorHostKeywords.any { u.contains(it, ignoreCase = true) } }
+                            ?.let { out[nid] = "ex:$it"; log("httpResolve: ex for $nid") }
+                        ?: log("httpResolve: no embed found in /player/$nid (likely JS-assembled)")
+                    }
+                }
+            }
         }
         return out
     }
@@ -416,6 +461,10 @@ class AnizleProvider : MainAPI() {
     override val mainPage = mainPageOf("anime-izle" to "Son Eklenen Bölümler", "" to "Son Eklenen Animeler")
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val cacheKey = "$page:${request.data}"
+        mainPageCache[cacheKey]?.let { (cached, time) ->
+            if (System.currentTimeMillis() - time < mainPageCacheTtlMs) return cached
+        }
         val url = if (request.data == "anime-izle") "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
         val doc = app.get(url, headers = baseHeaders).document
         fun toAbs(src: String): String? {
@@ -442,7 +491,11 @@ class AnizleProvider : MainAPI() {
                 val animeUrl = if (isEp) href.replace(episodeUrlCleanupRe, "").trimEnd('-', '/') else href
                 newAnimeSearchResponse(title, animeUrl, TvType.Anime) { posterUrl = poster }
             }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        if (page == 1 && items.isEmpty()) logW("site-change warning: main page selectors empty")
+        val result = newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        mainPageCache[cacheKey] = result to System.currentTimeMillis()
+        if (mainPageCache.size > 20) mainPageCache.keys.firstOrNull()?.let { mainPageCache.remove(it) }
+        return result
     }
 
     // ── Load ──────────────────────────────────────────────────────────────────
@@ -577,40 +630,63 @@ class AnizleProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         getSession(); log("loadLinks: $data")
 
-        val epHtml = try { app.get(data, headers = baseHeaders).text }
-            catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return false }
+        val epHtml = try {
+            val text = getWithSessionRetry(data, baseHeaders)
+            if (text == null) { log("loadLinks: page error: session retry failed"); return false }
+            text
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { log("loadLinks: page error: ${e.message}"); return false }
         log("loadLinks: page len=${epHtml.length}")
 
-        val translators = mutableListOf<Pair<String, String>>()
+        // LinkedHashMap: O(1) dedup by URL (was translators.none{} — an O(n) scan per
+        // insert) while still preserving insertion order, which the fetch loop below relies
+        // on for its "first translator gets priority" delay logic.
+        val translators = LinkedHashMap<String, String>()
         trRe1.findAll(epHtml).forEach { m ->
-            val u = m.groupValues[1]; if (u.isNotBlank() && translators.none { it.first == u }) translators += u to m.groupValues[2].ifBlank { "Fansub" }
+            val u = m.groupValues[1]; if (u.isNotBlank()) translators.putIfAbsent(u, m.groupValues[2].ifBlank { "Fansub" })
         }
         if (translators.isEmpty()) trRe2.findAll(epHtml).forEach { m ->
-            val u = m.groupValues[2]; if (u.isNotBlank() && translators.none { it.first == u }) translators += u to m.groupValues[1].ifBlank { "Fansub" }
+            val u = m.groupValues[2]; if (u.isNotBlank()) translators.putIfAbsent(u, m.groupValues[1].ifBlank { "Fansub" })
         }
-        log("loadLinks: ${translators.size} translators: ${translators.map { it.second }}")
-        if (translators.isEmpty()) return false
+        log("loadLinks: ${translators.size} translators: ${translators.values}")
+        if (translators.isEmpty()) {
+            if (epHtml.length > 5000) logW("site-change warning: no translators found on a normal-sized episode page")
+            return false
+        }
 
-        val allWanted = mutableListOf<VidInfo>()
-        for ((trUrl, fansubName) in translators) {
-            val trText = try { app.get(trUrl, headers = xhrHeaders + mapOf("Referer" to data)).text }
-                catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); continue }
-            val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
-            if (trHtml.isBlank()) continue
-            val videos = mutableListOf<Pair<String, String>>()
-            vidRe1.findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
-            if (videos.isEmpty()) vidRe2.findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
-            log("loadLinks: $fansubName: ${videos.map { it.second }}")
-            for ((videoUrl, videoName) in videos) {
-                val vl = videoName.lowercase()
-                val isExtractorHost = extractorHostKeywords.any { vl.contains(it) }
-                if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive") && !isExtractorHost) continue
-                val numId = numIdRe.find(videoUrl)?.groupValues?.get(1) ?: continue
-                allWanted.add(VidInfo(numId, videoName, fansubName))
+        val allWanted = java.util.concurrent.ConcurrentLinkedQueue<VidInfo>()
+        val anyTranslatorHadData = java.util.concurrent.atomic.AtomicBoolean(false)
+        val trGate = Semaphore(3)
+        coroutineScope {
+            for ((trUrl, fansubName) in translators) {
+                launch {
+                    trGate.withPermit {
+                        val trText = try {
+                            val text = getWithSessionRetry(trUrl, xhrHeaders + mapOf("Referer" to data))
+                            if (text == null) { log("loadLinks: tr error ($fansubName): session retry failed"); return@withPermit }
+                            text
+                        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Exception) { log("loadLinks: tr error ($fansubName): ${e.message}"); return@withPermit }
+                        val trHtml = try { JSONObject(trText).optString("data", "") } catch (_: Exception) { "" }
+                        if (trHtml.isBlank()) return@withPermit
+                        anyTranslatorHadData.set(true)
+                        val videos = mutableListOf<Pair<String, String>>()
+                        vidRe1.findAll(trHtml).forEach { m -> videos += m.groupValues[1] to m.groupValues[2].ifBlank { "Player" } }
+                        if (videos.isEmpty()) vidRe2.findAll(trHtml).forEach { m -> videos += m.groupValues[2] to m.groupValues[1].ifBlank { "Player" } }
+                        log("loadLinks: $fansubName: ${videos.map { it.second }}")
+                        for ((videoUrl, videoName) in videos) {
+                            val vl = videoName.lowercase()
+                            val isExtractorHost = extractorHostKeywords.any { vl.contains(it) }
+                            if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive") && !isExtractorHost) continue
+                            val numId = numIdRe.find(videoUrl)?.groupValues?.get(1) ?: continue
+                            allWanted.add(VidInfo(numId, videoName, fansubName))
+                        }
+                    }
+                }
             }
         }
+        if (translators.isNotEmpty() && !anyTranslatorHadData.get())
+            logW("site-change warning: translator data empty for all ${translators.size} translators")
         log("loadLinks: ${allWanted.size} wanted")
         if (allWanted.isEmpty()) return false
 
@@ -862,9 +938,10 @@ class AnizleProvider : MainAPI() {
             return r1.url to headers
         }
         val html = r1.text
-        val confirm = gdriveConfirmRe.find(html)?.groupValues?.get(1)
-        val uuid = gdriveUuidRe.find(html)?.groupValues?.get(1)
-        if (confirm == null) { log("gdrive: no confirm field in interstitial (page structure changed?)"); return null }
+        val gdoc = org.jsoup.Jsoup.parse(html)
+        val confirm = gdoc.selectFirst("input[name=confirm]")?.attr("value")?.ifBlank { null }
+        val uuid = gdoc.selectFirst("input[name=uuid]")?.attr("value")?.ifBlank { null }
+        if (confirm == null) { logW("site-change warning: gdrive confirm missing"); return null }
         val cookie1 = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         // Small range here on purpose: r2 is only checked for its Content-Type header and
         // final redirect URL below, never its body. Reusing h's 64KB range would ask Google
