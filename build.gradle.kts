@@ -51,7 +51,12 @@ subprojects {
     }
 
     android {
-        namespace = "com.example"
+        // Was a shared "com.example" for every module — harmless with just two modules
+        // today, but a real collision risk (resource/manifest merging, R-class clashes)
+        // the moment a third module is added, and increasingly strict AGP versions have
+        // been known to enforce uniqueness more aggressively. Derived per-module instead,
+        // so this can never collide and needs no manual upkeep when a new module is added.
+        namespace = "com.a.${project.name.lowercase()}"
 
         defaultConfig {
             minSdk = 21
@@ -114,7 +119,8 @@ subprojects {
         implementation("org.jsoup:jsoup:1.18.3") // HTML Parser
         // IMPORTANT: Do not bump Jackson above 2.13.1, as newer versions will
         // break compatibility on older Android devices.
-        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1") // JSON Parser
+        // Jackson removed (3.3) — confirmed unused; both providers parse JSON with
+        // org.json (JSONObject/JSONArray) exclusively. One less dependency to track.
     }
 }
 
