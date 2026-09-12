@@ -24,12 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
         with:
           path: "src"
 
       - name: Checkout builds
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
         with:
           ref: "builds"
           path: "builds"
@@ -63,8 +63,13 @@ jobs:
           chmod +x gradlew
           ./gradlew make makePluginsJson
           ./gradlew ensureJarCompatibility
-          cp **/build/*.cs3 $GITHUB_WORKSPACE/builds
-          cp **/build/*.jar $GITHUB_WORKSPACE/builds || true
+          # find instead of `cp **/build/*.cs3`: that relies on bash's globstar option,
+          # which isn't enabled by default — it happens to work today only because every
+          # module's build output is exactly one directory deep. find is correct
+          # regardless of nesting, so it can't silently stop copying files if a module's
+          # structure ever changes.
+          find . -path '*/build/*.cs3' -exec cp {} $GITHUB_WORKSPACE/builds \;
+          find . -path '*/build/*.jar' -exec cp {} $GITHUB_WORKSPACE/builds \; || true
           cp build/plugins.json $GITHUB_WORKSPACE/builds
 
       - name: Push builds
