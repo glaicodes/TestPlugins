@@ -101,6 +101,9 @@ subprojects {
         // artifact resolves cleanly again.
         // Stubs for all cloudstream classes (full pre-release APK — slower to resolve
         // than the library artifact was, but it works).
+        // Last verified working: com.lagradost:cloudstream3:pre-release@2026-09-13
+        // (coroutines dependency + CloudStreamApp/CloudflareKiller stub build succeeded,
+        // Phase 1+2 code changes since have all built and run correctly against it)
         cloudstream("com.lagradost:cloudstream3:pre-release")
 
         // CORRECTION: the stub does NOT transitively expose kotlinx.coroutines on the
