@@ -30,6 +30,7 @@ class AnizleProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
+    @Volatile
     private var playerBase = "https://anizmplayer.com"
     // Derived, not hardcoded — if the site ever moves domains, only mainUrl needs updating;
     // this and every check that uses it follow automatically instead of silently going stale.
@@ -50,6 +51,7 @@ class AnizleProvider : MainAPI() {
     private val cfKiller = CloudflareKiller()
     private var csrfToken: String? = null
     private var sessionFetchedAt: Long = 0L
+    @Volatile private var csrfWarningLogged = false
     private val sessionTtlMs = 5 * 60 * 1000L
 
     // Hash cache — numId → embed string, with timestamps for TTL
@@ -68,6 +70,7 @@ class AnizleProvider : MainAPI() {
     // pull-to-refresh far more often than the underlying page content actually changes.
     private val mainPageCache = java.util.concurrent.ConcurrentHashMap<String, Pair<HomePageResponse, Long>>()
     private val mainPageCacheTtlMs = 3 * 60 * 1000L // 3 minutes — short on purpose, this is a burst-of-taps guard, not a real cache
+    private val mainPageCacheLock = Any()
 
     private fun getCached(numId: String): String? {
         val c = embedCache[numId] ?: return null
@@ -126,6 +129,9 @@ class AnizleProvider : MainAPI() {
     private val ogIzleTruncRe = Regex("""\s+[iİ]z?l?e?\.{2,}.*$""", RegexOption.IGNORE_CASE)
     private val asciiOnlyRe = Regex("^[\\x20-\\x7E]+$")
     private val yearRe = Regex("""\d{4}""")
+    private val rangeLabelRe = Regex("""\d+\s*-\s*\d+\.?\s*[Bb][oöô]l[uüû]m""")
+    private val singleEpLabelRe = Regex("""^(\d+)\.?\s*[Bb][oöô]l[uüû]m""")
+    private val singleEpUrlRe = Regex("""-(\d+)-bolum(?:-|$)""")
     // gdriveConfirmRe/gdriveUuidRe removed (3.1) — same reasoning as the CSRF regexes:
     // Jsoup's input[name=...] selector doesn't care about attribute order, and is also
     // more tolerant of the deliberately-truncated HTML this fetch produces (Range-limited).
@@ -156,10 +162,16 @@ class AnizleProvider : MainAPI() {
             val now = System.currentTimeMillis()
             if (!force && csrfToken != null && (now - sessionFetchedAt) < sessionTtlMs) return
             try {
-                var resp = app.get(mainUrl, headers = baseHeaders)
+                var resp = app.get(mainUrl, headers = baseHeaders, timeout = 10)
                 var html = resp.text
-                if (isCf(html)) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller); html = resp.text }
-                csrfToken = resp.document.selectFirst("meta[name=csrf-token]")?.attr("content")?.ifBlank { null }
+                if (isCf(html)) { resp = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller, timeout = 10); html = resp.text }
+                val newToken = resp.document.selectFirst("meta[name=csrf-token]")?.attr("content")?.ifBlank { null }
+                if (newToken == null) {
+                    if (!csrfWarningLogged) { logW("site-change warning: csrf token missing"); csrfWarningLogged = true }
+                } else {
+                    csrfWarningLogged = false
+                }
+                csrfToken = newToken
                 sessionFetchedAt = System.currentTimeMillis()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -182,19 +194,47 @@ class AnizleProvider : MainAPI() {
     // try/catch pattern used elsewhere in this file would never have caught this at all.
     // One retry only, never a loop: if refreshing the session doesn't fix it, it's a
     // real failure and should surface as one, not spin.
-    private suspend fun getWithSessionRetry(url: String, headers: Map<String, String>): String? {
-        var resp = app.get(url, headers = headers)
+    private suspend fun getWithSessionRetry(
+        url: String,
+        headers: Map<String, String>,
+        params: Map<String, String>? = null,
+        timeout: Int = 12,
+        injectToken: Boolean = false
+    ): String? {
+        val safeParams = params ?: emptyMap()
+        // New map each call, never a mutation of the caller's map — the retry must see
+        // whatever csrfToken getSession(force=true) just fetched, not a stale copy taken
+        // before the refresh.
+        fun buildParams() = if (injectToken && csrfToken != null) safeParams + ("_token" to csrfToken!!) else safeParams
+        var resp = app.get(url, headers = headers, params = buildParams(), timeout = timeout)
         if (resp.code == 403 || resp.code == 419) {
             log("session: got ${resp.code} for $url, refreshing session and retrying once")
-            csrfToken = null
+            // Invalidation itself now happens under the same mutex getSession() uses
+            // internally — previously this write raced against getSession()'s own lock
+            // instead of being part of the same atomic operation.
+            sessionMutex.withLock {
+                csrfToken = null
+                sessionFetchedAt = 0L
+            }
             getSession(force = true)
-            resp = app.get(url, headers = headers)
+            resp = app.get(url, headers = headers, params = buildParams(), timeout = timeout)
             if (resp.code == 403 || resp.code == 419) {
                 log("session: retry also got ${resp.code}, giving up")
                 return null
             }
         }
         return resp.text
+    }
+
+    // 1.6: document-returning counterpart for callers that need a parsed DOM (load,
+    // getMainPage) rather than raw text.
+    private suspend fun getDocumentWithSessionRetry(
+        url: String,
+        headers: Map<String, String>,
+        timeout: Int = 12
+    ): org.jsoup.nodes.Document? {
+        val text = getWithSessionRetry(url, headers, timeout = timeout)
+        return text?.let { org.jsoup.Jsoup.parse(it) }
     }
 
     private val baseHeaders get() = mapOf(
@@ -219,7 +259,8 @@ class AnizleProvider : MainAPI() {
                 launch {
                     gate.withPermit {
                         val html = try {
-                            app.get("$mainUrl/player/$nid", headers = baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8).text
+                            getWithSessionRetry("$mainUrl/player/$nid", baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8)
+                                ?: run { log("httpResolve: $nid session retry failed"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("httpResolve: $nid failed: ${e.message}"); return@withPermit }
                         apRe.find(html)?.let { m ->
@@ -288,13 +329,13 @@ class AnizleProvider : MainAPI() {
                     }
                 }
                 // If the caller's coroutine is cancelled (user leaves screen), tear the
-                // WebView down instead of leaking it until the 35s global timeout.
+                // WebView down instead of leaking it until the 25s global timeout.
                 cont.invokeOnCancellation { handler.post { finish() } }
 
                 val globalTimeout = Runnable { log("resolve: global timeout (${results.size}/${numIds.size})"); finish() }
                 handler.postDelayed(globalTimeout, 25_000L)
 
-                var currentTarget = ""; var currentIdx = -1
+                val currentTarget = java.util.concurrent.atomic.AtomicReference(""); var currentIdx = -1
                 var perIdTimeout: Runnable? = null
                 var usedFallback = false
                 var pageReady = false
@@ -317,11 +358,11 @@ class AnizleProvider : MainAPI() {
                         return
                     }
                     if (currentIdx >= numIds.size || done) { handler.removeCallbacks(globalTimeout); finish(); return }
-                    currentTarget = numIds[currentIdx]
+                    currentTarget.set(numIds[currentIdx])
                     val nid = numIds[currentIdx]
                     log("resolve: [${currentIdx}/${numIds.size}] numId=$nid")
 
-                    perIdTimeout = Runnable { if (currentTarget == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
+                    perIdTimeout = Runnable { if (currentTarget.get() == nid && !done) { log("resolve: timeout $nid"); resolveNext() } }
                     // 1.5s, not 3s: across 89 successful resolves in the user's own log, the
                     // slowest was 0.91s (p90 0.81s). A numId still unresolved past ~1.5s is
                     // dead, not slow — the old 3s just doubled the wasted wait on broken ones.
@@ -354,7 +395,7 @@ class AnizleProvider : MainAPI() {
                 // shouldInterceptRequest's own (different) thread.
                 fun handleDetectedEmbed(v: String) {
                     if (done) return
-                    val tgt = currentTarget
+                    val tgt = currentTarget.get()
                     if (v.isNotBlank() && tgt.isNotBlank() && !results.containsKey(tgt)) {
                         log("resolve: $v for numId=$tgt"); results[tgt] = v
                         onResolved(tgt, v)
@@ -373,7 +414,7 @@ class AnizleProvider : MainAPI() {
                         if (host.endsWith(mainHost)) {
                             // Only process /player/ paths
                             if (url.contains("/player/")) {
-                                val tgt = currentTarget
+                                val tgt = currentTarget.get()
                                 if (tgt.isBlank() || !url.endsWith("/player/$tgt"))
                                     return emptyResponse()
                             }
@@ -384,8 +425,10 @@ class AnizleProvider : MainAPI() {
                         if (host.contains("player")) {
                             apRe.find(url)?.let { m ->
                                 val domain = m.groupValues[1]
-                                if (!playerBase.contains(domain.substringAfter("://"))) {
-                                    playerBase = domain; log("resolve: player domain updated to $domain")
+                                synchronized(playerBaseLock) {
+                                    if (!playerBase.contains(domain.substringAfter("://"))) {
+                                        playerBase = domain; log("resolve: player domain updated to $domain")
+                                    }
                                 }
                                 if (seenEmbeds.add(m.groupValues[2]))
                                     handler.post { handleDetectedEmbed("ap:${m.groupValues[2]}") }
@@ -438,10 +481,10 @@ class AnizleProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim().ifBlank { return emptyList() }; getSession()
         val responseText = try {
-            val params = mutableMapOf("query" to q, "type" to "detailed", "limit" to "20",
+            val params = mapOf("query" to q, "type" to "detailed", "limit" to "20",
                 "priorityField" to "info_title", "orderBy" to "info_year", "orderDirection" to "ASC")
-            csrfToken?.let { params["_token"] = it }
-            app.get("$mainUrl/searchAnime", headers = xhrHeaders, params = params).text
+            getWithSessionRetry("$mainUrl/searchAnime", xhrHeaders, params = params, timeout = 10, injectToken = true)
+                ?: return emptyList()
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (_: Exception) { return emptyList() }
         return try {
@@ -466,7 +509,8 @@ class AnizleProvider : MainAPI() {
             if (System.currentTimeMillis() - time < mainPageCacheTtlMs) return cached
         }
         val url = if (request.data == "anime-izle") "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
-        val doc = app.get(url, headers = baseHeaders).document
+        val doc = getDocumentWithSessionRetry(url, baseHeaders, timeout = 12)
+            ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         fun toAbs(src: String): String? {
             if (src.isBlank() || src.startsWith("data:")) return null
             return when { src.startsWith("http") -> src; src.startsWith("//") -> "https:$src"; src.startsWith("/") -> "$mainUrl$src"; else -> "$mainUrl/$src" }
@@ -493,8 +537,16 @@ class AnizleProvider : MainAPI() {
             }
         if (page == 1 && items.isEmpty()) logW("site-change warning: main page selectors empty")
         val result = newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
-        mainPageCache[cacheKey] = result to System.currentTimeMillis()
-        if (mainPageCache.size > 20) mainPageCache.keys.firstOrNull()?.let { mainPageCache.remove(it) }
+        if (items.isNotEmpty()) {
+            mainPageCache[cacheKey] = result to System.currentTimeMillis()
+            synchronized(mainPageCacheLock) {
+                if (mainPageCache.size > 20) {
+                    mainPageCache.entries.minByOrNull { it.value.second }?.let {
+                        mainPageCache.remove(it.key)
+                    }
+                }
+            }
+        }
         return result
     }
 
@@ -513,7 +565,9 @@ class AnizleProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        getSession(); val doc = app.get(url, headers = baseHeaders).document
+        getSession()
+        val doc = getDocumentWithSessionRetry(url, baseHeaders, timeout = 12)
+            ?: return newAnimeLoadResponse(title = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h2.page-title, h1, .anime-title")?.text()?.trim()
             ?: url.substringAfterLast("/").replace("-", " ")
@@ -584,9 +638,7 @@ class AnizleProvider : MainAPI() {
         // parse real episodes' numbers directly from label or URL instead of trusting
         // position at all, so a missing/reordered entry elsewhere can't shift anything.
         data class EpEntry(val href: String, val label: String, val isSpecial: Boolean)
-        val rangeLabelRe = Regex("""\d+\s*-\s*\d+\.?\s*[Bb][oöô]l[uüû]m""")
-        val singleEpLabelRe = Regex("""^(\d+)\.?\s*[Bb][oöô]l[uüû]m""")
-        val singleEpUrlRe = Regex("""-(\d+)-bolum(?:-|$)""")
+        // rangeLabelRe/singleEpLabelRe/singleEpUrlRe now hoisted to class level (1.8)
         val entries = allLinks.mapNotNull { el ->
             val href = el.attr("abs:href").ifBlank { return@mapNotNull null }
             val label = el.text().trim().ifBlank { return@mapNotNull null }
@@ -677,7 +729,7 @@ class AnizleProvider : MainAPI() {
                         for ((videoUrl, videoName) in videos) {
                             val vl = videoName.lowercase()
                             val isExtractorHost = extractorHostKeywords.any { vl.contains(it) }
-                            if (!vl.contains("aincrad") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive") && !isExtractorHost) continue
+                            if (!vl.contains("aincrad") && !vl.contains("beta") && !vl.contains("gdrive") && !vl.contains("google") && !vl.contains("drive") && !isExtractorHost) continue
                             val numId = numIdRe.find(videoUrl)?.groupValues?.get(1) ?: continue
                             allWanted.add(VidInfo(numId, videoName, fansubName))
                         }
@@ -755,11 +807,11 @@ class AnizleProvider : MainAPI() {
                 try {
                     resolveEmbeds(uncachedIds, data) { id, embed ->
                         val existing = embedMap.putIfAbsent(id, embed)
-                        if (existing != null && existing != embed) {
-                            log("loadLinks: duplicate resolution for $id, keeping first")
-                        } else {
+                        if (existing == null) {
                             putCache(id, embed)
                             dispatch(id, embed)
+                        } else if (existing != embed) {
+                            log("loadLinks: duplicate resolution for $id, keeping first")
                         }
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -772,11 +824,11 @@ class AnizleProvider : MainAPI() {
                     log("loadLinks: ${missing.size} unresolved, trying HTTP fallback")
                     for ((id, embed) in httpResolveEmbeds(missing, data)) {
                         val existing = embedMap.putIfAbsent(id, embed)
-                        if (existing != null && existing != embed) {
-                            log("loadLinks: duplicate resolution for $id, keeping first")
-                        } else {
+                        if (existing == null) {
                             putCache(id, embed)
                             dispatch(id, embed)
+                        } else if (existing != embed) {
+                            log("loadLinks: duplicate resolution for $id, keeping first")
                         }
                     }
                 }
@@ -808,7 +860,7 @@ class AnizleProvider : MainAPI() {
             try {
                 // Collect, then re-emit with the fansub in the name — otherwise these
                 // links show only the extractor name ("Voe") with no fansub attribution
-                val collected = mutableListOf<ExtractorLink>()
+                val collected = java.util.concurrent.CopyOnWriteArrayList<ExtractorLink>()
                 kotlinx.coroutines.withTimeoutOrNull(15_000) {
                     loadExtractor(exUrl, data, subtitleCallback) { collected.add(it) }
                 }
