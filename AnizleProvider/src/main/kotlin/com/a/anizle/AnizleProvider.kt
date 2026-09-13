@@ -198,7 +198,7 @@ class AnizleProvider : MainAPI() {
         url: String,
         headers: Map<String, String>,
         params: Map<String, String>? = null,
-        timeout: Int = 12,
+        timeout: Long = 12L,
         injectToken: Boolean = false
     ): String? {
         val safeParams = params ?: emptyMap()
@@ -231,7 +231,7 @@ class AnizleProvider : MainAPI() {
     private suspend fun getDocumentWithSessionRetry(
         url: String,
         headers: Map<String, String>,
-        timeout: Int = 12
+        timeout: Long = 12L
     ): org.jsoup.nodes.Document? {
         val text = getWithSessionRetry(url, headers, timeout = timeout)
         return text?.let { org.jsoup.Jsoup.parse(it) }
@@ -259,7 +259,7 @@ class AnizleProvider : MainAPI() {
                 launch {
                     gate.withPermit {
                         val html = try {
-                            getWithSessionRetry("$mainUrl/player/$nid", baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8)
+                            getWithSessionRetry("$mainUrl/player/$nid", baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8L)
                                 ?: run { log("httpResolve: $nid session retry failed"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("httpResolve: $nid failed: ${e.message}"); return@withPermit }
@@ -483,7 +483,7 @@ class AnizleProvider : MainAPI() {
         val responseText = try {
             val params = mapOf("query" to q, "type" to "detailed", "limit" to "20",
                 "priorityField" to "info_title", "orderBy" to "info_year", "orderDirection" to "ASC")
-            getWithSessionRetry("$mainUrl/searchAnime", xhrHeaders, params = params, timeout = 10, injectToken = true)
+            getWithSessionRetry("$mainUrl/searchAnime", xhrHeaders, params = params, timeout = 10L, injectToken = true)
                 ?: return emptyList()
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (_: Exception) { return emptyList() }
@@ -509,7 +509,7 @@ class AnizleProvider : MainAPI() {
             if (System.currentTimeMillis() - time < mainPageCacheTtlMs) return cached
         }
         val url = if (request.data == "anime-izle") "$mainUrl/anime-izle?sayfa=$page" else "$mainUrl?sayfa=$page"
-        val doc = getDocumentWithSessionRetry(url, baseHeaders, timeout = 12)
+        val doc = getDocumentWithSessionRetry(url, baseHeaders, timeout = 12L)
             ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
         fun toAbs(src: String): String? {
             if (src.isBlank() || src.startsWith("data:")) return null
@@ -566,8 +566,8 @@ class AnizleProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         getSession()
-        val doc = getDocumentWithSessionRetry(url, baseHeaders, timeout = 12)
-            ?: return newAnimeLoadResponse(title = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
+        val doc = getDocumentWithSessionRetry(url, baseHeaders, timeout = 12L)
+            ?: return newAnimeLoadResponse(name = url.substringAfterLast('/'), url = url, type = TvType.Anime) { addEpisodes(DubStatus.Subbed, emptyList()) }
 
         val title = doc.selectFirst("h2.anizm_pageTitle, h2.page-title, h1, .anime-title")?.text()?.trim()
             ?: url.substringAfterLast("/").replace("-", " ")
