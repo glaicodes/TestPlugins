@@ -150,7 +150,7 @@ class AnizleProvider : MainAPI() {
     private val emptyBytes = ByteArray(0)
     private fun emptyResponse() = WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(emptyBytes))
 
-    private fun log(msg: String) { android.util.Log.d("Anizle", msg) }
+    private fun log(msg: String) { android.util.Log.i("Anizle", msg) }
     private fun logW(msg: String) { android.util.Log.w("Anizle", msg) }
 
     private val sessionMutex = Mutex()
