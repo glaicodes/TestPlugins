@@ -1,7 +1,7 @@
 [
     {
         "iconUrl": "https://anizm.pro/favicon.ico",
-        "fileHash": "sha256-f5adc74c8ab3599b99606cfc1dd075c6599258bd89b882b7dd8238a3176dfcf9",
+        "fileHash": "sha256-c3d5fe715ed117e0bfade9d8c1d141cda8e9d8042892e13fd81fd26e59c3e99e",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
         "fileSize": 67312,
@@ -15,7 +15,7 @@
             "AnimeMovie",
             "OVA"
         ],
-        "version": 100,
+        "version": 101,
         "internalName": "AnizleProvider",
         "description": "Anizle / Anizm",
         "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/AnizleProvider.cs3",
