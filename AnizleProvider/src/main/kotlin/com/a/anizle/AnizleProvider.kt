@@ -99,6 +99,14 @@ class AnizleProvider : MainAPI() {
     // Pre-compiled regexes — avoid recompilation in hot paths
     private val apRe = Regex("""(https?://[a-z0-9]*player[a-z0-9]*\.[a-z.]+)/(?:video|player)/([a-f0-9]{24,40})""", RegexOption.IGNORE_CASE)
     private val gdRe = Regex("""drive\.google\.com/(?:file/d/|uc\?[^"]*id=|open\?[^"]*id=)([A-Za-z0-9_-]{20,})""")
+    // Beta Player: /player/{numId} redirects to pl.puffytr.tr/watch/{hash} — a genuinely
+    // new backend, unrelated to Aincrad/anizmplayer.com despite similar button styling.
+    private val puffytrRe = Regex("""puffytr\.tr/watch/([a-f0-9]+)""", RegexOption.IGNORE_CASE)
+    // Master parsing: resolution + bandwidth + the variant URI on the line after — shared
+    // between Aincrad's HLS master and Beta Player's master.txt, same format either way.
+    private val streamInfRe = Regex("""#EXT-X-STREAM-INF:([^\n]*)\n\s*([^#\s]\S*)""")
+    private val resAttrRe = Regex("""RESOLUTION=\d+x(\d+)""")
+    private val bwAttrRe = Regex("""BANDWIDTH=(\d+)""")
     // Hosts CloudStream ships extractors for. Anything matching gets forwarded to
     // loadExtractor(), so upstream maintains them — new host on anizm = add one keyword.
     private val extractorHostKeywords = listOf(
@@ -194,13 +202,14 @@ class AnizleProvider : MainAPI() {
     // try/catch pattern used elsewhere in this file would never have caught this at all.
     // One retry only, never a loop: if refreshing the session doesn't fix it, it's a
     // real failure and should surface as one, not spin.
-    private suspend fun getWithSessionRetry(
+    private data class SessionRetryResult(val url: String, val text: String)
+    private suspend fun getResponseWithSessionRetry(
         url: String,
         headers: Map<String, String>,
         params: Map<String, String>? = null,
         timeout: Long = 12L,
         injectToken: Boolean = false
-    ): String? {
+    ): SessionRetryResult? {
         val safeParams = params ?: emptyMap()
         // New map each call, never a mutation of the caller's map — the retry must see
         // whatever csrfToken getSession(force=true) just fetched, not a stale copy taken
@@ -223,8 +232,16 @@ class AnizleProvider : MainAPI() {
                 return null
             }
         }
-        return resp.text
+        return SessionRetryResult(resp.url, resp.text)
     }
+
+    private suspend fun getWithSessionRetry(
+        url: String,
+        headers: Map<String, String>,
+        params: Map<String, String>? = null,
+        timeout: Long = 12L,
+        injectToken: Boolean = false
+    ): String? = getResponseWithSessionRetry(url, headers, params, timeout, injectToken)?.text
 
     // 1.6: document-returning counterpart for callers that need a parsed DOM (load,
     // getMainPage) rather than raw text.
@@ -254,16 +271,29 @@ class AnizleProvider : MainAPI() {
     private suspend fun httpResolveEmbeds(numIds: List<String>, episodeUrl: String): Map<String, String> {
         val out = java.util.concurrent.ConcurrentHashMap<String, String>()
         val gate = Semaphore(3)
+        // Referer + Sec-Fetch-*: OkHttp doesn't send these by default the way a real
+        // top-level/iframe navigation does, and /player/{numId} appears to gate on them
+        // (browser investigation: plain XHR/fetch fails outright regardless of cookies;
+        // navigation-shaped requests succeed). Cheap to add, can't make things worse.
+        val navHeaders = baseHeaders + mapOf(
+            "Referer" to episodeUrl,
+            "Sec-Fetch-Dest" to "iframe",
+            "Sec-Fetch-Mode" to "navigate",
+            "Sec-Fetch-Site" to "same-origin"
+        )
         coroutineScope {
             for (nid in numIds) {
                 launch {
                     gate.withPermit {
-                        val html = try {
-                            getWithSessionRetry("$mainUrl/player/$nid", baseHeaders + mapOf("Referer" to episodeUrl), timeout = 8L)
+                        val result = try {
+                            getResponseWithSessionRetry("$mainUrl/player/$nid", navHeaders, timeout = 8L)
                                 ?: run { log("httpResolve: $nid session retry failed"); return@withPermit }
                         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                         catch (e: Exception) { log("httpResolve: $nid failed: ${e.message}"); return@withPermit }
-                        apRe.find(html)?.let { m ->
+                        val html = result.text
+                        puffytrRe.find(result.url)?.let { m ->
+                            out[nid] = "bp:${m.groupValues[1]}"; log("httpResolve: bp for $nid")
+                        } ?: apRe.find(html)?.let { m ->
                             val domain = m.groupValues[1]
                             // playerBase is shared provider state, written from here concurrently now —
                             // lock the read-then-maybe-write so two coroutines can't race on it.
@@ -432,6 +462,13 @@ class AnizleProvider : MainAPI() {
                                 }
                                 if (seenEmbeds.add(m.groupValues[2]))
                                     handler.post { handleDetectedEmbed("ap:${m.groupValues[2]}") }
+                                return emptyResponse()
+                            }
+                        }
+                        if (host.contains("puffytr")) {
+                            puffytrRe.find(url)?.let { m ->
+                                if (seenEmbeds.add(m.groupValues[1]))
+                                    handler.post { handleDetectedEmbed("bp:${m.groupValues[1]}") }
                                 return emptyResponse()
                             }
                         }
@@ -913,28 +950,82 @@ class AnizleProvider : MainAPI() {
                 if (cand.isBlank() || resolved) continue
                 val head = try {
                     // Range keeps this cheap if honored; playlists are small anyway
-                    app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8).text
+                    app.get(cand, headers = hlsHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8)
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e // never swallow cancellation: dropped sources otherwise (Seicode bug)
                 } catch (e: Exception) { log("aincrad: probe failed: ${e.message}"); continue }
-                val t = head.trimStart()
+                val t = head.text.trimStart()
                 when {
                     t.startsWith("#EXTM3U") -> {
-                        if (t.contains("TYPE=AUDIO"))
-                            log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
-                        // Real resolution from the master (RESOLUTION=WxH on STREAM-INF lines)
-                        val h = hlsResolutionRe.findAll(t)
-                            .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
                         val cleanLabel = cleanDisplayName(label)
-                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = cand, type = ExtractorLinkType.M3U8) {
-                            quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
-                        resolved = true
+                        val isSplitAudio = t.contains("TYPE=AUDIO")
+                        if (isSplitAudio) {
+                            // Splitting per-resolution here would mean each entry is a
+                            // video-only variant — plays fine, but CloudStream's downloader
+                            // can't mux the separate audio track back in, producing a silent
+                            // download (the exact bug fixed earlier). Keep this one case as a
+                            // single master link so ExoPlayer handles ABR + audio itself.
+                            log("aincrad: split-audio HLS — streaming ok, app downloader can't mux this")
+                            val h = hlsResolutionRe.findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
+                            callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = cand, type = ExtractorLinkType.M3U8) {
+                                quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                            resolved = true
+                        } else {
+                            // Self-contained variants (each already has its own audio) — safe
+                            // to split into one selectable entry per resolution.
+                            val variants = streamInfRe.findAll(t).mapNotNull { m ->
+                                val attrs = m.groupValues[1]
+                                val height = resAttrRe.find(attrs)?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
+                                val bandwidth = bwAttrRe.find(attrs)?.groupValues?.get(1)?.toLongOrNull()
+                                val rawUri = m.groupValues[2]
+                                val resolvedUrl = try { java.net.URI(cand).resolve(rawUri).toString() } catch (_: Exception) { rawUri }
+                                Triple(height, bandwidth, resolvedUrl)
+                            }.distinctBy { it.first }.sortedByDescending { it.first }.toList()
+
+                            if (variants.isEmpty()) {
+                                // Master had no parseable per-resolution variants at all —
+                                // fall back to the single-link behavior rather than emit nothing.
+                                val h = hlsResolutionRe.findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
+                                callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = cand, type = ExtractorLinkType.M3U8) {
+                                    quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
+                                resolved = true
+                            } else {
+                                val variantGate = Semaphore(3)
+                                coroutineScope {
+                                    for ((height, bandwidth, variantUrl) in variants) {
+                                        launch {
+                                            variantGate.withPermit {
+                                                // Validate + estimate size from the same fetch — no extra
+                                                // request beyond what we'd need to confirm it's real anyway.
+                                                val body = try {
+                                                    app.get(variantUrl, headers = hlsHeaders, timeout = 8).text
+                                                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                                                catch (e: Exception) { log("aincrad: variant $height p probe failed: ${e.message}"); return@withPermit }
+                                                if (!body.trimStart().startsWith("#EXTM3U")) {
+                                                    log("aincrad: variant ${height}p rejected (not a playlist)"); return@withPermit
+                                                }
+                                                val totalSeconds = Regex("""#EXTINF:([\d.]+)""").findAll(body)
+                                                    .sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
+                                                val estBytes = if (bandwidth != null && totalSeconds > 0)
+                                                    (bandwidth * totalSeconds / 8).toLong() else null
+                                                val name = "$cleanLabel ${height}p${formatSize(estBytes, isEstimate = true)}"
+                                                callback(newExtractorLink(source = cleanLabel, name = name, url = variantUrl, type = ExtractorLinkType.M3U8) {
+                                                    quality = height; referer = playerRef; headers = hlsHeaders })
+                                            }
+                                        }
+                                    }
+                                }
+                                resolved = true
+                            }
+                        }
                     }
                     t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
                         log("aincrad: candidate unusable, trying next")
                     else -> {
                         val cleanLabel = cleanDisplayName(label)
-                        callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = cand, type = ExtractorLinkType.VIDEO) {
+                        val sizeBytes = parseContentRangeTotal(head.headers)
+                        val name = cleanLabel + formatSize(sizeBytes)
+                        callback(newExtractorLink(source = cleanLabel, name = name, url = cand, type = ExtractorLinkType.VIDEO) {
                             quality = Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                         resolved = true
                     }
@@ -951,14 +1042,82 @@ class AnizleProvider : MainAPI() {
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
               catch (e: Exception) { log("gdrive: resolve error: ${e.message}"); null }
             if (resolved != null) {
-                val (finalUrl, dlHeaders) = resolved
                 val cleanLabel = cleanDisplayName(label)
-                callback(newExtractorLink(source = cleanLabel, name = cleanLabel, url = finalUrl, type = ExtractorLinkType.VIDEO) {
-                    quality = Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = dlHeaders })
+                val displayName = cleanLabel + formatSize(resolved.sizeBytes)
+                callback(newExtractorLink(source = cleanLabel, name = displayName, url = resolved.url, type = ExtractorLinkType.VIDEO) {
+                    quality = Qualities.Unknown.value; referer = "https://drive.google.com/"; headers = resolved.headers })
                 return true
             }
             log("gdrive: could not resolve a playable link for $fileId")
             return false
+        }
+
+        if (embed.startsWith("bp:")) {
+            // Beta Player — genuinely different backend from Aincrad (puffytr.tr, not
+            // anizmplayer.com) despite similar button styling on-site. master.txt is a
+            // plain, unauthenticated standard HLS master — same STREAM-INF format as
+            // Aincrad's, so this reuses the exact same parsing/classification approach.
+            val hash = embed.removePrefix("bp:")
+            log("beta: hash=$hash for $label")
+            val watchRef = "https://pl.puffytr.tr/watch/$hash"
+            val betaHeaders = mapOf("User-Agent" to ua, "Referer" to watchRef)
+            val masterUrl = "https://pl.puffytr.tr/stream/$hash/master.txt"
+            val body = try {
+                app.get(masterUrl, headers = betaHeaders, timeout = 10L).text
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("beta: master.txt fetch failed: ${e.message}"); return false }
+            if (!body.trimStart().startsWith("#EXTM3U")) { log("beta: master.txt not a valid playlist"); return false }
+
+            val cleanLabel = cleanDisplayName(label)
+            val variants = streamInfRe.findAll(body).mapNotNull { m ->
+                val attrs = m.groupValues[1]
+                val height = resAttrRe.find(attrs)?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
+                val bandwidth = bwAttrRe.find(attrs)?.groupValues?.get(1)?.toLongOrNull()
+                val resolvedUrl = try { java.net.URI(masterUrl).resolve(m.groupValues[2]).toString() } catch (_: Exception) { null }
+                    ?: return@mapNotNull null
+                Triple(height, bandwidth, resolvedUrl)
+            }.distinctBy { it.first }.sortedByDescending { it.first }.toList()
+
+            if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
+
+            var any = false
+            val betaGate = Semaphore(3)
+            coroutineScope {
+                for ((height, bandwidth, variantUrl) in variants) {
+                    launch {
+                        betaGate.withPermit {
+                            // Don't trust the report's claim that these are always plain HLS —
+                            // classify by content the same way every other source here does.
+                            val probe = try {
+                                app.get(variantUrl, headers = betaHeaders + mapOf("Range" to "bytes=0-4095"), timeout = 8L)
+                            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                            catch (e: Exception) { log("beta: variant ${height}p probe failed: ${e.message}"); return@withPermit }
+                            val pt = probe.text.trimStart()
+                            when {
+                                pt.startsWith("#EXTM3U") -> {
+                                    val totalSeconds = Regex("""#EXTINF:([\d.]+)""").findAll(pt)
+                                        .sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
+                                    val estBytes = if (bandwidth != null && totalSeconds > 0) (bandwidth * totalSeconds / 8).toLong() else null
+                                    val name = "$cleanLabel ${height}p${formatSize(estBytes, isEstimate = true)}"
+                                    callback(newExtractorLink(source = cleanLabel, name = name, url = variantUrl, type = ExtractorLinkType.M3U8) {
+                                        quality = height; referer = watchRef; headers = betaHeaders })
+                                    any = true
+                                }
+                                pt.startsWith("<") || pt.contains("<html", ignoreCase = true) || pt.isBlank() ->
+                                    log("beta: variant ${height}p unusable")
+                                else -> {
+                                    val sizeBytes = parseContentRangeTotal(probe.headers)
+                                    val name = "$cleanLabel ${height}p" + formatSize(sizeBytes)
+                                    callback(newExtractorLink(source = cleanLabel, name = name, url = variantUrl, type = ExtractorLinkType.VIDEO) {
+                                        quality = height; referer = watchRef; headers = betaHeaders })
+                                    any = true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return any
         }
 
         return false
@@ -971,7 +1130,20 @@ class AnizleProvider : MainAPI() {
     // `uuid` values Google issues, and replay them — this is Google's own two-step flow,
     // not a workaround. Every request uses a small Range so a multi-GB file is never
     // pulled through just to read its headers.
-    private suspend fun resolveGDrive(fileId: String): Pair<String, Map<String, String>>? {
+    // Appends " [1.3GB]" style suffix to a name. isEstimate prefixes with ~ since HLS
+    // variant sizes are computed from bitrate×duration, not a server-reported value.
+    private fun formatSize(bytes: Long?, isEstimate: Boolean = false): String {
+        if (bytes == null || bytes <= 0) return ""
+        val gb = bytes / 1_073_741_824.0
+        val tilde = if (isEstimate) "~" else ""
+        return if (gb >= 1) " [$tilde%.1fGB]".format(gb) else " [$tilde%.0fMB]".format(bytes / 1_048_576.0)
+    }
+    private fun parseContentRangeTotal(headers: Map<String, String>): Long? =
+        headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
+            ?: headers["Content-Length"]?.toLongOrNull()
+
+    private data class GDriveResolution(val url: String, val headers: Map<String, String>, val sizeBytes: Long?)
+    private suspend fun resolveGDrive(fileId: String): GDriveResolution? {
         // Wide range for THIS request specifically: we don't yet know if it's an HTML
         // interstitial or real media. Google's confirm/uuid form fields sit well past 2KB
         // (after head/style boilerplate) — a small range was truncating the page before
@@ -987,7 +1159,7 @@ class AnizleProvider : MainAPI() {
             val cookie = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
             val headers = mapOf("User-Agent" to ua) + (if (cookie.isNotBlank()) mapOf("Cookie" to cookie) else emptyMap())
             log("gdrive: no interstitial, direct link")
-            return r1.url to headers
+            return GDriveResolution(r1.url, headers, parseContentRangeTotal(r1.headers))
         }
         val html = r1.text
         val gdoc = org.jsoup.Jsoup.parse(html)
@@ -1007,6 +1179,6 @@ class AnizleProvider : MainAPI() {
         val allCookies = (r1.cookies + r2.cookies).entries.joinToString("; ") { "${it.key}=${it.value}" }
         val headersFinal = mapOf("User-Agent" to ua) + (if (allCookies.isNotBlank()) mapOf("Cookie" to allCookies) else emptyMap())
         log("gdrive: resolved via confirm+uuid")
-        return r2.url to headersFinal
+        return GDriveResolution(r2.url, headersFinal, parseContentRangeTotal(r2.headers))
     }
 }
