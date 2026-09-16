@@ -47,6 +47,13 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          # Google removed the legacy 'tools' package from the SDK repository
+          # (~2026-09-15); this action's default packages input is "tools platform-tools",
+          # so it now fails before anything of ours even runs. Only platform-tools was
+          # ever actually needed here — AGP downloads whatever platform/build-tools
+          # compileSdk requires on its own once Gradle configures the modules.
+          packages: platform-tools
 
       # Caches gradle wrapper, dependencies and build cache between CI runs
       - name: Setup Gradle
