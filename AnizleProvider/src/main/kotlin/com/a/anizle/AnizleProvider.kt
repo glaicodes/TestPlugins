@@ -1138,7 +1138,7 @@ class AnizleProvider : MainAPI() {
         val tilde = if (isEstimate) "~" else ""
         return if (gb >= 1) " [$tilde%.1fGB]".format(gb) else " [$tilde%.0fMB]".format(bytes / 1_048_576.0)
     }
-    private fun parseContentRangeTotal(headers: Map<String, String>): Long? =
+    private fun parseContentRangeTotal(headers: Headers): Long? =
         headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
             ?: headers["Content-Length"]?.toLongOrNull()
 
