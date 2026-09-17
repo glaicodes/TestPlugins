@@ -27,6 +27,26 @@ import kotlin.coroutines.resume
 
 class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
+    // v11: lets the settings screen run the connection self-test on demand, instead of the
+    // user having to force-stop the app and catch the one automatic run in a logcat.
+    companion object {
+        @Volatile internal var instance: AnizmProvider? = null
+        @Volatile internal var lastProbeTarget: Pair<String, String>? = null // numId, episode url
+    }
+    init { instance = this }
+
+    /** Called from the settings screen. Returns the report lines (also written to logcat). */
+    suspend fun runConnectionTest(): List<String> {
+        val (nid, episodeUrl) = lastProbeTarget
+            ?: return listOf("Open an episode first (so there is a player id to test), then run this again.")
+        val out = mutableListOf<String>()
+        diagnosedThisSession = false
+        diagnoseDirectBlock(nid, episodeUrl) { out += it }
+        val blocked = System.currentTimeMillis() < playerHttpBlockedUntil
+        out += if (blocked) "Currently using the WebView fallback." else "Direct lookups are in use."
+        return out
+    }
+
     override var mainUrl    = "https://anizm.net"
     override var name       = "Anizm"
     override var lang       = "tr"
@@ -357,9 +377,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // whether the block is about the path, the headers, the missing cookies or the client
     // itself — instead of us guessing one variable at a time across builds.
     @Volatile private var diagnosedThisSession = false
-    private suspend fun diagnoseDirectBlock(nid: String, episodeUrl: String) {
+    private suspend fun diagnoseDirectBlock(nid: String, episodeUrl: String, collect: ((String) -> Unit)? = null) {
         if (diagnosedThisSession) return
         diagnosedThisSession = true
+        fun report(line: String) { logW(line); collect?.invoke(line) }
         val playerUrl = "$mainUrl/player/$nid"
         val cookies = webViewCookies()
         val chromeHints = mapOf(
@@ -380,7 +401,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             Triple("episode page (control)", episodeUrl, baseHeaders),
             Triple("home page (control)", "$mainUrl/", baseHeaders),
         )
-        logW("diag: direct lookups refused — running one-time self-test (webview cookies: ${cookies?.split(";")?.size ?: 0} present)")
+        report("diag: self-test (webview cookies: ${cookies?.split(";")?.size ?: 0})")
         for ((name, url, headers) in cases) {
             val line = try {
                 val r = app.get(url, headers = headers, timeout = 8L, allowRedirects = false)
@@ -394,7 +415,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 "${r.code} server=${r.headers["server"]} cf-mitigated=${r.headers["cf-mitigated"]} ray=${r.headers["cf-ray"]}$loc$marker"
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (e: Exception) { "exception ${e.javaClass.simpleName}: ${e.message}" }
-            logW("diag: $name → $line")
+            report("$name → $line")
             delay(700)
         }
         // Same URL through CloudflareKiller, which replays the WebView's own cookies.
@@ -404,8 +425,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             "${r.code}${r.headers["Location"]?.take(60)?.let { " → $it" } ?: ""}"
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
         catch (e: Exception) { "exception ${e.javaClass.simpleName}: ${e.message}" }
-        logW("diag: player, via CloudflareKiller → $viaKiller")
-        logW("diag: done — send this logcat")
+        report("player, via CloudflareKiller → $viaKiller")
     }
 
     private suspend fun resolveViaRedirect(nid: String, episodeUrl: String): String? {
@@ -417,6 +437,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         ) + (webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap())
         val playerUrl = "$mainUrl/player/$nid"
+        lastProbeTarget = nid to episodeUrl
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
         // looksCfBlocked), and a block should switch strategy, not be retried.
         val r = app.get(playerUrl, headers = headers, timeout = 8L, allowRedirects = false)
@@ -1053,6 +1074,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             .sortedBy { id -> byNumId[id]!!.minOf { settings.priorityOf(it.name) } }
         // A numId counts as enabled if any label pointing at it is enabled.
         val enabledIds = ordered(listed.filter { settings.isEnabled(it.name) }.map { it.numId })
+        // Remember a target for the settings screen's connection test, whether or not the
+        // direct path ran this time.
+        enabledIds.firstOrNull()?.let { lastProbeTarget = it to data }
         val enabledSet = enabledIds.toHashSet()
         val disabledIds = ordered(listed.map { it.numId }.filter { it !in enabledSet })
         log("loadLinks: ${enabledIds.size} enabled, ${disabledIds.size} disabled by settings; lazy=$lazy target=$target minQ=$minQuality gdriveFirst=$gdriveFirst lastResort=$lastResort")

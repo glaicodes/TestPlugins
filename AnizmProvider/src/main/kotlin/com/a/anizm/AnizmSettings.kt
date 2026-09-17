@@ -8,11 +8,16 @@ import android.util.TypedValue
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * User-facing settings, shown from CloudStream's Extensions screen via Plugin.openSettings.
@@ -121,6 +126,28 @@ class AnizmSettings(private val prefs: SharedPreferences) {
             }
             syncTargetRow()
             lazyBox.setOnCheckedChangeListener { _, _ -> syncTargetRow() }
+
+            header("Connection")
+            note("anizm sometimes refuses this extension's direct player lookups, and it falls back to the in-app browser engine (slower, but works). This test shows what the site answers.")
+            val testBtn = Button(context).apply {
+                text = "Run connection test"
+                setOnClickListener {
+                    isEnabled = false; text = "Testing…"
+                    CoroutineScope(Dispatchers.IO).launch {
+                        val lines = try { AnizmProvider.instance?.runConnectionTest() ?: listOf("Extension not loaded yet.") }
+                        catch (e: Exception) { listOf("Test failed: ${e.message}") }
+                        withContext(Dispatchers.Main) {
+                            isEnabled = true; text = "Run connection test"
+                            AlertDialog.Builder(context)
+                                .setTitle("Connection test")
+                                .setMessage(lines.joinToString("\n\n"))
+                                .setPositiveButton("OK", null)
+                                .show()
+                        }
+                    }
+                }
+            }
+            root.addView(testBtn)
 
             header("Extras")
             val sizeBox = check("Show estimated file size for Aincrad / Beta Player", settings.estimateSizes)
