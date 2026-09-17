@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://anizm.net/favicon.ico",
-        "fileHash": "sha256-06c29251137d48ae68d95864cbe327f8e569db6a4235c9987ede0d53eb87d529",
+        "fileHash": "sha256-d08be9b51fa2a08816eee95b5af24ac7929c424b039f313eea84af6c646392be",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
-        "fileSize": 114399,
+        "fileSize": 123918,
         "status": 1,
         "language": "tr",
         "authors": [
