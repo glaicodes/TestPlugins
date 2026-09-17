@@ -23,7 +23,7 @@
     },
     {
         "iconUrl": "https://anizm.net/favicon.ico",
-        "fileHash": "sha256-24b164169ee9cd36e828c557cb7cd267ffb2a2a1096df4099bc1af2f23aecfe2",
+        "fileHash": "sha256-3e2b2ac08eee49c53c0003ed5dd6a7aed670da729b64a3fe61b45ba72db76243",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
         "fileSize": 133728,
@@ -37,7 +37,7 @@
             "AnimeMovie",
             "OVA"
         ],
-        "version": 4,
+        "version": 5,
         "internalName": "AnizmProvider",
         "description": "Anizm (anizm.net) - T\u00fcrk\u00e7e altyaz\u0131l\u0131 anime",
         "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/AnizmProvider.cs3",
