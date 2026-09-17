@@ -122,6 +122,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // XHR each time; embedCache only covered the step after that.
     private val sourceListCache = java.util.concurrent.ConcurrentHashMap<String, Pair<List<VidInfo>, Long>>()
     private val sourceListTtlMs = 10 * 60 * 1000L
+    // v9: last loadLinks time per episode, for the reload detection in loadLinks.
+    private val lastLoadAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val reloadMinGapMs = 5_000L      // below this it's the app's own preload + open
+    private val reloadWindowMs = 30 * 60 * 1000L
 
     // Hash cache — numId → embed string, with timestamps for TTL
     // Hashes are content-based (not session-based) so safe to cache
@@ -340,6 +344,70 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return if (url.startsWith("http")) "ex:$url" else null
     }
 
+    // v10: cookies the WebView picked up for anizm (Cloudflare's __cf_bm / cf_clearance
+    // among them) are in the app-wide CookieManager. OkHttp doesn't use that store, so until
+    // now the direct lookups arrived cookieless while the WebView path was fully "logged in"
+    // to Cloudflare's eyes. Sharing them costs nothing and may be the whole difference.
+    private fun webViewCookies(): String? = try {
+        CookieManager.getInstance().getCookie(mainUrl)?.takeIf { it.isNotBlank() }
+    } catch (_: Throwable) { null }
+
+    // One-shot self-test, run the first time a direct lookup is refused. It replays the same
+    // request a few different ways and logs what each one gets back, so a single logcat shows
+    // whether the block is about the path, the headers, the missing cookies or the client
+    // itself — instead of us guessing one variable at a time across builds.
+    @Volatile private var diagnosedThisSession = false
+    private suspend fun diagnoseDirectBlock(nid: String, episodeUrl: String) {
+        if (diagnosedThisSession) return
+        diagnosedThisSession = true
+        val playerUrl = "$mainUrl/player/$nid"
+        val cookies = webViewCookies()
+        val chromeHints = mapOf(
+            "sec-ch-ua" to "\"Chromium\";v=\"152\", \"Google Chrome\";v=\"152\", \"Not?A_Brand\";v=\"24\"",
+            "sec-ch-ua-mobile" to "?1", "sec-ch-ua-platform" to "\"Android\"",
+            "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "same-origin",
+            "Upgrade-Insecure-Requests" to "1",
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        val cases = listOf<Triple<String, String, Map<String, String>>>(
+            Triple("player, minimal", playerUrl, mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")),
+            Triple("player, episode referer", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl)),
+            Triple("player, no user-agent", playerUrl, mapOf("Referer" to "$mainUrl/")),
+            Triple("player, chrome hints", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) + chromeHints),
+            Triple("player, webview cookies", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) +
+                (cookies?.let { mapOf("Cookie" to it) } ?: emptyMap())),
+            Triple("player, cookies + hints", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl) + chromeHints +
+                (cookies?.let { mapOf("Cookie" to it) } ?: emptyMap())),
+            Triple("episode page (control)", episodeUrl, baseHeaders),
+            Triple("home page (control)", "$mainUrl/", baseHeaders),
+        )
+        logW("diag: direct lookups refused — running one-time self-test (webview cookies: ${cookies?.split(";")?.size ?: 0} present)")
+        for ((name, url, headers) in cases) {
+            val line = try {
+                val r = app.get(url, headers = headers, timeout = 8L, allowRedirects = false)
+                val body = if (r.code in 200..299 && (r.headers["Content-Type"] ?: "").contains("html", true)) r.text.take(200) else ""
+                val marker = when {
+                    body.contains("Just a moment", true) -> " challenge-page"
+                    body.contains("blocked", true) || body.contains("Attention Required", true) -> " block-page"
+                    else -> ""
+                }
+                val loc = r.headers["Location"]?.take(60)?.let { " → $it" } ?: ""
+                "${r.code} server=${r.headers["server"]} cf-mitigated=${r.headers["cf-mitigated"]} ray=${r.headers["cf-ray"]}$loc$marker"
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { "exception ${e.javaClass.simpleName}: ${e.message}" }
+            logW("diag: $name → $line")
+            delay(700)
+        }
+        // Same URL through CloudflareKiller, which replays the WebView's own cookies.
+        val viaKiller = try {
+            val r = app.get(playerUrl, headers = baseHeaders + mapOf("Referer" to episodeUrl),
+                timeout = 20L, allowRedirects = false, interceptor = cfKiller)
+            "${r.code}${r.headers["Location"]?.take(60)?.let { " → $it" } ?: ""}"
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { "exception ${e.javaClass.simpleName}: ${e.message}" }
+        logW("diag: player, via CloudflareKiller → $viaKiller")
+        logW("diag: done — send this logcat")
+    }
+
     private suspend fun resolveViaRedirect(nid: String, episodeUrl: String): String? {
         // v5: no Sec-Fetch-* headers. Only the Referer is needed (verified), and Sec-Fetch-*
         // without Chrome's matching sec-ch-ua client hints is an inconsistent fingerprint —
@@ -347,7 +415,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         val headers = baseHeaders + mapOf(
             "Referer" to episodeUrl,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
+        ) + (webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap())
         val playerUrl = "$mainUrl/player/$nid"
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
         // looksCfBlocked), and a block should switch strategy, not be retried.
@@ -356,6 +424,9 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             logW("resolve: /player/$nid refused (http ${r.code}, server=${r.headers["server"]}, cf-mitigated=${r.headers["cf-mitigated"]}, cf-ray=${r.headers["cf-ray"]}) — switching to WebView for ${playerHttpBlockCooldownMs / 60000} min")
             try { r.okhttpResponse.close() } catch (_: Exception) {}
             playerHttpBlockedUntil = System.currentTimeMillis() + playerHttpBlockCooldownMs
+            try { diagnoseDirectBlock(nid, episodeUrl) }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { log("diag: failed: ${e.message}") }
             throw PlayerLookupBlocked(r.code)
         }
         if (r.code in 300..399) {
@@ -943,11 +1014,29 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         log("loadLinks: $data")
+        // v9: tell a real "reload links" apart from the app's own double call.
+        // CloudStream calls loadLinks again a second or two after the first (preload, then
+        // the actual open) — those should use the caches. A call that arrives much later for
+        // the same episode is the user asking again, and answering that from cache is what
+        // made "reload links" look like it did nothing. That one re-scrapes everything:
+        // episode page, translator lists, every player lookup, and Aincrad's signed URL.
+        val callNow = System.currentTimeMillis()
+        val sinceLast = lastLoadAt[data]?.let { callNow - it } ?: Long.MAX_VALUE
+        lastLoadAt[data] = callNow
+        if (lastLoadAt.size > 50) lastLoadAt.entries.removeAll { callNow - it.value > reloadWindowMs }
+        val forceRefresh = sinceLast in reloadMinGapMs..reloadWindowMs
+        if (forceRefresh) {
+            log("loadLinks: reload requested (${sinceLast / 1000}s since last) — clearing caches for this episode")
+            sourceListCache.remove(data)?.first?.forEach { vi ->
+                embedCache.remove(vi.numId)?.embed?.takeIf { it.startsWith("ap:") }?.let { aincradCache.remove(it.removePrefix("ap:")) }
+            }
+        }
         val listed = fetchSourceList(data) ?: return false
         if (listed.isEmpty()) return false
 
         // Snapshot settings once per call so a change mid-load can't half-apply.
-        val lazy = settings.lazyResolve
+        // A reload also ignores the lazy stop: if you asked again, you want the whole list.
+        val lazy = settings.lazyResolve && !forceRefresh
         val target = settings.lazyTargetSources
         val lastResort = settings.tryDisabledAsLastResort
         val minQuality = settings.lazyMinQuality
