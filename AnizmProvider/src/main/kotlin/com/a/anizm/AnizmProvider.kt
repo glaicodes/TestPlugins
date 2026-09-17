@@ -66,13 +66,29 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // it's the entire reason resolveGDrive()'s multi-step dance exists — so this stays at
     // 1, not the 5 used for general step4 work.
     private val gdriveGate = Semaphore(1)
-    // Single UA everywhere (OkHttp + WebView). Cookies are shared via CookieManager,
-    // so presenting two different UAs on the same session is an easy fingerprint.
-    // 4.0: bumped from Chrome/133 — a UA ~19 major versions behind stable (152 as of
-    // 2026-09) is itself a bot-score signal for Cloudflare's bot management, which this
-    // site loads (cdn-cgi/challenge-platform). Reduced-UA form (x.0.0.0) is what real
-    // Chrome sends. Bump this roughly twice a year.
-    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+    // v13: this runs on Android, so it now says so — and says it with THIS device's real
+    // browser identity instead of an invented one. The UA is taken from the system WebView
+    // (minus the "; wv" marker, so it reads as Chrome rather than an embedded WebView), which
+    // means the Chrome version is whatever is actually installed and never goes stale.
+    //
+    // Why it matters beyond honesty: the WebView fallback runs real JavaScript on the page,
+    // where Cloudflare can read navigator.userAgentData, the platform, screen and touch
+    // support. Claiming "Chrome on Windows" from an Android tablet contradicts all of that,
+    // and header/JS disagreement is exactly what bot scoring looks for. One identity now:
+    // same UA on OkHttp and the WebView, client hints derived from it.
+    private val ua: String by lazy {
+        val fromSystem = try {
+            val ctx = com.lagradost.cloudstream3.CloudStreamApp.context
+            if (ctx != null) WebSettings.getDefaultUserAgent(ctx)?.replace("; wv", "")?.replace(" wv)", ")") else null
+        } catch (_: Throwable) { null }
+        val resolved = fromSystem?.takeIf { it.contains("Chrome/") && it.contains("Android") }
+            ?: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36"
+        log("ua: $resolved")
+        resolved
+    }
+    private val chromeMajor: String by lazy {
+        Regex("""Chrome/(\d+)""").find(ua)?.groupValues?.get(1) ?: "152"
+    }
     // Old stub system: CloudflareKiller is directly on the compile classpath again
     // (it's part of the full pre-release APK), no reflection needed.
     private val cfKiller = CloudflareKiller()
@@ -322,10 +338,30 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private suspend fun siteDocument(url: String, headers: Map<String, String>, timeout: Long = 12L): org.jsoup.nodes.Document? =
         siteText(url, headers, timeout = timeout)?.let { org.jsoup.Jsoup.parse(it, url) }
 
-    private val baseHeaders get() = mapOf(
+    // v12: Cloudflare's challenge on /player/ was about MISSING CLIENT HINTS, not the
+    // Referer and not cookies. Device self-test (2026-09-18), same URL, same second:
+    //   minimal / episode-referer / no-UA / webview-cookies → 403, cf-mitigated=challenge
+    //   chrome hints / cookies+hints                        → 302 (the embed redirect)
+    //   episode page, home page (no hints)                  → 200
+    // A UA that says "Chrome 152" with no sec-ch-ua headers is a contradiction, and that
+    // path is where Cloudflare enforces it. v5 removed these headers on the theory that they
+    // looked inconsistent — exactly backwards. They're on every anizm request now.
+    // Mobile hints, matching the Android UA above — and the exact shape the device self-test
+    // got its 302 with. Version comes from the real Chrome version in the UA.
+    private val clientHints get() = mapOf(
+        "sec-ch-ua" to "\"Chromium\";v=\"$chromeMajor\", \"Google Chrome\";v=\"$chromeMajor\", \"Not?A_Brand\";v=\"24\"",
+        "sec-ch-ua-mobile" to "?1",
+        "sec-ch-ua-platform" to "\"Android\"")
+    private val navHints get() = clientHints + mapOf(
+        "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "same-origin",
+        "Upgrade-Insecure-Requests" to "1",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+
+    private val baseHeaders get() = clientHints + mapOf(
         "User-Agent" to ua,
         "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", "Referer" to "$mainUrl/")
-    private val xhrHeaders get() = mapOf(
+    private val xhrHeaders get() = clientHints + mapOf(
+        "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin",
         "User-Agent" to ua,
         "Accept-Language" to "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7", "Origin" to mainUrl, "Referer" to "$mainUrl/",
         "X-Requested-With" to "XMLHttpRequest", "Accept" to "application/json, text/javascript, */*; q=0.01")
@@ -383,12 +419,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         fun report(line: String) { logW(line); collect?.invoke(line) }
         val playerUrl = "$mainUrl/player/$nid"
         val cookies = webViewCookies()
-        val chromeHints = mapOf(
-            "sec-ch-ua" to "\"Chromium\";v=\"152\", \"Google Chrome\";v=\"152\", \"Not?A_Brand\";v=\"24\"",
-            "sec-ch-ua-mobile" to "?1", "sec-ch-ua-platform" to "\"Android\"",
-            "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "same-origin",
-            "Upgrade-Insecure-Requests" to "1",
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        val chromeHints = navHints
         val cases = listOf<Triple<String, String, Map<String, String>>>(
             Triple("player, minimal", playerUrl, mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")),
             Triple("player, episode referer", playerUrl, baseHeaders + mapOf("Referer" to episodeUrl)),
@@ -432,15 +463,23 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // v5: no Sec-Fetch-* headers. Only the Referer is needed (verified), and Sec-Fetch-*
         // without Chrome's matching sec-ch-ua client hints is an inconsistent fingerprint —
         // a plausible reason Cloudflare singled these requests out.
-        val headers = baseHeaders + mapOf(
-            "Referer" to episodeUrl,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ) + (webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap())
+        val cookieHeader = webViewCookies()?.let { mapOf("Cookie" to it) } ?: emptyMap()
+        val headers = baseHeaders + navHints + mapOf("Referer" to episodeUrl) + cookieHeader
         val playerUrl = "$mainUrl/player/$nid"
         lastProbeTarget = nid to episodeUrl
         // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
         // looksCfBlocked), and a block should switch strategy, not be retried.
-        val r = app.get(playerUrl, headers = headers, timeout = 8L, allowRedirects = false)
+        var r = app.get(playerUrl, headers = headers, timeout = 8L, allowRedirects = false)
+        if (r.code == 403 && r.headers["cf-mitigated"]?.contains("challenge", true) == true) {
+            // One retry with the hint values the self-test proved work, before giving up on
+            // the fast path for 15 minutes.
+            try { r.okhttpResponse.close() } catch (_: Exception) {}
+            // Retry once without cookies: a stale __cf_bm from the WebView can itself be the
+            // thing being challenged, and the self-test's cookieless variant passed.
+            r = app.get(playerUrl, headers = baseHeaders + navHints + mapOf("Referer" to episodeUrl),
+                timeout = 8L, allowRedirects = false)
+            if (r.code in 300..399) log("resolve: retry without cookies worked for $nid")
+        }
         if (r.code == 403 || r.code == 429 || r.code == 503) {
             logW("resolve: /player/$nid refused (http ${r.code}, server=${r.headers["server"]}, cf-mitigated=${r.headers["cf-mitigated"]}, cf-ray=${r.headers["cf-ray"]}) — switching to WebView for ${playerHttpBlockCooldownMs / 60000} min")
             try { r.okhttpResponse.close() } catch (_: Exception) {}
@@ -544,7 +583,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                 val wv = WebView(ctx).apply {
                     settings.javaScriptEnabled = true; settings.domStorageEnabled = true
                     settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    settings.userAgentString = ua // match OkHttp UA — same cookies, same fingerprint
+                    // Only override if our UA differs from the WebView's own (it won't, when the
+                    // system UA was readable — see `ua`). Leaving the native string in place is
+                    // what keeps the JS-visible identity and the headers telling the same story.
+                    if (settings.userAgentString != ua) settings.userAgentString = ua
                 }
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
