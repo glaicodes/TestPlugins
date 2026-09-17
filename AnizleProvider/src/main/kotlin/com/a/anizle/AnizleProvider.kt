@@ -438,9 +438,11 @@ class AnizleProvider : MainAPI() {
                         val url = request?.url?.toString() ?: return null
                         val host = request.url?.host ?: ""
 
-                        // Fast path: skip regex processing for anizm.net sub-resources
-                        // (CSS, JS, fonts etc.) — we only care about cross-domain embeds
-                        // Note: must NOT match anizmplayer.com (which also contains "anizm")
+                        // Fast path: skip regex processing for our own site's sub-resources
+                        // (CSS, JS, fonts etc.) — we only care about cross-domain embeds.
+                        // host.endsWith(mainHost), not a literal domain string, so this
+                        // still works correctly if the site is ever accessed via a mirror
+                        // domain (e.g. CloudStream's "clone site" feature).
                         if (host.endsWith(mainHost)) {
                             // Only process /player/ paths
                             if (url.contains("/player/")) {
@@ -448,7 +450,7 @@ class AnizleProvider : MainAPI() {
                                 if (tgt.isBlank() || !url.endsWith("/player/$tgt"))
                                     return emptyResponse()
                             }
-                            return null // let all other anizm.net requests through
+                            return null // let all other same-site requests through
                         }
 
                         // Cross-domain: check for embeds we want to intercept
@@ -500,7 +502,7 @@ class AnizleProvider : MainAPI() {
                         log("resolve: pageFinished url=$url ready=$pageReady fallback=$usedFallback")
                         if (!pageReady) {
                             pageReady = true
-                            if (usedFallback && url?.contains("anizm") == true) {
+                            if (usedFallback && url?.contains(mainHost) == true) {
                                 log("resolve: fallback loaded, restarting"); resolveNext()
                             }
                         }
@@ -1138,7 +1140,7 @@ class AnizleProvider : MainAPI() {
         val tilde = if (isEstimate) "~" else ""
         return if (gb >= 1) " [$tilde%.1fGB]".format(gb) else " [$tilde%.0fMB]".format(bytes / 1_048_576.0)
     }
-    private fun parseContentRangeTotal(headers: Headers): Long? =
+    private fun parseContentRangeTotal(headers: okhttp3.Headers): Long? =
         headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
             ?: headers["Content-Length"]?.toLongOrNull()
 
