@@ -64,6 +64,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // Cloudflare — and does it on the actual request instead of on the homepage.
     @Volatile private var cfUntil = 0L
     private val cfStickyMs = 10 * 60 * 1000L
+    private val cfSolveBudgetMs = 20_000L
+    // v5: set when anizm refuses a direct (OkHttp) /player/ lookup. While set, lookups go
+    // straight to the in-app WebView resolver — a real browser engine — instead of
+    // retrying a request that's being blocked (and adding to whatever triggered the block).
+    @Volatile private var playerHttpBlockedUntil = 0L
+    private val playerHttpBlockCooldownMs = 15 * 60 * 1000L
+    private class PlayerLookupBlocked(val code: Int) : Exception("blocked: http $code")
 
     // ── Tuning: stealth vs. speed ────────────────────────────────────────────
     // (1) Pacing of /player/{id} lookups. At most `resolveConcurrency` in flight, and
@@ -214,10 +221,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // JS), so that marker matched on every successful response. Interstitials load
         // from .../challenge-platform/h/... instead. Still NOT matching bare "turnstile".
 
+    // v5: a 403/503 from a Cloudflare server is NOT enough to call CloudflareKiller any
+    // more. Real-device log (v4): anizm answered OkHttp's /player/ requests with an error
+    // CloudflareKiller can't solve — it opened a WebView per request, waited the full 60s for
+    // a cf_clearance cookie that never came, and loadLinks hit CloudStream's 120s limit
+    // with nothing. Only an actual challenge (cf-mitigated: challenge, or a challenge page
+    // body) is worth solving; a plain block is handled by the caller instead.
     private fun looksCfBlocked(r: NiceResponse): Boolean {
-        val cfServer = r.headers["server"]?.contains("cloudflare", true) == true
+        val challengeHeader = r.headers["cf-mitigated"]?.contains("challenge", true) == true
         return when (r.code) {
-            403, 429, 503 -> cfServer || isCf(r.text)
+            403, 429, 503 -> challengeHeader || isCf(r.text)
             // 3xx: never read the body of a redirect we deliberately didn't follow
             in 300..399 -> false
             else -> r.code in 200..299 && r.text.length < 60_000 && isCf(r.text)
@@ -243,9 +256,15 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             allowRedirects = allowRedirects, interceptor = if (sticky) cfKiller else null)
         if (sticky || !looksCfBlocked(first)) return first
         log("cf: challenge on ${url.substringBefore('?')} (${first.code}), retrying via CloudflareKiller")
-        cfUntil = System.currentTimeMillis() + cfStickyMs
-        return app.get(url, headers = headers, params = params, timeout = timeout,
-            allowRedirects = allowRedirects, interceptor = cfKiller)
+        // v5: hard cap. CloudflareKiller's own WebView wait is 60s, which alone can eat half
+        // of CloudStream's 120s loadLinks budget.
+        val solved = withTimeoutOrNull(cfSolveBudgetMs) {
+            app.get(url, headers = headers, params = params, timeout = timeout,
+                allowRedirects = allowRedirects, interceptor = cfKiller)
+        }
+        if (solved == null || looksCfBlocked(solved)) { log("cf: solve failed/timed out for ${url.substringBefore('?')}"); return solved ?: first }
+        cfUntil = System.currentTimeMillis() + cfStickyMs // only sticky once a solve actually worked
+        return solved
     }
 
     private suspend fun siteText(url: String, headers: Map<String, String>,
@@ -301,15 +320,23 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     }
 
     private suspend fun resolveViaRedirect(nid: String, episodeUrl: String): String? {
+        // v5: no Sec-Fetch-* headers. Only the Referer is needed (verified), and Sec-Fetch-*
+        // without Chrome's matching sec-ch-ua client hints is an inconsistent fingerprint —
+        // a plausible reason Cloudflare singled these requests out.
         val headers = baseHeaders + mapOf(
             "Referer" to episodeUrl,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Sec-Fetch-Dest" to "iframe",
-            "Sec-Fetch-Mode" to "navigate",
-            "Sec-Fetch-Site" to "same-origin",
         )
         val playerUrl = "$mainUrl/player/$nid"
-        val r = siteGet(playerUrl, headers, timeout = 8L, allowRedirects = false)
+        // Plain request, deliberately not siteGet(): CloudflareKiller can't help here (see
+        // looksCfBlocked), and a block should switch strategy, not be retried.
+        val r = app.get(playerUrl, headers = headers, timeout = 8L, allowRedirects = false)
+        if (r.code == 403 || r.code == 429 || r.code == 503) {
+            logW("resolve: /player/$nid refused (http ${r.code}, server=${r.headers["server"]}, cf-mitigated=${r.headers["cf-mitigated"]}, cf-ray=${r.headers["cf-ray"]}) — switching to WebView for ${playerHttpBlockCooldownMs / 60000} min")
+            try { r.okhttpResponse.close() } catch (_: Exception) {}
+            playerHttpBlockedUntil = System.currentTimeMillis() + playerHttpBlockCooldownMs
+            throw PlayerLookupBlocked(r.code)
+        }
         if (r.code in 300..399) {
             val loc = r.headers["Location"]?.trim().orEmpty()
             try { r.okhttpResponse.close() } catch (_: Exception) {}
@@ -358,9 +385,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             numIds.forEach { nid ->
                 launch {
                     gate.withPermit {
+                        // One refusal stops the rest of the batch — don't keep knocking.
+                        if (System.currentTimeMillis() < playerHttpBlockedUntil) return@withPermit
                         paceResolve()
+                        if (System.currentTimeMillis() < playerHttpBlockedUntil) return@withPermit
                         val embed = try { resolveViaRedirect(nid, episodeUrl) }
                             catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                            catch (_: PlayerLookupBlocked) { null }
                             catch (e: Exception) { log("resolve: $nid failed: ${e.message}"); null }
                         if (embed != null) { log("resolve: $embed for numId=$nid"); onResolved(nid, embed) }
                     }
@@ -747,9 +778,16 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         // to be comma-joined into one query, and a[href*=/kategoriler/] also matches the
         // site-wide category menu — so e.g. Re:Zero S4 got tagged "Aksiyon, Arabalar"
         // (Action, Cars) right after its real genres.
-        val tags = doc.select("span.dataValue > span.tag > span.label")
-            .ifEmpty { doc.select(".genre a, .anime-genres a") }
-            .map { it.text().trim() }.filter { it.isNotBlank() && it.length < 30 }.distinct().take(8).ifEmpty { null }
+        // v5: the genre/theme rows are links, not span.label — v4's selector matched nothing
+        // (tags vanished). Read the "Türler" (genres) and "Temalar" (themes) rows directly,
+        // the same way the page lays them out: <span class=dataTitle>Türler</span> + links.
+        val tagRows = doc.select("span.dataTitle").filter { t ->
+            val l = t.text().lowercase()
+            l.contains("tür") || l.contains("tema") || l.contains("genre") || l.contains("theme")
+        }
+        val tags = tagRows.flatMap { it.parent()?.select("a, span.label")?.toList() ?: emptyList() }
+            .ifEmpty { doc.select("span.dataValue > span.tag > span.label, span.dataValue a[href*=/kategoriler/]") }
+            .map { it.text().trim() }.filter { it.isNotBlank() && it.length < 30 }.distinct().take(10).ifEmpty { null }
 
         val allLinks = doc.select("div#episodesMiddle a[href]")
             .ifEmpty { doc.select("div.episodeListTabContent a[href]") }
@@ -999,9 +1037,12 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
                 if (uncachedIds.isNotEmpty()) {
                     // Primary: redirect read, each source dispatched the moment it resolves.
-                    try { httpResolveEmbeds(uncachedIds, data) { id, embed -> accept(id, embed) } }
-                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (e: Exception) { log("loadLinks: http resolve error: ${e.message}") }
+                    // Skipped entirely while direct lookups are being refused.
+                    if (System.currentTimeMillis() >= playerHttpBlockedUntil) {
+                        try { httpResolveEmbeds(uncachedIds, data) { id, embed -> accept(id, embed) } }
+                        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Exception) { log("loadLinks: http resolve error: ${e.message}") }
+                    } else log("loadLinks: direct lookups blocked recently, using WebView")
 
                     // Fallback: WebView, only for recognised players the redirect path missed.
                     val missing = uncachedIds.filter { id ->
@@ -1092,8 +1133,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val aHeaders = mapOf("User-Agent" to ua,
                 "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
                 "Referer" to playerRef, "Origin" to playerBase)
-            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/",
-                    "Sec-Fetch-Dest" to "iframe", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "cross-site"), timeout = 8) }
+            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8) }
             catch (e: kotlinx.coroutines.CancellationException) { throw e }
             catch (_: Exception) {}
             // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
