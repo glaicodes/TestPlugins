@@ -94,7 +94,28 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
 
     // 4.0: the size estimate's extra requests (see sampleRendition). User setting.
     private val estimateHlsSizes get() = settings.estimateSizes
-    private val sizeEstimateBudgetMs = 4_000L
+    // v7: 4s → 8s. Real-device log: an Aincrad source came up without a size on first load
+    // (budget ran out on a cold connection) and with one on the next.
+    private val sizeEstimateBudgetMs = 8_000L
+
+    // v7: why Aincrad links doubled (2 → 4) when an episode was loaded again: getVideo hands
+    // out a fresh signed URL (…master.m3u8?md5=…&expires=…) on every call, so the second
+    // loadLinks emitted the "same" stream under a different URL — and, since the first load
+    // had no size, a different name too. CloudStream treats that as a new link. Caching the
+    // signed URL (until shortly before it expires) and the size estimate per stream makes a
+    // repeat load emit byte-identical links, which the app de-duplicates.
+    private data class AincradSource(val videoSource: String, val securedLink: String, val validUntil: Long)
+    private val aincradCache = java.util.concurrent.ConcurrentHashMap<String, AincradSource>()
+    private val expiresParamRe = Regex("""[?&]expires=(\d{9,13})""")
+    private val sizeCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Map<Int, Long>, Long>>()
+    private val sizeCacheTtlMs = 60 * 60 * 1000L
+    private fun cachedSizes(key: String): Map<Int, Long>? =
+        sizeCache[key]?.takeIf { System.currentTimeMillis() - it.second < sizeCacheTtlMs }?.first
+    private fun storeSizes(key: String, sizes: Map<Int, Long>) {
+        if (sizes.isEmpty()) return // never cache a failure: next load gets another try
+        sizeCache[key] = sizes to System.currentTimeMillis()
+        if (sizeCache.size > 100) sizeCache.entries.minByOrNull { it.value.second }?.let { sizeCache.remove(it.key) }
+    }
 
     // 4.0: short cache of an episode's source list. Prefetch + manual click (or reopening
     // the source picker) used to re-download the ~890KB episode page and every translator
@@ -1133,21 +1154,37 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val aHeaders = mapOf("User-Agent" to ua,
                 "X-Requested-With" to "XMLHttpRequest", "Accept" to "*/*",
                 "Referer" to playerRef, "Origin" to playerBase)
-            try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8) }
-            catch (e: kotlinx.coroutines.CancellationException) { throw e }
-            catch (_: Exception) {}
-            // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
-            // The server doesn't enforce it today, but an empty-bodied POST is an easy
-            // thing to start rejecting; sending the same form fields costs nothing.
-            val streamText = try {
-                app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders,
-                    data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).text
-            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-              catch (e: Exception) { log("aincrad error: ${e.message}"); return false }
-            val json = try { JSONObject(streamText) } catch (_: Exception) { return false }
-            val securedLink = json.optString("securedLink", "")
-            val videoSource = json.optString("videoSource", "")
-            log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0}")
+            val now = System.currentTimeMillis()
+            val cachedSource = aincradCache[hash]?.takeIf { it.validUntil > now }
+            val videoSource: String
+            val securedLink: String
+            if (cachedSource != null) {
+                videoSource = cachedSource.videoSource; securedLink = cachedSource.securedLink
+                log("aincrad: reusing signed URL for $hash (${(cachedSource.validUntil - now) / 1000}s left)")
+            } else {
+                try { app.get(playerRef, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"), timeout = 8) }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (_: Exception) {}
+                // 4.0: FirePlayer's own call is $.ajax POST with data {hash: ID, r: document.referrer}.
+                val streamText = try {
+                    app.post("$playerBase/player/index.php?data=$hash&do=getVideo", headers = aHeaders,
+                        data = mapOf("hash" to hash, "r" to "$mainUrl/"), timeout = 10).text
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                  catch (e: Exception) { log("aincrad error: ${e.message}"); return false }
+                val json = try { JSONObject(streamText) } catch (_: Exception) { return false }
+                securedLink = json.optString("securedLink", "")
+                videoSource = json.optString("videoSource", "")
+                log("aincrad: hls=${json.optBoolean("hls")} secured=${securedLink.isNotBlank()} source=${videoSource.isNotBlank()} same=${securedLink == videoSource} dl=${json.optJSONArray("downloadLinks")?.length() ?: 0}")
+                // Valid until 2 min before the URL's own expiry (seconds or ms epoch), max 30 min;
+                // 10 min if the URL doesn't say.
+                val exp = expiresParamRe.find(videoSource.ifBlank { securedLink })?.groupValues?.get(1)?.toLongOrNull()
+                    ?.let { if (it < 100_000_000_000L) it * 1000 else it }
+                val until = minOf(exp?.minus(120_000) ?: (now + 10 * 60_000), now + 30 * 60_000)
+                if (until > now && (videoSource.isNotBlank() || securedLink.isNotBlank())) {
+                    aincradCache[hash] = AincradSource(videoSource, securedLink, until)
+                    if (aincradCache.size > 200) aincradCache.entries.removeAll { it.value.validUntil <= now }
+                }
+            }
             // Single entry per source, chosen by CONTENT, not by JSON field name — see git
             // history for the 3003 error this avoids. NOTE ON DOWNLOADS: split-audio masters
             // stream fine but CloudStream's downloader can't mux them (app limitation).
@@ -1174,13 +1211,17 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
                             // top rendition (video + audio) by sampling real segment sizes.
                             val h = variants.maxOfOrNull { it.height }
                                 ?: hlsResolutionRe.findAll(t).mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull()
-                            val est = if (estimateHlsSizes && variants.isNotEmpty())
-                                withTimeoutOrNull(sizeEstimateBudgetMs) { estimateSplitAudioBytes(t, cand, variants, hlsHeaders) } else null
+                            val sizeKey = "ap:$hash"
+                            val est = if (estimateHlsSizes && variants.isNotEmpty()) {
+                                cachedSizes(sizeKey)?.get(0)
+                                    ?: withTimeoutOrNull(sizeEstimateBudgetMs) { estimateSplitAudioBytes(t, cand, variants, hlsHeaders) }
+                                        ?.also { storeSizes(sizeKey, mapOf(0 to it)) }
+                            } else null
                             callback(newExtractorLink(source = cleanLabel, name = cleanLabel + formatSize(est, isEstimate = true), url = cand, type = ExtractorLinkType.M3U8) {
                                 quality = h ?: Qualities.Unknown.value; referer = playerRef; headers = hlsHeaders })
                             resolved = true
                         } else {
-                            resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad")
+                            resolved = emitVariants(variants, cleanLabel, playerRef, hlsHeaders, callback, "aincrad", "ap:$hash")
                         }
                     }
                     t.startsWith("<") || t.contains("<html", ignoreCase = true) || t.isBlank() ->
@@ -1230,7 +1271,7 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             if (!body.trimStart().startsWith("#EXTM3U")) { log("beta: master.txt not a valid playlist"); return false }
             val variants = parseVariants(body, masterUrl)
             if (variants.isEmpty()) { log("beta: no parseable variants in master.txt"); return false }
-            return emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta")
+            return emitVariants(variants, cleanDisplayName(label), watchRef, betaHeaders, callback, "beta", "bp:$hash")
         }
 
         return false
@@ -1252,11 +1293,13 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // each validated by content before it's emitted.
     private suspend fun emitVariants(
         variants: List<Variant>, cleanLabel: String, referer: String, headers: Map<String, String>,
-        callback: (ExtractorLink) -> Unit, tag: String,
+        callback: (ExtractorLink) -> Unit, tag: String, sizeKey: String,
     ): Boolean {
-        val sizes = if (estimateHlsSizes)
-            withTimeoutOrNull(sizeEstimateBudgetMs) { estimateVariantSizes(variants, headers) } ?: emptyMap()
-        else emptyMap()
+        val sizes = if (estimateHlsSizes) {
+            cachedSizes(sizeKey)
+                ?: (withTimeoutOrNull(sizeEstimateBudgetMs) { estimateVariantSizes(variants, headers) } ?: emptyMap())
+                    .also { storeSizes(sizeKey, it) }
+        } else emptyMap()
         val any = java.util.concurrent.atomic.AtomicBoolean(false)
         val gate = Semaphore(3)
         coroutineScope {
@@ -1357,19 +1400,66 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         if (sizes.size < maxOf(2, (idx.size + 1) / 2)) { log("size: only ${sizes.size}/${idx.size} samples, skipping"); return null }
         val sampledDur = sizes.keys.sumOf { segs[it].dur }
         if (sampledDur <= 0) return null
+
+        // v8 diagnostics. Ground truth from a real 1DM+ download (Enen ep 6, Aincrad 1080p):
+        // 341MB / 141 segments = ~2.4MB per segment, while this estimator implied ~9.3MB —
+        // so either the sizes the server reports in its headers are inflated, or this
+        // playlist has far more segments than the stream really uses. These two lines say
+        // which, without needing another test download.
+        val meanKb = sizes.values.average() / 1024
+        log("size: ${segs.size} segs, ${(total / 60).toInt()}m${(total % 60).toInt()}s, ${sizes.size} sampled, mean ${meanKb.toLong()}KB/seg → " +
+            "${(sizes.values.sum() / sampledDur * 8 / 1000).toLong()} kbps; samples=" +
+            sizes.entries.sortedBy { it.key }.take(4).joinToString(" ") { "[#${it.key} ${"%.1f".format(segs[it.key].dur)}s ${it.value / 1024}KB]" })
+
+        // v8: verify one reported size is real. Ask for the LAST byte the server claims the
+        // segment has: a truthful size answers 206 with one byte, an inflated one answers
+        // 416 (Range Not Satisfiable). Costs one request and no meaningful data.
+        val check = sizes.entries.minByOrNull { it.value }
+        if (check != null) {
+            val claimed = check.value
+            val ok = try {
+                val rr = app.get(segs[check.key].url, headers = headers + mapOf("Range" to "bytes=${claimed - 1}-${claimed - 1}"), timeout = 6L)
+                val code = rr.code
+                val reported = rr.headers["Content-Range"]?.substringAfterLast('/')?.trim()?.toLongOrNull()
+                try { rr.okhttpResponse.close() } catch (_: Exception) {}
+                if (code == 416 || (reported != null && reported != claimed))
+                    log("size: reported size looks wrong (claimed $claimed, tail request → $code, total=$reported)")
+                code != 416 && (reported == null || reported == claimed)
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) { true } // network hiccup: don't throw the estimate away over it
+            if (!ok) return null
+        }
         return RenditionStats(sizes.values.sum() / sampledDur, total)
+    }
+
+    // v7: plausibility check. Real-device log: one Aincrad 1080p episode came out at ~1306MB,
+    // i.e. ~7.5 Mbps average — nearly 2× the 4096 kbps the playlist declares as its ceiling,
+    // and 2.5–4× the other episodes (179–530MB). A measured AVERAGE above the declared
+    // BANDWIDTH doesn't happen with this encoder, so it means the 12 samples were unlucky
+    // (or a server quirk). Re-sample with 24; if it's still implausible, show no size rather
+    // than a wrong one.
+    private suspend fun sampleVideoChecked(top: Variant, headers: Map<String, String>): RenditionStats? {
+        val declaredBps = top.bandwidth?.takeIf { it > 0 }?.let { it / 8.0 }
+        fun plausible(r: RenditionStats) = declaredBps == null || r.bytesPerSec <= declaredBps * 1.3
+        val first = sampleRendition(top.url, headers, 12) ?: return null
+        if (plausible(first)) return first
+        log("size: ${top.height}p measured ${(first.bytesPerSec * 8 / 1000).toLong()} kbps > declared ${top.bandwidth!! / 1000} kbps, re-sampling with 24")
+        val second = sampleRendition(top.url, headers, 24) ?: return null
+        if (plausible(second)) return second
+        log("size: ${top.height}p still ${(second.bytesPerSec * 8 / 1000).toLong()} kbps, not showing a size")
+        return null
     }
 
     // Split-audio master (Aincrad): top video rendition + the audio rendition.
     private suspend fun estimateSplitAudioBytes(master: String, masterUrl: String, variants: List<Variant>, headers: Map<String, String>): Long? {
         val top = variants.firstOrNull() ?: return null
-        val video = sampleRendition(top.url, headers, 12) ?: return null
+        val video = sampleVideoChecked(top, headers) ?: return null
         val audioUrl = audioMediaUriRe.find(master)?.groupValues?.get(1)
             ?.let { try { java.net.URI(masterUrl).resolve(it).toString() } catch (_: Exception) { null } }
         // Audio is near-constant bitrate AAC, so 3 samples is plenty.
         val audio = audioUrl?.let { sampleRendition(it, headers, 3) }
         val bytes = (video.bytesPerSec + (audio?.bytesPerSec ?: 0.0)) * video.durationSec
-        log("size: split-audio ${top.height}p ≈ ${(bytes / 1_048_576).toLong()}MB (audio ${if (audio != null) "sampled" else "missing"})")
+        log("size: split-audio ${top.height}p ≈ ${(bytes / 1_048_576).toLong()}MB (video ${(video.bytesPerSec * 8 / 1000).toLong()} kbps + audio ${audio?.let { "${(it.bytesPerSec * 8 / 1000).toLong()} kbps" } ?: "missing"}, ${(video.durationSec / 60).toInt()} min)")
         return bytes.toLong()
     }
 
@@ -1378,9 +1468,10 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     // the top one, but it doesn't multiply the request count by the number of variants.
     private suspend fun estimateVariantSizes(variants: List<Variant>, headers: Map<String, String>): Map<Int, Long> {
         val top = variants.firstOrNull() ?: return emptyMap()
-        val s = sampleRendition(top.url, headers, 12) ?: return emptyMap()
+        val s = sampleVideoChecked(top, headers) ?: return emptyMap()
         val out = HashMap<Int, Long>()
         out[top.height] = (s.bytesPerSec * s.durationSec).toLong()
+        log("size: ${top.height}p ≈ ${out[top.height]!! / 1_048_576}MB (${(s.bytesPerSec * 8 / 1000).toLong()} kbps measured vs ${(top.bandwidth ?: 0) / 1000} kbps declared, ${(s.durationSec / 60).toInt()} min)")
         val topBw = top.bandwidth
         if (topBw != null && topBw > 0) {
             val bytesPerBw = s.bytesPerSec / topBw
@@ -1518,28 +1609,28 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
         return h
     }
 
+    // Finishes a resolve once we have a response that IS the video (not an HTML page).
+    private suspend fun gdriveFromMedia(r: NiceResponse, earlierCookies: Map<String, String>, nameHint: String?, sizeHint: Long?, how: String): GDriveResolution {
+        val allCookies = (earlierCookies + r.cookies).entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val headers = mapOf("User-Agent" to ua) + (if (allCookies.isNotBlank()) mapOf("Cookie" to allCookies) else emptyMap())
+        val size = sizeFromRanged(r) ?: sizeHint
+        val bytes = if (r.code == 206) bodyBytes(r) else { try { r.okhttpResponse.close() } catch (_: Exception) {}; null }
+        val height = gdriveHeight(filenameFromDisposition(r.headers) ?: nameHint, bytes, r.url, headers, size)
+        log("gdrive: resolved ($how), size=$size height=$height")
+        return GDriveResolution(r.url, headers, size, height)
+    }
+    private fun isHtml(r: NiceResponse) = (r.headers["Content-Type"] ?: "").contains("text/html", ignoreCase = true)
+
     private suspend fun resolveGDrive(fileId: String): GDriveResolution? {
         // 64KB: covers Google's whole interstitial page (confirm/uuid sit well past 2KB), and
         // for a direct video response it's enough to hold a faststart MP4's track headers.
         val h = mapOf("User-Agent" to ua, "Range" to "bytes=0-65535")
         val base = "https://drive.usercontent.google.com/download?id=$fileId&export=download"
         val r1 = app.get(base, headers = h, timeout = 15)
-        val ct1 = r1.headers["Content-Type"] ?: ""
-        if (!ct1.contains("text/html", ignoreCase = true)) {
-            // No interstitial for this file — first response IS the video.
-            val cookie = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-            val headers = mapOf("User-Agent" to ua) + (if (cookie.isNotBlank()) mapOf("Cookie" to cookie) else emptyMap())
-            val size = sizeFromRanged(r1)
-            val bytes = if (r1.code == 206) bodyBytes(r1) else { try { r1.okhttpResponse.close() } catch (_: Exception) {}; null }
-            val height = gdriveHeight(filenameFromDisposition(r1.headers), bytes, r1.url, headers, size)
-            log("gdrive: no interstitial, direct link, size=$size height=$height")
-            return GDriveResolution(r1.url, headers, size, height)
-        }
+        if (!isHtml(r1)) return gdriveFromMedia(r1, emptyMap(), null, null, "direct")
+
         val html = r1.text
-        val gdoc = org.jsoup.Jsoup.parse(html)
-        val confirm = gdoc.selectFirst("input[name=confirm]")?.attr("value")?.ifBlank { null }
-        val uuid = gdoc.selectFirst("input[name=uuid]")?.attr("value")?.ifBlank { null }
-        if (confirm == null) { logW("site-change warning: gdrive confirm missing"); return null }
+        val gdoc = org.jsoup.Jsoup.parse(html, r1.url)
         // Interstitial reads like: "<a>[Fansub] Show - 01 [1080p].mp4</a> (1.4G) is too large…"
         val ucNameSize = gdoc.selectFirst(".uc-name-size")
         val pageName = ucNameSize?.selectFirst("a")?.text()?.ifBlank { null }
@@ -1548,21 +1639,40 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
             val mult = when (m.groupValues[2].uppercase()) { "K" -> 1L shl 10; "M" -> 1L shl 20; "G" -> 1L shl 30; else -> 1L shl 40 }
             (n * mult).toLong()
         }
-        val cookie1 = r1.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        // v4: 64KB instead of 4KB — this is the one video read we do anyway, and it's what
-        // the MP4 header check needs. Still negligible next to the file itself.
-        val h2 = mapOf("User-Agent" to ua, "Range" to "bytes=0-65535") +
-            (if (cookie1.isNotBlank()) mapOf("Cookie" to cookie1) else emptyMap())
-        val confirmUrl = "$base&confirm=$confirm" + (uuid?.let { "&uuid=$it" } ?: "")
-        val r2 = app.get(confirmUrl, headers = h2, timeout = 15)
-        val ct2 = r2.headers["Content-Type"] ?: ""
-        if (ct2.contains("text/html", ignoreCase = true)) { log("gdrive: still HTML after confirm+uuid"); return null }
-        val allCookies = (r1.cookies + r2.cookies).entries.joinToString("; ") { "${it.key}=${it.value}" }
-        val headersFinal = mapOf("User-Agent" to ua) + (if (allCookies.isNotBlank()) mapOf("Cookie" to allCookies) else emptyMap())
-        val size = sizeFromRanged(r2) ?: pageSize
-        val bytes = if (r2.code == 206) bodyBytes(r2) else { try { r2.okhttpResponse.close() } catch (_: Exception) {}; null }
-        val height = gdriveHeight(filenameFromDisposition(r2.headers) ?: pageName, bytes, r2.url, headersFinal, size)
-        log("gdrive: resolved via confirm+uuid, size=$size height=$height")
-        return GDriveResolution(r2.url, headersFinal, size, height)
+        val cookies1 = r1.cookies
+
+        // v6: submit Google's download form as-is (every hidden input, to the form's own
+        // action) instead of hand-picking confirm + uuid. v5 required an input literally named
+        // "confirm" and gave up otherwise — and on your device every Drive file (4 files,
+        // 2 fansubs) hit "gdrive confirm missing", so the page no longer has that exact shape.
+        val form = gdoc.selectFirst("form#download-form")
+            ?: gdoc.select("form").firstOrNull { it.attr("action").contains("download") || it.selectFirst("input[name=id]") != null }
+        if (form != null) {
+            val action = form.attr("abs:action").ifBlank { "https://drive.usercontent.google.com/download" }
+            val params = form.select("input[name]").associate { it.attr("name") to it.attr("value") }
+                .let { if ("id" !in it) it + ("id" to fileId) else it }
+            val query = params.entries.joinToString("&") { "${java.net.URLEncoder.encode(it.key, "UTF-8")}=${java.net.URLEncoder.encode(it.value, "UTF-8")}" }
+            val url = if (action.contains('?')) "$action&$query" else "$action?$query"
+            val cookieHeader = cookies1.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            val r2 = app.get(url, headers = h + (if (cookieHeader.isNotBlank()) mapOf("Cookie" to cookieHeader) else emptyMap()), timeout = 15)
+            if (!isHtml(r2)) return gdriveFromMedia(r2, cookies1, pageName, pageSize, "form: ${params.keys.joinToString(",")}")
+            log("gdrive: still HTML after submitting form (${params.keys.joinToString(",")})")
+        }
+
+        // Last try: the old confirm=t shortcut, which still works for some files.
+        val r3 = app.get("$base&confirm=t", headers = h, timeout = 15)
+        if (!isHtml(r3)) return gdriveFromMedia(r3, cookies1, pageName, pageSize, "confirm=t")
+
+        // Nothing worked — say what Google actually sent, so the next log explains it.
+        val title = gdoc.title().take(80)
+        val reason = when {
+            html.contains("quota", ignoreCase = true) -> "download quota exceeded for this file"
+            html.contains("accounts.google.com", ignoreCase = true) && form == null -> "sign-in / no access"
+            r1.code == 404 || html.contains("404", ignoreCase = false) && title.contains("404") -> "file removed"
+            html.contains("/sorry/", ignoreCase = true) || html.contains("unusual traffic", ignoreCase = true) -> "Google rate-limited this IP"
+            else -> "unknown page"
+        }
+        logW("gdrive: $fileId unresolvable — $reason (http ${r1.code}, title='$title', forms=${gdoc.select("form").size}, inputs=${gdoc.select("input[name]").joinToString(",") { it.attr("name") }})")
+        return null
     }
 }
