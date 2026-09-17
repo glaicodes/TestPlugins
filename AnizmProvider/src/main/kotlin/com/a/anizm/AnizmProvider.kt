@@ -1624,13 +1624,32 @@ class AnizmProvider(private val settings: AnizmSettings) : MainAPI() {
     private suspend fun estimateVariantSizes(variants: List<Variant>, headers: Map<String, String>): Map<Int, Long> {
         val top = variants.firstOrNull() ?: return emptyMap()
         val s = sampleVideoChecked(top, headers) ?: return emptyMap()
-        val out = HashMap<Int, Long>()
+        val out = java.util.concurrent.ConcurrentHashMap<Int, Long>()
         out[top.height] = (s.bytesPerSec * s.durationSec).toLong()
         log("size: ${top.height}p ≈ ${out[top.height]!! / 1_048_576}MB (${(s.bytesPerSec * 8 / 1000).toLong()} kbps measured vs ${(top.bandwidth ?: 0) / 1000} kbps declared, ${(s.durationSec / 60).toInt()} min)")
+
+        // v14: the lower variants are measured too, with fewer samples. They used to be scaled
+        // from the declared BANDWIDTH ladder, which is nominal — that's how a source could
+        // advertise a bigger file than one that actually looks better.
         val topBw = top.bandwidth
-        if (topBw != null && topBw > 0) {
-            val bytesPerBw = s.bytesPerSec / topBw
-            for (v in variants.drop(1)) v.bandwidth?.let { out[v.height] = (it * bytesPerBw * s.durationSec).toLong() }
+        val bytesPerBw = if (topBw != null && topBw > 0) s.bytesPerSec / topBw else null
+        val gate = Semaphore(2)
+        coroutineScope {
+            for (v in variants.drop(1)) {
+                launch {
+                    gate.withPermit {
+                        val measured = try { sampleRendition(v.url, headers, 8) }
+                        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (_: Exception) { null }
+                        if (measured != null) {
+                            out[v.height] = (measured.bytesPerSec * measured.durationSec).toLong()
+                            log("size: ${v.height}p ≈ ${out[v.height]!! / 1_048_576}MB (${(measured.bytesPerSec * 8 / 1000).toLong()} kbps measured)")
+                        } else if (bytesPerBw != null) {
+                            v.bandwidth?.let { out[v.height] = (it * bytesPerBw * s.durationSec).toLong() }
+                        }
+                    }
+                }
+            }
         }
         return out
     }
