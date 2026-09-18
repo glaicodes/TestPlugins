@@ -3,7 +3,7 @@
         "iconUrl": "https://anizm.pro/favicon.ico",
         "fileHash": "sha256-c0478e57681e59d956b4db663534918f01d4f84bbefaab991220a502c2a6013b",
         "apiVersion": 1,
-        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "fileSize": 80983,
         "status": 1,
         "language": "tr",
@@ -18,14 +18,14 @@
         "version": 102,
         "internalName": "AnizleProvider",
         "description": "Anizle / Anizm",
-        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/AnizleProvider.cs3",
+        "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizleProvider.cs3",
         "name": "AnizleProvider"
     },
     {
         "iconUrl": "https://anizm.net/favicon.ico",
         "fileHash": "sha256-59ea2e0161e97ed0563985ab889883b8a6662985deac7d792c396bf3109f706c",
         "apiVersion": 1,
-        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "fileSize": 136532,
         "status": 1,
         "language": "tr",
@@ -40,14 +40,14 @@
         "version": 7,
         "internalName": "AnizmProvider",
         "description": "Anizm (anizm.net) - T\u00fcrk\u00e7e altyaz\u0131l\u0131 anime",
-        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/AnizmProvider.cs3",
+        "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/AnizmProvider.cs3",
         "name": "AnizmProvider"
     },
     {
         "iconUrl": "https://rezeroizle.com/images/icon.png",
         "fileHash": "sha256-bc61370d097fd0be679468f25f4a3ae672ba76cc1830b464a993b0c08bdeb768",
         "apiVersion": 1,
-        "repositoryUrl": "https://github.com/glaicodes/TestPlugins",
+        "repositoryUrl": "https://github.com/standard-droid/TestPlugins",
         "fileSize": 21920,
         "status": 1,
         "language": "tr",
@@ -61,7 +61,7 @@
         "version": 16,
         "internalName": "ReZeroIzleProvider",
         "description": "Re:Zero kara Hajimeru Isekai Seikatsu \u2014 T\u00fcrk\u00e7e altyaz\u0131l\u0131, Google Drive \u00fczerinden.",
-        "url": "https://raw.githubusercontent.com/glaicodes/TestPlugins/builds/ReZeroIzleProvider.cs3",
+        "url": "https://raw.githubusercontent.com/standard-droid/TestPlugins/builds/ReZeroIzleProvider.cs3",
         "name": "ReZeroIzleProvider"
     }
 ]
